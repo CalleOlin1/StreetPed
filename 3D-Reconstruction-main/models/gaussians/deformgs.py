@@ -55,7 +55,7 @@ def get_linear_noise_func(
 
 class DeformableGaussians(VanillaGaussians):
     def __init__(
-        """
+        self,
         **kwargs
     ):
         super().__init__(**kwargs)

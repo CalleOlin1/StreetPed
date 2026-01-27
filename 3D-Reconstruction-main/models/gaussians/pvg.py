@@ -19,6 +19,7 @@ logger = logging.getLogger()
 
 class PeriodicVibrationGaussians(VanillaGaussians):
     def __init__(
+        self,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -28,7 +29,6 @@ class PeriodicVibrationGaussians(VanillaGaussians):
         
         self.T = self.ctrl_cfg.cycle_length
         self.t_grad_accum = None
-        """
 
     def set_cur_frame(self, frame_id: int):
         self.cur_frame = frame_id
