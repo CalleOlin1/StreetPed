@@ -154,8 +154,8 @@ def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
 
 def quaternion_multiply(q1, q2):
     """
-    四元数乘法
-    q1, q2: [4] 形状的四元数，格式为(w,x,y,z)
+    Quaternion multiplication
+    q1, q2: Quaternions of shape [4], format is (w,x,y,z)
     """
     w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
     w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
@@ -169,13 +169,13 @@ def quaternion_multiply(q1, q2):
 
 def safe_quaternion_multiply(q1, q2):
     """
-    安全的四元数乘法，处理不同的输入维度
+    Safe quaternion multiplication that handles different input dimensions
     
     Args:
-        q1, q2: 四元数张量，可以是 [4] 或 [1, 4] 或 [N, 4] 形状
+        q1, q2: Quaternion tensors, can be of shape [4], [1, 4], or [N, 4]
     
     Returns:
-        四元数乘积，保持输入的批次维度
+        Quaternion product, preserving the batch dimension of the input
     """
     # 记录原始形状
     q1_shape = q1.shape
@@ -209,7 +209,7 @@ def safe_quaternion_multiply(q1, q2):
     
     result = torch.stack([w, x, y, z], dim=1)
     
-    # 恢复原始维度
+    # Restore original dimensions
     if len(q1_shape) == 1 and len(q2_shape) == 1:
         result = result.squeeze(0)
     
@@ -218,14 +218,14 @@ def safe_quaternion_multiply(q1, q2):
 
 def combine_rotations(rotations_list, device='cuda'):
     """
-    组合多个旋转（以轴角或四元数形式）
+    Combine multiple rotations (in axis-angle or quaternion form)
     
     Args:
-        rotations_list: 旋转列表，每个旋转是字典 {"axis": [x,y,z], "angle": degrees}
-        device: 设备
+        rotations_list: List of rotations, each rotation is a dict {"axis": [x,y,z], "angle": degrees}
+        device: Device
     
     Returns:
-        组合后的四元数
+        Combined quaternion
     """
     from pytorch3d.transforms import axis_angle_to_quaternion
     

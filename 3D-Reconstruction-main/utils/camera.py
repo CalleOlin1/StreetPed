@@ -224,7 +224,7 @@ def kitti_fixed_path(
         
     except Exception as e:
         print(f"Error loading from NPZ: {e}")
-        # 如果NPZ加载失败，回退到原始的front_center_interp
+        # If NPZ loading fails, fall back to the original front_center_interp
         print("Falling back to front_center_interp")
         assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required for fallback"
         key_poses = per_cam_poses[0][::original_frames // 4]
@@ -237,78 +237,78 @@ def apply_trajectory_offset(
     rotation_offset: Optional[List[float]] = None
 ) -> torch.Tensor:
     """
-    给轨迹应用位置和旋转偏移
+    Apply position and rotation offsets to trajectory
     
     Args:
-        poses: 原始poses张量，形状 (N, 4, 4)
-        position_offset: 位置偏移 [x, y, z]，单位米
-        rotation_offset: 旋转偏移 [roll, pitch, yaw]，单位弧度
+        poses: Original poses tensor, shape (N, 4, 4)
+        position_offset: Position offset [x, y, z], in meters
+        rotation_offset: Rotation offset [roll, pitch, yaw], in radians
         
     Returns:
-        torch.Tensor: 应用偏移后的poses
+        torch.Tensor: Poses with applied offsets
     """
     import torch
     import math
     
     result = poses.clone()
     
-    # 应用位置偏移
+    # Apply position offset
     if position_offset is not None:
         offset_tensor = torch.tensor(position_offset, dtype=poses.dtype, device=poses.device)
         print(f"     Position offset: {position_offset}")
         
-        # 方法1：简单的全局偏移（在世界坐标系中）
+        # Method 1: Simple global offset (in world coordinate system)
         result[:, :3, 3] += offset_tensor
         
-        # 方法2：相对于相机朝向的偏移（如果你想要相对偏移，可以启用这个）
+        # Method 2: Offset relative to camera orientation (enable this if you want relative offset)
         # for i in range(len(result)):
-        #     # 获取当前相机的旋转矩阵
+        #     # Get current camera's rotation matrix
         #     rotation_matrix = result[i, :3, :3]
-        #     # 将偏移转换到相机坐标系
+        #     # Transform offset to camera coordinate system
         #     relative_offset = rotation_matrix @ offset_tensor
         #     result[i, :3, 3] += relative_offset
     
-    # 应用旋转偏移
+    # Apply rotation offset
     if rotation_offset is not None:
         print(f"     Rotation offset (roll, pitch, yaw): {rotation_offset}")
         
-        # 将欧拉角转换为旋转矩阵
+        # Convert Euler angles to rotation matrix
         roll, pitch, yaw = rotation_offset
         
-        # 创建旋转矩阵（ZYX顺序）
+        # Create rotation matrix (ZYX order)
         cos_r, sin_r = math.cos(roll), math.sin(roll)
         cos_p, sin_p = math.cos(pitch), math.sin(pitch) 
         cos_y, sin_y = math.cos(yaw), math.sin(yaw)
         
-        # Roll (X轴旋转)
+        # Roll (X-axis rotation)
         R_x = torch.tensor([
             [1, 0, 0],
             [0, cos_r, -sin_r],
             [0, sin_r, cos_r]
         ], dtype=poses.dtype, device=poses.device)
         
-        # Pitch (Y轴旋转)
+        # Pitch (Y-axis rotation)
         R_y = torch.tensor([
             [cos_p, 0, sin_p],
             [0, 1, 0],
             [-sin_p, 0, cos_p]
         ], dtype=poses.dtype, device=poses.device)
         
-        # Yaw (Z轴旋转)
+        # Yaw (Z-axis rotation)
         R_z = torch.tensor([
             [cos_y, -sin_y, 0],
             [sin_y, cos_y, 0],
             [0, 0, 1]
         ], dtype=poses.dtype, device=poses.device)
         
-        # 组合旋转矩阵 (ZYX顺序)
+        # Combine rotation matrices (ZYX order)
         R_offset = R_z @ R_y @ R_x
         
-        # 应用旋转偏移到每一帧
+        # Apply rotation offset to each frame
         for i in range(len(result)):
-            # 原始旋转矩阵
+            # Original rotation matrix
             original_rotation = result[i, :3, :3]
-            # 应用偏移旋转
+            # Apply offset rotation
             result[i, :3, :3] = R_offset @ original_rotation
     
     return result
@@ -339,34 +339,34 @@ def fixed_offset_trajectory(
     rotation_offset: list = [0.0, 0.0, 0.0],
 ) -> torch.Tensor:
     """
-    生成相对于前视相机的固定偏移轨迹
+    Generate fixed offset trajectory relative to front camera
 
     Args:
-        translation_offset (list): [x, y, z] 平移偏移量（米）
-        rotation_offset (list): [pitch, yaw, roll] 旋转偏移量（度）
+        translation_offset (list): [x, y, z] translation offset (meters)
+        rotation_offset (list): [pitch, yaw, roll] rotation offset (degrees)
     """
-    assert 0 in per_cam_poses.keys(), "需要前视中心相机（ID 0）"
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) required"
 
-    # 获取设备信息
+    # Get device information
     device = per_cam_poses[0].device
 
-    # 转换偏移量为张量
+    # Convert offsets to tensors
     trans_offset = torch.tensor(translation_offset, device=device, dtype=torch.float32)
     rot_offset = torch.tensor(rotation_offset, device=device, dtype=torch.float32)
 
-    # 确保original_frames至少为1
+    # Ensure original_frames is at least 1
     original_frames = max(1, original_frames)
-    # 计算步长，确保至少为1
+    # Calculate step size, ensure at least 1
     step = max(1, original_frames // 4)
     key_poses = per_cam_poses[0][::step]
 
     def convert_to_tensor(data, device):
         return torch.tensor(data, device=device, dtype=torch.float32)  # [!code ++]
 
-    # 应用偏移量
+    # Apply offsets
     modified_poses = []
     for pose in key_poses:
-        # 创建新位姿矩阵
+        # Create new pose matrix
         new_pose = torch.eye(4, device=device)
 
         rot_matrix = R.from_euler(
@@ -374,10 +374,10 @@ def fixed_offset_trajectory(
         ).as_matrix()
         rot_matrix = rot_matrix.astype(np.float32)  # [!code ++]
 
-        # 修改点3：保持矩阵乘法数据类型一致
+        # Modification 3: Keep matrix multiplication data types consistent
         new_rot = pose[:3, :3] @ convert_to_tensor(rot_matrix, device)  # [!code ++]
 
-        # 修改点4：确保平移偏移量数据类型正确
+        # Modification 4: Ensure translation offset data type is correct
         trans_offset = convert_to_tensor(translation_offset, device)  # [!code ++]
         offset_trans = pose[:3, :3] @ trans_offset
         new_trans = pose[:3, 3] + offset_trans
@@ -386,9 +386,9 @@ def fixed_offset_trajectory(
         new_pose[:3, 3] = new_trans
 
         modified_poses.append(new_pose)
-    # 确保至少有两个位姿才能插值
+    # Ensure at least two poses for interpolation
     if len(modified_poses) == 1:
-        # 如果只有一个位姿，直接复制它来创建目标帧数
+        # If only one pose, directly copy it to create target number of frames
         return modified_poses[0].unsqueeze(0).repeat(target_frames, 1, 1)
     return interpolate_poses(torch.stack(modified_poses), target_frames)
 
@@ -401,33 +401,33 @@ def analyze_front_center_interp(
     num_loops: int = 1,
 ) -> torch.Tensor:
     """
-    分析front_center_interp的逻辑，显示关键信息
+    Analyze front_center_interp logic, display key information
     """
-    print(f"🔍 Front Center Interp Analysis:")
+    print(f"\U0001f50d Front Center Interp Analysis:")
     
-    # 检查输入
+    # Check input
     assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) required"
     front_poses = per_cam_poses[0]
     
-    # 基本信息
+    # Basic information
     print(f"   Input: {len(front_poses)} poses -> Target: {target_frames} frames")
     print(f"   Original frames param: {original_frames}")
     
-    # 关键帧选择逻辑
+    # Key frame selection logic
     step = original_frames // 4
     key_poses = front_poses[::step]
     print(f"   Step size: {step} -> Key frames: {len(key_poses)}")
     
-    # 显示关键帧坐标
+    # Display key frame coordinates
     print(f"   Key frame positions:")
     for i, pose in enumerate(key_poses):
         pos = pose[:3, 3]
         print(f"     [{i}] {pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}")
     
-    # 进行插值
+    # Perform interpolation
     result = interpolate_poses(key_poses, target_frames)
     
-    # 输出结果
+    # Output result
     result_start = result[0][:3, 3]
     result_end = result[-1][:3, 3]
     print(f"   Output: {result.shape[0]} frames")
@@ -445,19 +445,19 @@ def analyze_kitti_trajectory(
     num_loops: int = 1,
 ) -> torch.Tensor:
     """
-    分析kitti轨迹的逻辑
+    Analyze kitti trajectory logic
     """
     npz_path =  "output/Kitti/dataset=Kitti/training_20250630_162211_FollowLeadingVehicleWithObstacle_1/camera_poses_eval/full_poses_2025-07-02_18-00-20.npz"
     
-    print(f"🔍 Kitti Trajectory Analysis:")
+    print(f"\U0001f50d Kitti Trajectory Analysis:")
     
     try:
-        # 加载数据
+        # Load data
         data = np.load(npz_path, allow_pickle=True)
         camera_poses = data['camera_poses']
         cam_names = data['cam_names']
         
-        # 找到前视中心相机
+        # Find front center camera
         front_mask = None
         for candidate in ['FRONT_CENTER', 'front_center', 'FRONT', 'front', '0']:
             mask = np.array([str(name) == candidate for name in cam_names])
@@ -469,31 +469,31 @@ def analyze_kitti_trajectory(
             front_mask = np.ones(len(cam_names), dtype=bool)
             front_mask[1:] = False
         
-        # 提取poses
+        # Extract poses
         front_poses = camera_poses[front_mask]
         frame_indices = data['frame_indices']
         front_frames = np.array(frame_indices)[front_mask]
         
-        # 排序
+        # Sort
         sorted_indices = np.argsort(front_frames)
         front_poses = front_poses[sorted_indices]
         
         print(f"   NPZ input: {len(front_poses)} poses -> Target: {target_frames} frames")
         
-        # 关键帧选择
+        # Key frame selection
         actual_frames = len(front_poses)
         step = max(1, actual_frames // 4)
         key_poses = front_poses[::step]
         
         print(f"   Step size: {step} -> Key frames: {len(key_poses)}")
         
-        # 显示关键帧坐标
+        # Display key frame coordinates
         print(f"   Key frame positions:")
         for i, pose in enumerate(key_poses):
             pos = pose[:3, 3]
             print(f"     [{i}] {pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}")
         
-        # 转换为tensor并插值
+        # Convert to tensor and interpolate
         key_poses_tensor = torch.tensor(key_poses, dtype=torch.float32)
         if per_cam_poses and len(per_cam_poses) > 0:
             sample_pose = per_cam_poses[list(per_cam_poses.keys())[0]]
@@ -501,7 +501,7 @@ def analyze_kitti_trajectory(
         
         result = interpolate_poses(key_poses_tensor, target_frames)
         
-        # 输出结果
+        # Output result
         result_start = result[0][:3, 3]
         result_end = result[-1][:3, 3]
         print(f"   Output: {result.shape[0]} frames")
@@ -524,7 +524,7 @@ def fixed_offset_trajectory_1(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [0.0, 0.0, 0.5]偏移"""
+    """Based on kitti_fixed_path + [0.0, 0.0, 0.5] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -540,7 +540,7 @@ def fixed_offset_trajectory_2(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [3.2, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [3.2, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -556,7 +556,7 @@ def fixed_offset_trajectory_3(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [1.6, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [1.6, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -572,7 +572,7 @@ def fixed_offset_trajectory_4(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [-3.2, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [-3.2, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -588,7 +588,7 @@ def fixed_offset_trajectory_5(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [-1.6, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [-1.6, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -604,7 +604,7 @@ def fixed_offset_trajectory_6(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [0.5, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [0.5, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -620,7 +620,7 @@ def fixed_offset_trajectory_7(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [-0.5, 0.0, 0.0]偏移"""
+    """Based on kitti_fixed_path + [-0.5, 0.0, 0.0] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -636,14 +636,14 @@ def fixed_offset_trajectory_8(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [0.5, 0.0, 0.0]偏移 + Y轴旋转15度"""
+    """Based on kitti_fixed_path + [0.5, 0.0, 0.0] offset + Y-axis rotation 15 degrees"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
         original_frames, 
         target_frames,
         position_offset=[0.0, -0.5, 0.0],
-        rotation_offset=[0.0, 0.0, math.radians(-15.0)],  # 转换为弧度
+        rotation_offset=[0.0, 0.0, math.radians(-15.0)],  # Convert to radians
         npz_path = FIX_TRAJ
     )
 
@@ -653,14 +653,14 @@ def fixed_offset_trajectory_9(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [-0.5, 0.0, 0.0]偏移 + Y轴旋转-15度"""
+    """Based on kitti_fixed_path + [-0.5, 0.0, 0.0] offset + Y-axis rotation -15 degrees"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
         original_frames, 
         target_frames,
         position_offset=[0.0, 0.5, 0.0],
-        rotation_offset=[0.0, 0.0, math.radians(15.0)],  # 转换为弧度
+        rotation_offset=[0.0, 0.0, math.radians(15.0)],  # Convert to radians
         npz_path = FIX_TRAJ
     )
 
@@ -670,7 +670,7 @@ def fixed_offset_trajectory_10(
     original_frames: int,
     target_frames: int,
 ) -> torch.Tensor:
-    """基于kitti_fixed_path + [0.0, 0.0, -0.5]偏移"""
+    """Based on kitti_fixed_path + [0.0, 0.0, -0.5] offset"""
     return kitti_fixed_path(
         dataset_type, 
         per_cam_poses, 
@@ -690,24 +690,24 @@ def double_lane_change_trajectory(
     second_change_start: int = 110,
     second_change_end: int = 130,
     lane_offset: float = 3.2,
-    offset_vector: list = [0.0, -1.0, 0.0],  # 向左变道
-    return_offset_vector: list = [0.0, 1.0, 0.0],  # 向右返回
-    first_steer_angle: float = 5.0,   # 第一次变道时的转向角度(度)
-    second_steer_angle: float = -5.0,  # 第二次变道时的转向角度(度)
+    offset_vector: list = [0.0, -1.0, 0.0],  # Lane change to the left
+    return_offset_vector: list = [0.0, 1.0, 0.0],  # Return to the right
+    first_steer_angle: float = 5.0,   # Steering angle for first lane change (degrees)
+    second_steer_angle: float = -5.0,  # Steering angle for second lane change (degrees)
 ) -> torch.Tensor:
     """
-    生成带转向的变道-变回轨迹
+    Generate lane change and return trajectory with steering
     
-    每次变道都包含：转向->回正 的过程
-    转向从change_start开始，在change_end结束
-    转向绕Y轴旋转（水平转向）
+    Each lane change includes: steering -> straightening process
+    Steering starts at change_start and ends at change_end
+    Steering rotates around Y-axis (horizontal steering)
     """
     import math
     import torch
     import numpy as np
     from scipy.spatial.transform import Rotation as R
     
-    assert 0 in per_cam_poses.keys(), "需要前视中心相机（ID 0）"
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required"
     assert (
         0
         <= first_change_start
@@ -715,66 +715,66 @@ def double_lane_change_trajectory(
         < second_change_start
         < second_change_end
         < target_frames
-    ), "帧索引设置有误"
+    ), "Invalid frame index settings"
     
-    # 获取设备信息
+    # Get device info
     device = per_cam_poses[0].device
     
-    # 生成基础轨迹（使用front_center_interp）
+    # Generate base trajectory (using front_center_interp)
     base_trajectory = front_center_interp(
         dataset_type, per_cam_poses, original_frames, target_frames
     )
     
-    # 归一化第一次变道的偏移向量
+    # Normalize the offset vector for the first lane change
     first_vector = torch.tensor(offset_vector, device=device, dtype=torch.float32)
     first_vector = first_vector / torch.norm(first_vector)
     first_full_offset = first_vector * lane_offset
     
-    # 归一化第二次变道的偏移向量
+    # Normalize the offset vector for the second lane change
     second_vector = torch.tensor(
         return_offset_vector, device=device, dtype=torch.float32
     )
     second_vector = second_vector / torch.norm(second_vector)
     second_full_offset = second_vector * lane_offset
     
-    # 创建变道轨迹
+    # Create lane change trajectory
     lane_change_trajectory = base_trajectory.clone()
     
-    # 创建转向旋转（绕Y轴旋转 - 水平转向）
-    # 第一次变道的转向旋转
+    # Create steering rotation (rotation around Y-axis - horizontal steering)
+    # Steering rotation for first lane change
     first_rot = R.from_euler('y', first_steer_angle, degrees=True)
     first_rot_matrix = torch.tensor(first_rot.as_matrix(), device=device, dtype=torch.float32)
     
-    # 第二次变道的转向旋转
+    # Steering rotation for second lane change
     second_rot = R.from_euler('y', second_steer_angle, degrees=True)
     second_rot_matrix = torch.tensor(second_rot.as_matrix(), device=device, dtype=torch.float32)
     
-    # 单位旋转矩阵（直行状态）
+    # Identity rotation matrix (straight driving state)
     identity_rot = torch.eye(3, device=device, dtype=torch.float32)
     
-    # 自定义球面线性插值函数
+    # Custom spherical linear interpolation function
     def custom_slerp(rot1, rot2, t):
         """
-        自定义的球面线性插值，兼容旧版本scipy
+        Custom spherical linear interpolation, compatible with older scipy versions
         """
         q1 = rot1.as_quat()
         q2 = rot2.as_quat()
         
-        # 计算四元数点积
+        # Calculate quaternion dot product
         dot = np.dot(q1, q2)
         
-        # 如果点积为负，反转第二个四元数以确保最短路径
+        # If dot product is negative, flip second quaternion to ensure shortest path
         if dot < 0.0:
             q2 = -q2
             dot = -dot
         
-        # 如果四元数几乎相同，直接线性插值
+        # If quaternions are nearly identical, use linear interpolation directly
         if dot > 0.9995:
             result = q1 + t * (q2 - q1)
             result /= np.linalg.norm(result)
             return R.from_quat(result)
         
-        # 计算插值角度
+        # Calculate interpolation angle
         theta_0 = np.arccos(np.abs(dot))
         sin_theta_0 = np.sin(theta_0)
         
@@ -784,37 +784,37 @@ def double_lane_change_trajectory(
         s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
         s1 = sin_theta / sin_theta_0
         
-        # 球面线性插值
+        # Spherical linear interpolation
         result = s0 * q1 + s1 * q2
         return R.from_quat(result)
     
-    # 计算每次变道的阶段长度
+    # Calculate phase length for each lane change
     first_duration = first_change_end - first_change_start
-    first_steer_duration = first_duration // 2  # 转向阶段（前半段）
-    first_return_duration = first_duration - first_steer_duration  # 回正阶段（后半段）
+    first_steer_duration = first_duration // 2  # Steering phase (first half)
+    first_return_duration = first_duration - first_steer_duration  # Straightening phase (second half)
     
     second_duration = second_change_end - second_change_start
-    second_steer_duration = second_duration // 2  # 转向阶段（前半段）
-    second_return_duration = second_duration - second_steer_duration  # 回正阶段（后半段）
+    second_steer_duration = second_duration // 2  # Steering phase (first half)
+    second_return_duration = second_duration - second_steer_duration  # Straightening phase (second half)
     
-    # 应用变道和转向
+    # Apply lane change and steering
     for frame_idx in range(target_frames):
         original_rotation = base_trajectory[frame_idx, :3, :3].clone()
         
         if frame_idx < first_change_start:
-            # 第一次变道之前保持原始轨迹
+            # Before first lane change, keep original trajectory
             continue
             
         elif frame_idx < first_change_start + first_steer_duration:
-            # 第一次变道：转向阶段（前半段）
+            # First lane change: steering phase (first half)
             progress = (frame_idx - first_change_start) / first_steer_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 平滑位移
+            # Smooth displacement
             current_offset = first_full_offset * ((frame_idx - first_change_start) / first_duration)
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 平滑转向
+            # Smooth steering
             start_rot = R.from_matrix(identity_rot.cpu().numpy())
             end_rot = R.from_matrix(first_rot_matrix.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -824,19 +824,19 @@ def double_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
             
         elif frame_idx <= first_change_end:
-            # 第一次变道：回正阶段（后半段）
+            # First lane change: straightening phase (second half)
             progress = (frame_idx - first_change_start - first_steer_duration) / first_return_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 继续移动
+            # Continue moving
             current_offset = first_full_offset * ((frame_idx - first_change_start) / first_duration)
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 从转向回到直行
+            # Return from steering to straight driving
             start_rot = R.from_matrix(first_rot_matrix.cpu().numpy())
             end_rot = R.from_matrix(identity_rot.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -846,26 +846,26 @@ def double_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
             
         elif frame_idx < second_change_start:
-            # 在两次变道之间保持直行
+            # Keep straight driving between the two lane changes
             lane_change_trajectory[frame_idx, :3, 3] += first_full_offset
-            # 保持直行状态
+            # Maintain straight driving state
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ identity_rot
             
         elif frame_idx < second_change_start + second_steer_duration:
-            # 第二次变道：转向阶段（前半段）
+            # Second lane change: steering phase (first half)
             progress = (frame_idx - second_change_start) / second_steer_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 平滑返回
+            # Smooth return
             total_progress = (frame_idx - second_change_start) / second_duration
             current_offset = first_full_offset + second_full_offset * total_progress
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 平滑转向
+            # Smooth steering
             start_rot = R.from_matrix(identity_rot.cpu().numpy())
             end_rot = R.from_matrix(second_rot_matrix.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -875,20 +875,20 @@ def double_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
             
         elif frame_idx <= second_change_end:
-            # 第二次变道：回正阶段（后半段）
+            # Second lane change: straightening phase (second half)
             progress = (frame_idx - second_change_start - second_steer_duration) / second_return_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 继续返回
+            # Continue returning
             total_progress = (frame_idx - second_change_start) / second_duration
             current_offset = first_full_offset + second_full_offset * total_progress
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 从转向回到直行
+            # Return from steering to straight driving
             start_rot = R.from_matrix(second_rot_matrix.cpu().numpy())
             end_rot = R.from_matrix(identity_rot.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -898,12 +898,12 @@ def double_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
             
         else:
-            # 第二次变道之后保持直行状态
-            # 不添加任何偏移，保持直行
+            # After second lane change, maintain straight driving state
+            # No offset added, keep driving straight
             continue
     
     return lane_change_trajectory
@@ -917,72 +917,72 @@ def smooth_lane_change_trajectory(
     start_frame: int = 20,
     end_frame: int = 50,
     lane_offset: float = -3.2,
-    offset_vector: list = [0.0, 1.0, 0.0],  # 向左变道
-    steer_angle: float = -5.0,  # 转向角度(度)
+    offset_vector: list = [0.0, 1.0, 0.0],  # Lane change to the left
+    steer_angle: float = -5.0,  # Steering angle (degrees)
 ) -> torch.Tensor:
     """
-    生成带转向的单次变道轨迹
+    Generate single lane change trajectory with steering
     
-    变道过程包含：转向->回正 的过程
-    转向从start_frame开始，在end_frame结束
-    转向绕Y轴旋转（水平转向）
+    Lane change process includes: steering -> straightening
+    Steering starts at start_frame and ends at end_frame
+    Steering rotates around Y-axis (horizontal steering)
     """
     import math
     import torch
     import numpy as np
     from scipy.spatial.transform import Rotation as R
     
-    assert 0 in per_cam_poses.keys(), "需要前视中心相机（ID 0）"
-    assert 0 <= start_frame < end_frame < target_frames, "帧索引设置有误"
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required"
+    assert 0 <= start_frame < end_frame < target_frames, "Invalid frame index settings"
     
-    # 获取设备信息
+    # Get device info
     device = per_cam_poses[0].device
     
-    # 生成基础轨迹（使用front_center_interp）
+    # Generate base trajectory (using front_center_interp)
     base_trajectory = front_center_interp(
         dataset_type, per_cam_poses, original_frames, target_frames
     )
     
-    # 归一化偏移向量
+    # Normalize offset vector
     norm_vector = torch.tensor(offset_vector, device=device, dtype=torch.float32)
     norm_vector = norm_vector / torch.norm(norm_vector)
     
-    # 计算完整偏移量
+    # Calculate full offset
     full_offset = norm_vector * lane_offset
     
-    # 创建变道轨迹
+    # Create lane change trajectory
     lane_change_trajectory = base_trajectory.clone()
     
-    # 创建转向旋转（绕Y轴旋转 - 水平转向）
+    # Create steering rotation (rotation around Y-axis - horizontal steering)
     steer_rot = R.from_euler('y', steer_angle, degrees=True)
     steer_rot_matrix = torch.tensor(steer_rot.as_matrix(), device=device, dtype=torch.float32)
     
-    # 单位旋转矩阵（直行状态）
+    # Identity rotation matrix (straight driving state)
     identity_rot = torch.eye(3, device=device, dtype=torch.float32)
     
-    # 自定义球面线性插值函数
+    # Custom spherical linear interpolation function
     def custom_slerp(rot1, rot2, t):
         """
-        自定义的球面线性插值，兼容旧版本scipy
+        Custom spherical linear interpolation, compatible with older scipy versions
         """
         q1 = rot1.as_quat()
         q2 = rot2.as_quat()
         
-        # 计算四元数点积
+        # Calculate quaternion dot product
         dot = np.dot(q1, q2)
         
-        # 如果点积为负，反转第二个四元数以确保最短路径
+        # If dot product is negative, flip second quaternion to ensure shortest path
         if dot < 0.0:
             q2 = -q2
             dot = -dot
         
-        # 如果四元数几乎相同，直接线性插值
+        # If quaternions are nearly identical, use linear interpolation directly
         if dot > 0.9995:
             result = q1 + t * (q2 - q1)
             result /= np.linalg.norm(result)
             return R.from_quat(result)
         
-        # 计算插值角度
+        # Calculate interpolation angle
         theta_0 = np.arccos(np.abs(dot))
         sin_theta_0 = np.sin(theta_0)
         
@@ -992,33 +992,33 @@ def smooth_lane_change_trajectory(
         s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
         s1 = sin_theta / sin_theta_0
         
-        # 球面线性插值
+        # Spherical linear interpolation
         result = s0 * q1 + s1 * q2
         return R.from_quat(result)
     
-    # 计算变道的阶段长度
+    # Calculate phase length for lane change
     duration = end_frame - start_frame
-    steer_duration = duration // 2  # 转向阶段（前半段）
-    return_duration = duration - steer_duration  # 回正阶段（后半段）
+    steer_duration = duration // 2  # Steering phase (first half)
+    return_duration = duration - steer_duration  # Straightening phase (second half)
     
-    # 对每一帧应用平滑过渡的偏移和转向
+    # Apply smooth transition offset and steering for each frame
     for frame_idx in range(target_frames):
         original_rotation = base_trajectory[frame_idx, :3, :3].clone()
         
         if frame_idx < start_frame:
-            # 起始帧之前保持原始轨迹
+            # Before start frame, keep original trajectory
             continue
             
         elif frame_idx < start_frame + steer_duration:
-            # 转向阶段（前半段）
+            # Steering phase (first half)
             progress = (frame_idx - start_frame) / steer_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 平滑位移
+            # Smooth displacement
             current_offset = full_offset * ((frame_idx - start_frame) / duration)
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 平滑转向
+            # Smooth steering
             start_rot = R.from_matrix(identity_rot.cpu().numpy())
             end_rot = R.from_matrix(steer_rot_matrix.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -1028,19 +1028,19 @@ def smooth_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
             
         elif frame_idx <= end_frame:
-            # 回正阶段（后半段）
+            # Straightening phase (second half)
             progress = (frame_idx - start_frame - steer_duration) / return_duration
             smooth_factor = 0.5 - 0.5 * math.cos(math.pi * progress)
             
-            # 继续移动
+            # Continue moving
             current_offset = full_offset * ((frame_idx - start_frame) / duration)
             lane_change_trajectory[frame_idx, :3, 3] += current_offset
             
-            # 从转向回到直行
+            # Return from steering to straight driving
             start_rot = R.from_matrix(steer_rot_matrix.cpu().numpy())
             end_rot = R.from_matrix(identity_rot.cpu().numpy())
             interpolated_rot = custom_slerp(start_rot, end_rot, smooth_factor)
@@ -1050,12 +1050,12 @@ def smooth_lane_change_trajectory(
                 dtype=torch.float32
             )
             
-            # 应用平滑旋转
+            # Apply smooth rotation
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ interpolated_rot_matrix
         else:
-            # 结束帧之后保持新位置和直行状态
+            # After end frame, maintain new position and straight driving state
             lane_change_trajectory[frame_idx, :3, 3] += full_offset
-            # 保持直行状态
+            # Maintain straight driving state
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ identity_rot
     
     return lane_change_trajectory
@@ -1154,17 +1154,17 @@ def circle_trajectory(
     radius: float = 5.0,
     height: float = 2.0,
 ) -> torch.Tensor:
-    """生成环绕场景的圆形轨迹"""
-    # 修复1：正确获取中心点坐标
+    """Generate circular trajectory around the scene"""
+    # Fix 1: Correctly get center point coordinates
     center_pose = per_cam_poses[0][original_frames // 2]
     center = center_pose[:3, 3].cpu().numpy()  # [!code --]
-    center = center_pose[:3, 3].cpu().numpy()  # [!code ++] 直接取位置坐标
+    center = center_pose[:3, 3].cpu().numpy()  # [!code ++] Directly get position coordinates
 
-    # 修复2：添加调试信息
-    print(f"Center pose shape: {center_pose.shape}")  # 应为 (4,4)
-    print(f"Center coordinates: {center}")  # 应显示三维坐标
+    # Fix 2: Add debug information
+    print(f"Center pose shape: {center_pose.shape}")  # Should be (4,4)
+    print(f"Center coordinates: {center}")  # Should display 3D coordinates
 
-    # 生成圆形轨迹参数
+    # Generate circular trajectory parameters
     angles = np.linspace(0, 2 * np.pi, 12)
     key_poses = []
 
@@ -1173,14 +1173,14 @@ def circle_trajectory(
         y = center[1] + radius * np.sin(angle)
         z = center[2] + height  # [!code ++]
 
-        # 确保坐标类型正确
+        # Ensure coordinate types are correct
         pose = torch.eye(4, device=center_pose.device)
         pose[:3, 3] = torch.tensor([x, y, z], device=center_pose.device)
 
-        # 修复3：添加方向计算保护
+        # Fix 3: Add direction calculation protection
         direction = center - pose[:3, 3].cpu().numpy()
         if np.linalg.norm(direction) < 1e-6:
-            direction = np.array([0.0, 0.0, 1.0])  # 防止零向量
+            direction = np.array([0.0, 0.0, 1.0])  # Prevent zero vector
 
         pose[:3, :3] = look_at_rotation(
             torch.tensor(direction, device=center_pose.device)
@@ -1199,14 +1199,14 @@ def spiral_trajectory(
     spiral_height: float = 3.0,
     num_turns: int = 2,
 ) -> torch.Tensor:
-    """生成螺旋上升轨迹"""
+    """Generate spiral ascending trajectory"""
     center_pose = per_cam_poses[0][original_frames // 2]
     center = center_pose[:3, 3].mean(dim=0).cpu().numpy()
 
     angles = np.linspace(0, num_turns * 2 * np.pi, 12)
     key_poses = []
     for i, angle in enumerate(angles):
-        r = radius * (1 - i / len(angles))  # 半径逐渐缩小
+        r = radius * (1 - i / len(angles))  # Radius gradually decreases
         x = center[0] + r * np.cos(angle)
         y = center[1] + r * np.sin(angle)
         z = center[2] + spiral_height * (i / len(angles))
@@ -1231,17 +1231,17 @@ def look_around_trajectory(
     elevation_range: tuple = (-30, 30),
     azimuth_range: tuple = (0, 360),
 ) -> torch.Tensor:
-    """生成环绕观察轨迹（固定位置，旋转视角）"""
+    """Generate look-around trajectory (fixed position, rotating viewpoint)"""
     center_pose = per_cam_poses[0][original_frames // 2]
     center = center_pose[:3, 3].cpu().numpy()
 
-    # 生成视角参数
+    # Generate viewing angle parameters
     elevations = np.linspace(*elevation_range, 6)
     azimuths = np.linspace(*azimuth_range, 6)
 
     key_poses = []
     for elev, azim in zip(elevations, azimuths):
-        # 将球坐标转换为笛卡尔坐标
+        # Convert spherical coordinates to Cartesian coordinates
         r = np.linalg.norm(center)
         x = r * np.cos(np.radians(azim)) * np.cos(np.radians(elev))
         y = r * np.sin(np.radians(azim)) * np.cos(np.radians(elev))

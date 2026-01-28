@@ -4,7 +4,7 @@ import numpy as np
 #     [[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0], [1.0, 0.0, 0.0, 0]]
 # )
 
-# # 旋转矩阵 R
+# # Rotation matrix R
 # R = np.array(
 #     [
 #         [7.533745e-03, -9.999714e-01, -6.166020e-04],
@@ -13,7 +13,7 @@ import numpy as np
 #     ]
 # )
 
-# 旋转矩阵 R
+# Rotation matrix R
 R = np.array(
     [
         [0, -1, 0],
@@ -22,13 +22,13 @@ R = np.array(
     ]
 )
 
-# 平移向量 T
+# Translation vector T
 T = np.array([0.0, 0.1, 0.0])
 
-# 构建 4x4 齐次变换矩阵
-transform_matrix = np.eye(4)  # 初始化单位矩阵
-transform_matrix[:3, :3] = R  # 填充旋转部分
-transform_matrix[:3, 3] = T  # 填充平移部分
+# Build 4x4 homogeneous transformation matrix
+transform_matrix = np.eye(4)  # Initialize identity matrix
+transform_matrix[:3, :3] = R  # Fill rotation part
+transform_matrix[:3, 3] = T  # Fill translation part
 
 transform_matrix = np.linalg.inv(transform_matrix)
 print("transform_matrix:")
@@ -52,9 +52,9 @@ for i, cam_name in enumerate(cam_list):
 
     location = cam_config["TRANSFORM"]["location"]
     rotation = cam_config["TRANSFORM"]["rotation"]
-    # 将欧拉角转换为旋转矩阵（ZYX顺序）
+    # Convert euler angles to rotation matrix (ZYX order)
     rx, ry, rz = np.radians(rotation)
-    # 构建各轴旋转矩阵（右手坐标系，ZYX顺序）
+    # Build rotation matrices for each axis (right-hand coordinate system, ZYX order)
     Rz = np.array(
         [[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]]
     )
@@ -71,7 +71,7 @@ for i, cam_name in enumerate(cam_list):
     print(R)
     R = np.array([[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0]])
 
-    # 构建4x4变换矩阵
+    # Build 4x4 transformation matrix
     extrinsic_matrix = np.eye(4)
     extrinsic_matrix[:3, :4] = R
     extrinsic_matrix[:3, 3] = location

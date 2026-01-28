@@ -20,22 +20,22 @@ def export_gaussians_to_ply(
     export_all_frames: bool = False,
 ):
     """
-    将高斯体导出为PLY文件
+    Export Gaussians to PLY file
 
     Args:
-        model: 高斯模型
-        save_dir: 保存目录
-        alpha_thresh: 透明度阈值，用于过滤点
-        instance_id: 实例ID，如果指定则只导出该实例
-        frame_idx: 帧索引，用于SMPL模型
-        normalize: 是否将点云归一化到[0,1]范围
-        export_all_frames: 是否导出所有帧的点云
+        model: Gaussian model
+        save_dir: Save directory
+        alpha_thresh: Opacity threshold for filtering points
+        instance_id: Instance ID, exports only this instance if specified
+        frame_idx: Frame index, used for SMPL model
+        normalize: Whether to normalize point cloud to [0,1] range
+        export_all_frames: Whether to export point clouds for all frames
     """
     os.makedirs(save_dir, exist_ok=True)
 
     if hasattr(model, "smpl_qauts"):  # SMPLNodes
         if export_all_frames:
-            # 导出所有帧
+            # Export all frames
             for frame in range(model.num_frames):
                 if instance_id is not None:
                     if not model.instances_fv[frame, instance_id]:
@@ -58,7 +58,7 @@ def export_gaussians_to_ply(
                         f"Exported frame {frame} instance {instance_id} to {save_path}"
                     )
         else:
-            # 只导出指定帧
+            # Export specified frame only
             point_data = model.export_gaussians_to_ply(
                 alpha_thresh=alpha_thresh,
                 instance_id=instance_id,
@@ -106,17 +106,17 @@ def export_gaussians_to_ply(
 
 
 def main(args):
-    # 加载配置
+    # Load configuration
     log_dir = os.path.dirname(args.resume_from)
     cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 构建数据集
+    # Build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
 
-    # 设置trainer
+    # Setup trainer
     trainer = import_str(cfg.trainer.type)(
         **cfg.trainer,
         num_timesteps=dataset.num_img_timesteps,
@@ -128,17 +128,17 @@ def main(args):
         device=device,
     )
 
-    # 从checkpoint恢复
+    # Resume from checkpoint
     trainer.resume_from_checkpoint(ckpt_path=args.resume_from, load_only_model=True)
     logger.info(f"Resumed from checkpoint: {args.resume_from}")
 
-    # 获取要导出的模型
+    # Get the model to export
     if args.model_name is not None:
         model = trainer.models[args.model_name]
     else:
         model = trainer.models[list(trainer.models.keys())[0]]
 
-    # 导出PLY文件
+    # Export PLY file
     export_gaussians_to_ply(
         model=model,
         save_dir=args.save_dir,
@@ -153,7 +153,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export Gaussian model to PLY file")
 
-    # 必需参数
+    # Required arguments
     parser.add_argument(
         "--resume_from",
         type=str,
@@ -164,7 +164,7 @@ if __name__ == "__main__":
         "--save_dir", type=str, required=True, help="Directory to save PLY files"
     )
 
-    # 可选参数
+    # Optional arguments
     parser.add_argument(
         "--model_name",
         type=str,
@@ -192,7 +192,7 @@ if __name__ == "__main__":
         help="Export all frames for SMPL model",
     )
 
-    # 其他配置选项
+    # Other configuration options
     parser.add_argument(
         "opts",
         nargs=argparse.REMAINDER,

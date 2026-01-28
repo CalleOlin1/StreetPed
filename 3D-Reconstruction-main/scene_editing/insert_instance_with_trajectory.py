@@ -434,58 +434,58 @@ def insert_rigid_instance_with_start_frame(
 
 def handle_insert_with_trajectory(args, trainer, dataset, cfg):
     """
-    处理带轨迹的插入操作
+    Handle insertion operation with trajectory
     """
     logger.info("=" * 60)
-    logger.info("开始插入实例并应用轨迹")
+    logger.info("Starting instance insertion and trajectory application")
     logger.info("=" * 60)
     
-    # 加载轨迹数据
+    # Load trajectory data
     trajectory_data = load_trajectory_data(args.trajectory_json_path, args.trajectory_instance_id)
     
-    # 验证实例文件
+    # Validate instance files
     instance_files = args.instance_files
     valid_files = []
     for file_path in instance_files:
         if not os.path.exists(file_path):
-            logger.warning(f"实例文件不存在，跳过: {file_path}")
+            logger.warning(f"Instance file does not exist, skipping: {file_path}")
             continue
         valid_files.append(file_path)
     
     if not valid_files:
-        logger.error("没有有效的实例文件可以插入")
+        logger.error("No valid instance files available for insertion")
         return False
     
-    logger.info(f"将插入以下实例文件:")
+    logger.info(f"Will insert the following instance files:")
     for file_path in valid_files:
         file_size = Path(file_path).stat().st_size / 1024 / 1024  # MB
         logger.info(f"  {file_path} ({file_size:.2f} MB)")
     
-    # 准备新实例ID
+    # Prepare new instance IDs
     new_instance_ids = args.new_instance_ids
     if new_instance_ids and len(new_instance_ids) != len(valid_files):
-        logger.warning(f"新实例ID数量({len(new_instance_ids)})与文件数量({len(valid_files)})不匹配")
+        logger.warning(f"Number of new instance IDs({len(new_instance_ids)}) does not match number of files({len(valid_files)})")
         new_instance_ids = new_instance_ids[:len(valid_files)] if new_instance_ids else None
     
-    # 获取开始帧参数
+    # Get start frame parameter
     start_frame = getattr(args, 'start_frame', 0)
     if start_frame > 0:
-        logger.info(f"将从第 {start_frame} 帧开始应用实例运动数据")
+        logger.info(f"Will start applying instance motion data from frame {start_frame}")
 
-    # 打印插入前的场景状态
-    logger.info("插入前的场景状态:")
+    # Print scene state before insertion
+    logger.info("Scene state before insertion:")
     print_node_info(trainer)
     
-    # 执行插入操作
+    # Execute insertion operation
     inserted_ids = []
     for i, file_path in enumerate(valid_files):
         try:
-            logger.info(f"\n--- 处理文件 {i+1}/{len(valid_files)}: {file_path} ---")
+            logger.info(f"\n--- Processing file {i+1}/{len(valid_files)}: {file_path} ---")
             
-            # 加载实例数据
+            # Load instance data
             instance_data = load_instance_data(file_path)
             
-            # 确定实例类型
+            # Determine instance type
             if "smpl_template" in instance_data or "voxel_deformer" in instance_data:
                 instance_type = "smpl"
                 insert_func = insert_smpl_instance_with_start_frame
@@ -493,18 +493,18 @@ def handle_insert_with_trajectory(args, trainer, dataset, cfg):
                 instance_type = "rigid"
                 insert_func = insert_rigid_instance_with_start_frame
             
-            logger.info(f"检测到实例类型: {instance_type.upper()}")
+            logger.info(f"Detected instance type: {instance_type.upper()}")
             
-            # 验证模型是否支持该类型
+            # Verify if model supports this type
             model_key = get_model_key(instance_type)
             if model_key not in trainer.models:
-                logger.error(f"目标场景不支持{instance_type.upper()}实例，跳过")
+                logger.error(f"Target scene does not support {instance_type.upper()} instances, skipping")
                 continue
             
-            # 确定新实例ID
+            # Determine new instance ID
             new_id = new_instance_ids[i] if new_instance_ids and i < len(new_instance_ids) else None
             
-            # 执行插入（使用支持start_frame的包装函数）
+            # Execute insertion (using wrapper function that supports start_frame)
             actual_id = insert_func(
                 trainer=trainer,
                 instance_data=instance_data,
@@ -515,33 +515,33 @@ def handle_insert_with_trajectory(args, trainer, dataset, cfg):
             
             if actual_id is not None:
                 inserted_ids.append(actual_id)
-                logger.info(f"✓ 成功插入实例，分配ID: {actual_id}")
+                logger.info(f"✓ Successfully inserted instance, assigned ID: {actual_id}")
                 
-                # 应用轨迹数据
-                logger.info(f"开始为实例 {actual_id} 应用轨迹数据...")
+                # Apply trajectory data
+                logger.info(f"Starting to apply trajectory data for instance {actual_id}...")
                 apply_trajectory_to_instance(trainer, model_key, actual_id, trajectory_data)
-                logger.info(f"✓ 轨迹应用完成")
+                logger.info(f"✓ Trajectory application complete")
                 
             else:
-                logger.error(f"✗ 插入失败，未返回有效ID")
+                logger.error(f"✗ Insertion failed, no valid ID returned")
             
         except Exception as e:
-            logger.error(f"处理文件 {file_path} 时出错: {str(e)}")
+            logger.error(f"Error processing file {file_path}: {str(e)}")
             logger.error(traceback.format_exc())
             continue
     
-    # 打印插入后的场景状态
-    logger.info("\n插入并应用轨迹后的场景状态:")
+    # Print scene state after insertion
+    logger.info("\nScene state after insertion and trajectory application:")
     final_node_info = print_node_info(trainer)
     
-    logger.info(f"\n操作完成!")
-    logger.info(f"成功插入并应用轨迹: {len(inserted_ids)}/{len(valid_files)} 个实例")
+    logger.info(f"\nOperation complete!")
+    logger.info(f"Successfully inserted and applied trajectory: {len(inserted_ids)}/{len(valid_files)} instances")
     if inserted_ids:
-        logger.info(f"已处理的实例ID: {inserted_ids}")
+        logger.info(f"Processed instance IDs: {inserted_ids}")
     
-    # 渲染结果（如果指定了输出目录）
+    # Render result (if output directory is specified)
     if args.output_dir and inserted_ids:
-        logger.info("\n开始渲染最终场景...")
+        logger.info("\nStarting to render final scene...")
         try:
             output_dir = Path(args.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -555,12 +555,12 @@ def handle_insert_with_trajectory(args, trainer, dataset, cfg):
                 log_dir=log_dir,
                 post_fix="_with_trajectory"
             )
-            logger.info(f"渲染完成，结果保存到: {output_dir}")
+            logger.info(f"Rendering complete, results saved to: {output_dir}")
             
-            # 保存最终场景信息
+            # Save final scene information
             save_node_info(final_node_info, str(output_dir))
             
-            # 保存使用的轨迹信息
+            # Save used trajectory information
             trajectory_info_path = output_dir / "trajectory_info.json"
             with open(trajectory_info_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -569,10 +569,10 @@ def handle_insert_with_trajectory(args, trainer, dataset, cfg):
                     "inserted_instance_ids": inserted_ids,
                     "trajectory_data": trajectory_data
                 }, f, indent=2, ensure_ascii=False)
-            logger.info(f"轨迹信息已保存到: {trajectory_info_path}")
+            logger.info(f"Trajectory information saved to: {trajectory_info_path}")
             
         except Exception as e:
-            logger.error(f"渲染过程中出错: {str(e)}")
+            logger.error(f"Error during rendering: {str(e)}")
             logger.error(traceback.format_exc())
     
     return len(inserted_ids) > 0
@@ -580,12 +580,12 @@ def handle_insert_with_trajectory(args, trainer, dataset, cfg):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="根据轨迹数据插入实例工具",
+        description="Insert instance based on trajectory data tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-使用示例:
+Usage examples:
 
-1. 插入实例并应用轨迹:
+1. Insert instance and apply trajectory:
    python scene_editing/insert_instance_with_trajectory.py \\
        --resume_from output/scene/checkpoint_final.pth \\
        --instance_files ./saved_instances/smpl_instance_0.pkl \\
@@ -594,7 +594,7 @@ def main():
        --trajectory_instance_id 1 \\
        --output_dir ./trajectory_output
 
-2. 多个实例插入:
+2. Multiple instance insertion:
    python scene_editing/insert_instance_with_trajectory.py \\
        --resume_from output/scene/checkpoint_final.pth \\
        --instance_files ./saved_instances/smpl_instance_0.pkl ./saved_instances/smpl_instance_1.pkl \\
@@ -605,79 +605,79 @@ def main():
         """
     )
     
-    # 基本参数
+    # Basic parameters
     parser.add_argument(
         "--resume_from", type=str, required=True,
-        help="检查点路径"
+        help="Checkpoint path"
     )
     
-    # 插入操作参数
+    # Insertion operation parameters
     parser.add_argument(
         "--instance_files", type=str, nargs="+", required=True,
-        help="要插入的实例文件路径列表"
+        help="List of instance file paths to insert"
     )
     parser.add_argument(
         "--new_instance_ids", type=int, nargs="+",
-        help="新实例ID列表，如果不指定则自动分配"
+        help="List of new instance IDs, auto-assigned if not specified"
     )
     
-    # 轨迹参数
+    # Trajectory parameters
     parser.add_argument(
         "--trajectory_json_path", type=str,
         default="data/kitti/processed/training_20250630_170054_FollowLeadingVehicleWithObstacle_1/instances/instances_info.json",
-        help="轨迹JSON文件路径"
+        help="Trajectory JSON file path"
     )
     parser.add_argument(
         "--trajectory_instance_id", type=str, required=True,
-        help="要使用轨迹的实例ID（JSON文件中的键）"
+        help="Instance ID to use trajectory from (key in JSON file)"
     )
     
-    # 输出参数
+    # Output parameters
     parser.add_argument(
         "--output_dir", type=str,
-        help="输出目录（用于渲染和保存信息）"
+        help="Output directory (for rendering and saving information)"
     )
     parser.add_argument(
         "--no_render", action="store_true",
-        help="不渲染结果，只进行操作"
+        help="Do not render result, only perform operation"
     )
     parser.add_argument(
         "--start_frame", type=int, default=0,
-        help="从第几帧开始应用插入实例的运动数据（默认为0，即从第一帧开始）。轨迹数据仍将应用于所有帧。"
+        help="Start applying inserted instance motion data from which frame (default 0, i.e., from first frame). Trajectory data will still be applied to all frames."
     )
     
-    # 配置覆盖
+    # Configuration override
     parser.add_argument(
         "opts", nargs=argparse.REMAINDER,
-        help="配置覆盖选项"
+        help="Configuration override options"
     )
     
     args = parser.parse_args()
     
     try:
-        # 验证轨迹JSON文件是否存在
+        # Verify trajectory JSON file exists
         if not os.path.exists(args.trajectory_json_path):
-            logger.error(f"轨迹JSON文件不存在: {args.trajectory_json_path}")
+            logger.error(f"Trajectory JSON file does not exist: {args.trajectory_json_path}")
             sys.exit(1)
         
-        # 加载模型和数据集
+        # Load model and dataset
         trainer, dataset, cfg = load_trainer_and_dataset(args.resume_from, args.opts)
         
-        # 执行插入和轨迹应用操作
+        # Execute insertion and trajectory application operation
         success = handle_insert_with_trajectory(args, trainer, dataset, cfg)
         
         if success:
             logger.info("=" * 60)
-            logger.info("插入实例并应用轨迹操作完成!")
+            logger.info("Instance insertion and trajectory application complete!")
             logger.info("=" * 60)
         else:
             logger.error("=" * 60)
-            logger.error("插入实例并应用轨迹操作失败!")
+            logger.error("Instance insertion and trajectory application failed!")
             logger.error("=" * 60)
             sys.exit(1)
         
     except Exception as e:
-        logger.error(f"程序执行失败: {str(e)}")
+        logger.error(f"Program execution failed: {str(e)}")
         logger.error(traceback.format_exc())
         sys.exit(1)
 

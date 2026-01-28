@@ -138,15 +138,15 @@ def save_camera_poses(poses_dict, save_path, verbose=True):
     # Ensure save directory exists
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
-    # 保存为.npz格式
+    # Save as .npz format
     np.savez(save_path, **poses_dict)
     if verbose:
         logger.info(f"Camera poses saved to {save_path}")
     
-    # 保存为更易读的JSON格式摘要
+    # Save as more readable JSON format summary
     json_path = save_path.replace('.npz', '_summary.json')
     
-    # 处理cam_ids，确保转换为可哈希的类型
+    # Process cam_ids, ensure conversion to hashable types
     cam_ids_list = []
     for cam_id in poses_dict['cam_ids']:
         if isinstance(cam_id, np.ndarray):
@@ -165,7 +165,7 @@ def save_camera_poses(poses_dict, save_path, verbose=True):
         }
     }
     
-    # 添加轨迹统计
+    # Add trajectory statistics
     if len(poses_dict['camera_positions']) > 0:
         positions = np.array(poses_dict['camera_positions'])
         summary_data['trajectory_stats'] = {
@@ -202,7 +202,7 @@ def analyze_camera_trajectory(poses_dict, verbose=True):
         logger.info(f"Total frames: {len(positions)}")
         logger.info(f"Camera names: {set(poses_dict['cam_names'])}")
         
-        # 处理cam_ids，确保可以正确显示
+        # Process cam_ids, ensure they can be displayed correctly
         cam_ids_clean = []
         for cam_id in poses_dict['cam_ids']:
             if isinstance(cam_id, np.ndarray):
@@ -211,13 +211,13 @@ def analyze_camera_trajectory(poses_dict, verbose=True):
                 cam_ids_clean.append(int(cam_id))
         logger.info(f"Camera IDs: {set(cam_ids_clean)}")
         
-        # 位置统计
+        # Position statistics
         logger.info(f"Position ranges:")
         logger.info(f"  X: [{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}]")
         logger.info(f"  Y: [{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}]")
         logger.info(f"  Z: [{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]")
         
-        # 移动距离
+        # Movement distance
         if len(positions) > 1:
             distances = np.linalg.norm(np.diff(positions, axis=0), axis=1)
             total_distance = distances.sum()
@@ -225,15 +225,15 @@ def analyze_camera_trajectory(poses_dict, verbose=True):
             logger.info(f"Total movement distance: {total_distance:.3f}")
             logger.info(f"Average inter-frame distance: {avg_distance:.3f}")
         
-        # 内参信息
-        intrinsics = poses_dict['camera_intrinsics'][0]  # 假设所有帧内参相同
+        # Intrinsic parameters
+        intrinsics = poses_dict['camera_intrinsics'][0]  # Assume all frames have the same intrinsics
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
         logger.info(f"Camera intrinsics:")
         logger.info(f"  Focal length: fx={fx}, fy={fy}")
         logger.info(f"  Principal point: cx={cx}, cy={cy}")
         
-        # 处理图像尺寸
+        # Process image size
         height = poses_dict['heights'][0]
         width = poses_dict['widths'][0]
         if isinstance(height, np.ndarray):
@@ -316,7 +316,7 @@ def render(
     
     # misc
     cam_names, cam_ids = [], []
-    # 新增：相机pose相关的列表
+    # New: Camera pose related lists
     if extract_poses:
         camera_poses = []
         camera_positions = []
@@ -344,17 +344,17 @@ def render(
             for k, v in cam_infos.items():
                 if isinstance(v, Tensor):
                     cam_infos[k] = v.cuda(non_blocking=True)
-                        # 新增：提取相机pose信息
+                        # New: Extract camera pose information
             if extract_poses:
-                # 提取相机pose (camera_to_world变换矩阵)
+                # Extract camera pose (camera_to_world transformation matrix)
                 c2w_matrix = cam_infos["camera_to_world"].cpu().numpy()
                 camera_poses.append(c2w_matrix.copy())
                 
-                # 提取相机位置和旋转
+                # Extract camera position and rotation
                 camera_positions.append(c2w_matrix[:3, 3].copy())
                 camera_rotations.append(c2w_matrix[:3, :3].copy())
                 
-                # 提取相机内参和图像尺寸
+                # Extract camera intrinsics and image size
                 camera_intrinsics.append(cam_infos["intrinsics"].cpu().numpy().copy())
                 heights.append(cam_infos["height"].cpu().numpy())
                 widths.append(cam_infos["width"].cpu().numpy())
@@ -649,13 +649,13 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     Perform rendering and save the result as a video.
     
     Args:
-        traj_type (str): 新增轨迹类型参数
+        traj_type (str): Trajectory type parameter
     """
     trainer.set_eval()  
     
     writer = imageio.get_writer(save_path, mode='I', fps=fps)
 
-    # 修改点1：使用轨迹类型作为子目录名称
+    # Modification 1: Use trajectory type as subdirectory name
     raw_output_dir = os.path.join(os.path.dirname(save_path), f"raw_{traj_type}")
     os.makedirs(raw_output_dir, exist_ok=True)
     logger.info(f"Created trajectory-specific raw output: {raw_output_dir}")
@@ -676,19 +676,19 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                 novel_view=True
             )
 
-            # 原始RGB数据保存
-            rgb_raw = outputs["rgb"].cpu().numpy()  # 保持原始数据 [H, W, 3]
+            # Raw RGB data saving
+            rgb_raw = outputs["rgb"].cpu().numpy()  # Keep original data [H, W, 3]
             
-            # 生成唯一文件名
+            # Generate unique filename
             frame_idx = frame_data["image_infos"]["frame_idx"][0,0].item()
             
-            # 生成文件名
+            # Generate filename
             raw_rgb_path = os.path.join(
                 raw_output_dir, 
                 f"new_frame{frame_idx:04d}.npy"
             )
             
-            # 保存原始浮点数据
+            # Save raw floating point data
             np.save(raw_rgb_path, rgb_raw)
             logger.debug(f"Saved raw RGB to {raw_rgb_path}")
 
