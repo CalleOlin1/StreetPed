@@ -256,7 +256,7 @@ class SceneLidarSource(abc.ABC):
                 f"[Lidar] {num_bf - self.visible_masks.sum()} out of {num_bf} points are cleared. {self.visible_masks.sum()} points left."
             )
             self.visible_masks = None
-            print(f"[DEBUG] 删除前点数: {len(self.origins)}")
-            print(f"可见点比例: {self.visible_masks.float().mean():.2%}")
+            print(f"[DEBUG] Point count before deletion: {len(self.origins)}")
+            print(f"Visible point ratio: {self.visible_masks.float().mean():.2%}")
         else:
             logger.info("[Lidar] No unvisible points to clear.")

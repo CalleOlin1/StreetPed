@@ -231,8 +231,8 @@ if __name__ == "__main__":
         dataset_processor = CustomProcessor(
             load_dir=args.data_root,
             save_dir=args.target_dir,
-            split=args.split,  # 传递 split 参数
-            split_file=args.split_file,  # 传递 split_file 参数
+            split=args.split,  # Pass split parameter
+            split_file=args.split_file,  # Pass split_file parameter
             process_keys=args.process_keys,
             workers=args.workers,
         )
@@ -242,8 +242,8 @@ if __name__ == "__main__":
         dataset_processor = Kitti5CamsProcessor(
             load_dir=args.data_root,
             save_dir=args.target_dir,
-            split=args.split,  # 传递 split 参数
-            split_file=args.split_file,  # 传递 split_file 参数
+            split=args.split,  # Pass split parameter
+            split_file=args.split_file,  # Pass split_file parameter
             process_keys=args.process_keys,
             workers=args.workers,
         )

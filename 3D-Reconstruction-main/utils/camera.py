@@ -160,61 +160,61 @@ def kitti_fixed_path(
         # If not found, use the first camera
         if front_center_mask is None:
             front_center_mask = np.ones(len(cam_names), dtype=bool)
-            front_center_mask[1:] = False  # 只保留第一个
+            front_center_mask[1:] = False  # Only keep the first one
             found_camera = str(cam_names[0])
         
         print(f"   Using camera: {found_camera}")
         
-        # 提取前视中心相机的poses
+        # Extract front center camera poses
         front_center_poses = camera_poses[front_center_mask]
         front_center_frames = np.array(frame_indices)[front_center_mask]
         
         print(f"   Found {len(front_center_poses)} poses for this camera")
         
-        # 按帧索引排序
+        # Sort by frame index
         sorted_indices = np.argsort(front_center_frames)
         front_center_poses = front_center_poses[sorted_indices]
         front_center_frames = front_center_frames[sorted_indices]
         
         print(f"   Frame range: {front_center_frames[0]} - {front_center_frames[-1]}")
         
-        # 显示位置范围
+        # Display position ranges
         positions = front_center_poses[:, :3, 3]
         print(f"   Position ranges:")
         print(f"     X: [{positions[:, 0].min():.6f}, {positions[:, 0].max():.6f}] m")
         print(f"     Y: [{positions[:, 1].min():.6f}, {positions[:, 1].max():.6f}] m")
         print(f"     Z: [{positions[:, 2].min():.6f}, {positions[:, 2].max():.6f}] m")
         
-        # 转换为torch tensor
+        # Convert to torch tensor
         poses_tensor = torch.tensor(front_center_poses, dtype=torch.float32)
         
-        # 确保设备一致性
+        # Ensure device consistency
         if per_cam_poses and len(per_cam_poses) > 0:
             sample_pose = per_cam_poses[list(per_cam_poses.keys())[0]]
             poses_tensor = poses_tensor.to(sample_pose.device)
         
-        # 根据target_frames调整输出
+        # Adjust output based on target_frames
         actual_frames = len(poses_tensor)
         
         if target_frames <= actual_frames:
-            # 如果目标帧数少于或等于实际帧数，直接截取
+            # If target frames is less than or equal to actual frames, truncate directly
             result = poses_tensor[:target_frames]
             print(f"   Truncated to {target_frames} frames (from {actual_frames})")
         else:
-            # 如果目标帧数多于实际帧数，重复最后一帧
+            # If target frames is more than actual frames, repeat last frame
             result = torch.zeros(target_frames, 4, 4, dtype=poses_tensor.dtype, device=poses_tensor.device)
             result[:actual_frames] = poses_tensor
-            # 用最后一帧填充剩余部分
+            # Fill remaining with last frame
             for i in range(actual_frames, target_frames):
                 result[i] = poses_tensor[-1]
             print(f"   Extended to {target_frames} frames (repeated last frame)")
         
-        # ==================== 新增：应用偏移 ====================
+        # ==================== New: Apply offsets ====================
         if position_offset is not None or rotation_offset is not None:
             print(f"   Applying offsets...")
             result = apply_trajectory_offset(result, position_offset, rotation_offset)
         
-        # 输出结果信息
+        # Output result info
         result_positions = result[:, :3, 3]
         print(f"   Output: {result.shape[0]} frames")
         print(f"   Start: {result_positions[0][0]:.3f}, {result_positions[0][1]:.3f}, {result_positions[0][2]:.3f}")

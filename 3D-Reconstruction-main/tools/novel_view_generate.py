@@ -83,41 +83,41 @@ def generate_fixed_offset_trajectories(
     rotation_offset
 ):
     """
-    生成固定偏移的轨迹
+    Generate trajectory with fixed offset
     
     Args:
-        dataset: 数据集实例
-        frame_idx: 当前帧索引
-        target_frames: 目标帧数
-        translation_offset: 平移偏移量 [x, y, z]
-        rotation_offset: 旋转偏移量 [pitch, yaw, roll]
+        dataset: Dataset instance
+        frame_idx: Current frame index
+        target_frames: Target frame count
+        translation_offset: Translation offset [x, y, z]
+        rotation_offset: Rotation offset [pitch, yaw, roll]
         
     Returns:
-        torch.Tensor: 生成的轨迹
+        torch.Tensor: Generated trajectory
     """
-    # 获取当前帧的相机位姿
+    # Get current frame's camera pose
     per_cam_poses = {}
     for cam_id in dataset.pixel_source.camera_list:
         per_cam_poses[cam_id] = dataset.pixel_source.camera_data[cam_id].cam_to_worlds
     
-    # 使用当前帧的相机位姿
+    # Use current frame's camera pose
     frame_poses = {}
     for cam_id, poses in per_cam_poses.items():
-        # 确保索引在范围内
+        # Ensure index is within range
         safe_idx = min(frame_idx, len(poses) - 1)
         frame_poses[cam_id] = poses[safe_idx:safe_idx+1]
     
-    # 获取设备信息
+    # Get device info
     device = next(iter(per_cam_poses.values())).device
     
     try:
-        # 尝试从utils.trajectory_utils导入fixed_offset_trajectory函数
+        # Try importing fixed_offset_trajectory function from utils.trajectory_utils
         from utils.camera import fixed_offset_trajectory
     except ImportError:
         try:
             from utils.camera import fixed_offset_trajectory
         except ImportError:
-            # 如果导入失败，则在当前模块中定义该函数
+            # If import fails, define the function in current module
             def fixed_offset_trajectory(
                 dataset_type: str,
                 per_cam_poses: Dict[int, torch.Tensor],
@@ -127,35 +127,35 @@ def generate_fixed_offset_trajectories(
                 rotation_offset: list = [0.0, 0.0, 0.0],
             ) -> torch.Tensor:
                 """
-                生成相对于前视相机的固定偏移轨迹
+                Generate fixed offset trajectory relative to front-view camera
 
                 Args:
-                    dataset_type: 数据集类型
-                    per_cam_poses: 每个相机的位姿
-                    original_frames: 原始帧数
-                    target_frames: 目标帧数
-                    translation_offset: [x, y, z] 平移偏移量（米）
-                    rotation_offset: [pitch, yaw, roll] 旋转偏移量（度）
+                    dataset_type: Dataset type
+                    per_cam_poses: Per-camera poses
+                    original_frames: Original frame count
+                    target_frames: Target frame count
+                    translation_offset: [x, y, z] translation offset (meters)
+                    rotation_offset: [pitch, yaw, roll] rotation offset (degrees)
                 """
-                assert 0 in per_cam_poses.keys(), "需要前视中心相机（ID 0）"
+                assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) required"
 
-                # 获取设备信息
+                # Get device info
                 device = per_cam_poses[0].device
 
-                # 转换偏移量为张量
+                # Convert offsets to tensors
                 trans_offset = torch.tensor(translation_offset, device=device, dtype=torch.float32)
                 rot_offset = torch.tensor(rotation_offset, device=device, dtype=torch.float32)
 
-                # 生成关键帧（使用原始相机位姿）
+                # Generate keyframes (using original camera poses)
                 key_poses = per_cam_poses[0][:: max(1, original_frames // 4)]
 
                 def convert_to_tensor(data, device):
                     return torch.tensor(data, device=device, dtype=torch.float32)
 
-                # 应用偏移量
+                # Apply offsets
                 modified_poses = []
                 for pose in key_poses:
-                    # 创建新位姿矩阵
+                    # Create new pose matrix
                     new_pose = torch.eye(4, device=device)
 
                     rot_matrix = R.from_euler(
@@ -163,10 +163,10 @@ def generate_fixed_offset_trajectories(
                     ).as_matrix()
                     rot_matrix = rot_matrix.astype(np.float32)
 
-                    # 保持矩阵乘法数据类型一致
+                    # Keep matrix multiplication data types consistent
                     new_rot = pose[:3, :3] @ convert_to_tensor(rot_matrix, device)
 
-                    # 确保平移偏移量数据类型正确
+                    # Ensure translation offset data type is correct
                     trans_offset_tensor = convert_to_tensor(translation_offset, device)
                     offset_trans = pose[:3, :3] @ trans_offset_tensor
                     new_trans = pose[:3, 3] + offset_trans
@@ -176,77 +176,77 @@ def generate_fixed_offset_trajectories(
 
                     modified_poses.append(new_pose)
 
-                # 插值生成所需帧数的轨迹
+                # Interpolate to generate trajectory with required frame count
                 return interpolate_poses(torch.stack(modified_poses), target_frames)
 
-            # 定义插值函数
+            # Define interpolation function
             def interpolate_poses(poses, n_samples):
                 """
-                对位姿进行插值，生成平滑轨迹
+                Interpolate poses to generate smooth trajectory
                 
                 Args:
-                    poses: 关键帧位姿，形状为 [N, 4, 4]
-                    n_samples: 插值后的总帧数
+                    poses: Keyframe poses, shape [N, 4, 4]
+                    n_samples: Total frame count after interpolation
                     
                 Returns:
-                    torch.Tensor: 插值后的轨迹，形状为 [n_samples, 4, 4]
+                    torch.Tensor: Interpolated trajectory, shape [n_samples, 4, 4]
                 """
                 device = poses.device
                 n_poses = poses.shape[0]
                 
-                # 创建一个线性插值的参数t
+                # Create linear interpolation parameter t
                 t_original = torch.linspace(0, 1, n_poses, device=device)
                 t_interp = torch.linspace(0, 1, n_samples, device=device)
                 
-                # 分别处理旋转和平移
+                # Handle rotation and translation separately
                 positions = poses[:, :3, 3]
                 rotations = poses[:, :3, :3]
                 
-                # 线性插值平移
+                # Linear interpolation for translation
                 interp_positions = torch.zeros((n_samples, 3), device=device)
                 for i in range(3):
-                    # 手动实现线性插值
+                    # Manual linear interpolation implementation
                     for j in range(n_samples):
                         t = t_interp[j]
-                        # 找到t所在的区间
+                        # Find the interval where t is located
                         idx = (t_original <= t).sum() - 1
                         idx = max(0, min(idx, n_poses - 2))
                         
-                        # 计算局部插值参数
+                        # Calculate local interpolation parameter
                         alpha = (t - t_original[idx]) / (t_original[idx + 1] - t_original[idx])
                         interp_positions[j, i] = positions[idx, i] + alpha * (positions[idx + 1, i] - positions[idx, i])          
-                # 对旋转矩阵进行SLERP插值
+                # SLERP interpolation for rotation matrices
                 interp_rotations = torch.zeros((n_samples, 3, 3), device=device)
                 for i in range(n_samples):
                     t = t_interp[i]
-                    # 找到t所在的区间
+                    # Find the interval where t is located
                     idx = (t_original <= t).sum() - 1
                     idx = max(0, min(idx, n_poses - 2))
                     
-                    # 计算局部插值参数
+                    # Calculate local interpolation parameter
                     alpha = (t - t_original[idx]) / (t_original[idx + 1] - t_original[idx])
                     
-                    # 使用简单的线性插值替代SLERP
+                    # Use simple linear interpolation instead of SLERP
                     rot1 = rotations[idx]
                     rot2 = rotations[idx + 1]
                     interp_rot = rot1 + alpha * (rot2 - rot1)
                     
-                    # 正交化以确保是有效的旋转矩阵
+                    # Orthogonalize to ensure valid rotation matrix
                     u, _, v = torch.svd(interp_rot)
                     interp_rotations[i] = u @ v.t()
                 
-                # 组合成完整的位姿矩阵
+                # Combine into complete pose matrix
                 interp_poses = torch.eye(4, device=device).unsqueeze(0).repeat(n_samples, 1, 1)
                 interp_poses[:, :3, :3] = interp_rotations
                 interp_poses[:, :3, 3] = interp_positions
                 
                 return interp_poses
     
-    # 调用fixed_offset_trajectory生成轨迹
+    # Call fixed_offset_trajectory to generate trajectory
     traj = fixed_offset_trajectory(
         dataset_type=dataset.type,
         per_cam_poses=frame_poses,
-        original_frames=1,  # 只使用一帧
+        original_frames=1,  # Only use one frame
         target_frames=target_frames,
         translation_offset=translation_offset,
         rotation_offset=rotation_offset

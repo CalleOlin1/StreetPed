@@ -333,10 +333,10 @@ class KITTIPixelSource(ScenePixelSource):
                         smpl_human_all[instance_id]["smpl_quats"][:, :, 0] = 1.0
                     if ins_smpl["valid_mask"][fi]:
                         try:
-                            # 检查该帧是否在物体实例的帧列表中
+                            # Check if this frame is in the object instance's frame list
                             frame_list = instances_info[str(instance_id)]["frame_annotations"]["frame_idx"]
                             if fi not in frame_list:
-                                continue  # 跳过不存在的帧
+                                continue  # Skip non-existent frames
                             betas = ins_smpl["smpl"]["betas"][fi]
                             smpl_human_all[instance_id]["smpl_betas"][
                                 fi - self.start_timestep
