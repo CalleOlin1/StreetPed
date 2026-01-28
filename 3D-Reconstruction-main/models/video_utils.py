@@ -46,7 +46,7 @@ def compute_psnr(prediction: Tensor, target: Tensor) -> float:
 
 def extract_camera_poses_from_dataset(dataset: SplitWrapper, trainer: BasicTrainer, vis_indices: Optional[List[int]] = None):
     """
-    从数据集中提取每一帧的相机pose
+    Extract camera pose for each frame from the dataset
     
     Parameters:
         dataset: Dataset to extract poses from
@@ -54,73 +54,73 @@ def extract_camera_poses_from_dataset(dataset: SplitWrapper, trainer: BasicTrain
         vis_indices: Optional; if not None, only extract poses for specified indices
         
     Returns:
-        dict: 包含相机pose信息的字典
+        dict: Dictionary containing camera pose information
     """
-    camera_poses = []           # 4x4变换矩阵
-    camera_positions = []       # 3D位置
-    camera_rotations = []       # 3x3旋转矩阵
-    camera_intrinsics = []      # 3x3内参矩阵
-    cam_names = []              # 相机名称
-    cam_ids = []                # 相机ID
-    frame_indices = []          # 帧索引
-    heights = []                # 图像高度
-    widths = []                 # 图像宽度
+    camera_poses = []           # 4x4 transformation matrices
+    camera_positions = []       # 3D positions
+    camera_rotations = []       # 3x3 rotation matrices
+    camera_intrinsics = []      # 3x3 intrinsic matrices
+    cam_names = []              # Camera names
+    cam_ids = []                # Camera IDs
+    frame_indices = []          # Frame indices
+    heights = []                # Image heights
+    widths = []                 # Image widths
     
     indices = vis_indices if vis_indices is not None else range(len(dataset))
     camera_downscale = trainer._get_downscale_factor()
     
     with torch.no_grad():
         for i in tqdm(indices, desc=f"extracting camera poses from {dataset.split}", dynamic_ncols=True):
-            # 获取相机信息
+            # Get camera info
             image_infos, cam_infos = dataset.get_image(i, camera_downscale)
             
-            # 将tensor移动到CPU进行处理
+            # Move tensors to CPU for processing
             for k, v in cam_infos.items():
                 if isinstance(v, Tensor):
                     cam_infos[k] = v.cpu()
             
             frame_indices.append(i)
             
-            # 提取相机名称
+            # Extract camera name
             cam_names.append(cam_infos["cam_name"])
             
-            # 提取相机ID（取第一个像素的值，因为整个tensor都是相同的值）
+            # Extract camera ID (take the first pixel's value since the entire tensor has the same value)
             cam_id = cam_infos["cam_id"][0, 0].numpy()
             cam_ids.append(cam_id)
             
-            # 提取图像尺寸
+            # Extract image dimensions
             height = cam_infos["height"].numpy()
             width = cam_infos["width"].numpy()
             heights.append(height)
             widths.append(width)
             
-            # 提取相机pose (camera_to_world变换矩阵)
+            # Extract camera pose (camera_to_world transformation matrix)
             c2w_matrix = cam_infos["camera_to_world"].numpy()
             camera_poses.append(c2w_matrix.copy())
             
-            # 提取相机位置（变换矩阵的平移部分）
-            position = c2w_matrix[:3, 3]  # 前3行第4列
+            # Extract camera position (translation part of transformation matrix)
+            position = c2w_matrix[:3, 3]  # First 3 rows, column 4
             camera_positions.append(position.copy())
             
-            # 提取相机旋转（变换矩阵的旋转部分）
-            rotation = c2w_matrix[:3, :3]  # 前3x3部分
+            # Extract camera rotation (rotation part of transformation matrix)
+            rotation = c2w_matrix[:3, :3]  # Top-left 3x3 part
             camera_rotations.append(rotation.copy())
             
-            # 提取相机内参
+            # Extract camera intrinsics
             intrinsic = cam_infos["intrinsics"].numpy()
             camera_intrinsics.append(intrinsic.copy())
     
-    # 返回结果字典
+    # Return result dictionary
     results = {
         'frame_indices': frame_indices,
-        'camera_poses': camera_poses,        # 4x4 camera-to-world变换矩阵
-        'camera_positions': camera_positions, # 3D相机位置 [x, y, z]
-        'camera_rotations': camera_rotations, # 3x3旋转矩阵
-        'camera_intrinsics': camera_intrinsics, # 3x3内参矩阵
-        'cam_names': cam_names,              # 相机名称列表
-        'cam_ids': cam_ids,                  # 相机ID列表
-        'heights': heights,                  # 图像高度列表
-        'widths': widths                     # 图像宽度列表
+        'camera_poses': camera_poses,        # 4x4 camera-to-world transformation matrices
+        'camera_positions': camera_positions, # 3D camera positions [x, y, z]
+        'camera_rotations': camera_rotations, # 3x3 rotation matrices
+        'camera_intrinsics': camera_intrinsics, # 3x3 intrinsic matrices
+        'cam_names': cam_names,              # Camera names list
+        'cam_ids': cam_ids,                  # Camera IDs list
+        'heights': heights,                  # Image heights list
+        'widths': widths                     # Image widths list
     }
     
     return results
@@ -128,14 +128,14 @@ def extract_camera_poses_from_dataset(dataset: SplitWrapper, trainer: BasicTrain
 
 def save_camera_poses(poses_dict, save_path, verbose=True):
     """
-    保存相机pose到文件
+    Save camera poses to file
     
     Parameters:
-        poses_dict: extract_camera_poses_from_dataset返回的字典
-        save_path: 保存路径（.npz格式）
-        verbose: 是否打印保存信息
+        poses_dict: Dictionary returned by extract_camera_poses_from_dataset
+        save_path: Save path (.npz format)
+        verbose: Whether to print save information
     """
-    # 确保保存目录存在
+    # Ensure save directory exists
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
     # 保存为.npz格式
@@ -189,11 +189,11 @@ def save_camera_poses(poses_dict, save_path, verbose=True):
 
 def analyze_camera_trajectory(poses_dict, verbose=True):
     """
-    分析相机轨迹并打印统计信息
+    Analyze camera trajectory and print statistics
     
     Parameters:
-        poses_dict: extract_camera_poses_from_dataset返回的字典
-        verbose: 是否打印详细信息
+        poses_dict: Dictionary returned by extract_camera_poses_from_dataset
+        verbose: Whether to print detailed information
     """
     positions = np.array(poses_dict['camera_positions'])
     

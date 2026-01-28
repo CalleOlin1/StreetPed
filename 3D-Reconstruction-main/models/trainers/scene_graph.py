@@ -322,7 +322,7 @@ class MultiTrainer(BasicTrainer):
         return metric_dict
 
     def get_rigid_info(self, frame_idx: int = None):
-        """获取刚体节点信息"""
+        """Get rigid node information"""
         if frame_idx is None:
             frame_idx = self.cur_frame.item()
 
@@ -331,14 +331,14 @@ class MultiTrainer(BasicTrainer):
 
         rigid_model = self.models["RigidNodes"]
 
-        # 设置当前帧
+        # Set current frame
         self.cur_frame = torch.tensor(frame_idx, device=self.device)
         if hasattr(rigid_model, "set_cur_frame"):
             rigid_model.set_cur_frame(self.cur_frame)
         elif hasattr(rigid_model, "cur_frame"):
             rigid_model.cur_frame = self.cur_frame
 
-        # 创建虚拟相机
+        # Create dummy camera
         dummy_cam = dataclass_camera(
             camtoworlds=torch.eye(4, device=self.device)[None],
             camtoworlds_gt=torch.eye(4, device=self.device)[None],
@@ -360,7 +360,7 @@ class MultiTrainer(BasicTrainer):
             ),
         }
 
-        # 获取变换信息
+        # Get transform information
         if hasattr(rigid_model, "instances_quats") and hasattr(
             rigid_model, "instances_trans"
         ):
@@ -382,7 +382,7 @@ class MultiTrainer(BasicTrainer):
         return result
 
     def get_smpl_info(self, frame_idx: int = None):
-        """获取SMPL节点信息"""
+        """Get SMPL node information"""
         if frame_idx is None:
             frame_idx = self.cur_frame.item()
 
@@ -391,12 +391,12 @@ class MultiTrainer(BasicTrainer):
 
         smpl_model = self.models["SMPLNodes"]
 
-        # 设置当前帧
+        # Set current frame
         self.cur_frame = torch.tensor(frame_idx, device=self.device)
         if hasattr(smpl_model, "set_cur_frame"):
             smpl_model.set_cur_frame(self.cur_frame)
 
-        # 创建虚拟相机
+        # Create dummy camera
         dummy_cam = dataclass_camera(
             camtoworlds=torch.eye(4, device=self.device)[None],
             camtoworlds_gt=torch.eye(4, device=self.device)[None],

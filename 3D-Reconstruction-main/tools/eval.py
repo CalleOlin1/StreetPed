@@ -31,18 +31,18 @@ def do_evaluation(
     render_keys: Optional[List[str]] = None,
     post_fix: str = "",
     log_metrics: bool = True,
-    extract_camera_poses: bool = True,  # 新增参数
+    extract_camera_poses: bool = True,  # new parameter
 ):
     trainer.set_eval()
-    # 新增：相机pose提取功能
+    # New: camera pose extraction feature
     if extract_camera_poses:
         logger.info("Extracting camera poses...")
         
-        # 为每个数据集提取poses
+        # Extract poses for each dataset
         pose_save_dir = f"{cfg.log_dir}/camera_poses{post_fix}"
         os.makedirs(pose_save_dir, exist_ok=True)
         
-        # 提取测试集poses
+        # Extract test set poses
         if dataset.test_image_set is not None:
             logger.info("Extracting poses from test set...")
             test_poses = extract_camera_poses_from_dataset(
@@ -53,7 +53,7 @@ def do_evaluation(
             save_camera_poses(test_poses, test_pose_file)
             analyze_camera_trajectory(test_poses)
         
-        # 提取完整数据集poses
+        # Extract full dataset poses
         if cfg.render.render_full:
             logger.info("Extracting poses from full set...")
             full_poses = extract_camera_poses_from_dataset(
@@ -72,10 +72,10 @@ def do_evaluation(
             dataset=dataset.test_image_set,
             compute_metrics=True,
             compute_error_map=cfg.render.vis_error,
-            extract_poses=extract_camera_poses,  # 新增参数
+            extract_poses=extract_camera_poses,  # new parameter
         )
 
-        # 新增：保存测试集的pose信息（如果在render中提取了）
+        # New: save test set pose information (if extracted during render)
         if extract_camera_poses and "camera_poses" in render_results:
             test_render_pose_file = os.path.join(pose_save_dir, f"test_render_poses_{current_time}.npz")
             poses_dict = {
@@ -228,7 +228,7 @@ def do_evaluation(
                 render_data,
                 save_path,
                 fps=render_novel_cfg.get("fps", cfg.render.fps),
-                traj_type=traj_type  # 新增参数
+                traj_type=traj_type  # new parameter
             )
             logger.info(
                 f"Saved novel view video for trajectory type: {traj_type} to {save_path}"

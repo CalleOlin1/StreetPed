@@ -44,90 +44,90 @@ from models.human_body import (
 logger = logging.getLogger()
 
 def improved_RGB2SH(rgb):
-    """将RGB颜色转换为球谐系数，更强健的实现"""
-    # 添加调试信息
+    """Convert RGB color to spherical harmonics coefficients, more robust implementation"""
+    # Add debug info
     if hasattr(rgb, 'shape'):
-        logger.debug(f"RGB2SH输入形状: {rgb.shape}")
+        logger.debug(f"RGB2SH input shape: {rgb.shape}")
     
-    # 确保输入是正确的形状 [N, 3]
+    # Ensure input has correct shape [N, 3]
     if not isinstance(rgb, torch.Tensor):
         rgb = torch.tensor(rgb, dtype=torch.float32)
     
-    # 强制转换为二维张量
+    # Force convert to 2D tensor
     if len(rgb.shape) == 1:
-        rgb = rgb.unsqueeze(0)  # 添加一个维度
+        rgb = rgb.unsqueeze(0)  # Add a dimension
     
-    # 如果只有一个通道，扩展到三个通道
+    # If only one channel, expand to three channels
     if rgb.shape[-1] == 1:
         rgb = rgb.repeat(1, 3)
     
-    # 确保值范围在[0,1]之间
+    # Ensure value range is within [0,1]
     if rgb.max() > 1.0:
         rgb = rgb / 255.0
     
-    # 转换为球谐系数 (简单转换)
+    # Convert to spherical harmonics coefficients (simple conversion)
     result = (rgb - 0.5) / 0.28209479177387814
     
-    logger.debug(f"RGB2SH输出形状: {result.shape}")
+    logger.debug(f"RGB2SH output shape: {result.shape}")
     return result
 
 def match_sequence_length(target_length: int, sequence: torch.Tensor) -> torch.Tensor:
-    """调整序列长度以匹配目标长度"""
-    logger.debug(f"输入序列形状: {sequence.shape}, 目标长度: {target_length}")
+    """Adjust sequence length to match target length"""
+    logger.debug(f"Input sequence shape: {sequence.shape}, target length: {target_length}")
     current_length = sequence.shape[0]
     
     if current_length == target_length:
-        logger.debug("序列长度已匹配，无需调整")
+        logger.debug("Sequence length already matches, no adjustment needed")
         return sequence
     
     if current_length < target_length:
-        # 计算需要重复的次数
+        # Calculate number of repetitions needed
         repeat_times = (target_length // current_length) + 1
-        logger.debug(f"序列过短，将重复 {repeat_times} 次")
+        logger.debug(f"Sequence too short, will repeat {repeat_times} times")
         
-        # 根据输入维度动态调整repeat参数
+        # Dynamically adjust repeat parameters based on input dimensions
         repeat_dims = [repeat_times] + [1]*(sequence.dim()-1)
-        logger.debug(f"使用repeat参数: {repeat_dims}")
+        logger.debug(f"Using repeat parameters: {repeat_dims}")
         
         repeated = sequence.repeat(*repeat_dims)
         return repeated[:target_length]
     else:
-        logger.debug(f"序列过长，将截断至 {target_length} 帧")
+        logger.debug(f"Sequence too long, will truncate to {target_length} frames")
         return sequence[:target_length]
 
 def inspect_smpl_node_structure(smpl_nodes):
-    """检查SMPL节点的结构，打印所有属性"""
-    logger.info("SMPL节点结构检查:")
+    """Inspect SMPL node structure, print all attributes"""
+    logger.info("SMPL node structure inspection:")
     for attr_name in dir(smpl_nodes):
         if not attr_name.startswith('_') or attr_name in ['_means', '_features_dc', '_scales', '_rotations', '_opacity', '_features_rest']:
             if hasattr(smpl_nodes, attr_name):
                 attr = getattr(smpl_nodes, attr_name)
                 if isinstance(attr, torch.Tensor):
-                    logger.info(f"  {attr_name}: Tensor, 形状 = {attr.shape}, 类型 = {attr.dtype}")
+                    logger.info(f"  {attr_name}: Tensor, shape = {attr.shape}, dtype = {attr.dtype}")
                 elif attr is not None:
                     logger.info(f"  {attr_name}: {type(attr)}")
 
 
 def compare_instance_info(smpl_nodes, instance_id, new_instance, print_stats=True):
-    """比较SMPL节点中原有实例和新实例的详细信息
+    """Compare detailed information of original and new instances in SMPL nodes
     
     Args:
-        smpl_nodes: SMPL节点对象
-        instance_id: 要替换的实例ID
-        new_instance: 新实例的数据字典
-        print_stats: 是否打印统计信息
+        smpl_nodes: SMPL node object
+        instance_id: ID of instance to replace
+        new_instance: Data dictionary of new instance
+        print_stats: Whether to print statistics
     """
-    logger.info(f"===== 实例 {instance_id} 替换前后对比 =====")
+    logger.info(f"===== Instance {instance_id} before/after replacement comparison =====")
     
-    # 获取原始实例信息
+    # Get original instance info
     points_per_instance = smpl_nodes.smpl_points_num
     start_idx = instance_id * points_per_instance
     end_idx = (instance_id + 1) * points_per_instance
     
-    # 创建比较表格
+    # Create comparison table
     info_table = []
     
-    # 检查几何属性
+    # Check geometric attributes
     geometric_attrs = {
         "_means/pts": (smpl_nodes._means[start_idx:end_idx], new_instance.get("pts")),
         "_scales/scales": (smpl_nodes._scales[start_idx:end_idx], new_instance.get("scales")),
@@ -141,31 +141,31 @@ def compare_instance_info(smpl_nodes, instance_id, new_instance, print_stats=Tru
         if orig_val is not None and new_val is not None:
             orig_name, new_name = attr_name.split("/") if "/" in attr_name else (attr_name, attr_name)
             
-            # 检查形状
+            # Check shape
             orig_shape = orig_val.shape
             new_shape = new_val.shape
             shape_match = "✓" if orig_shape == new_shape else "✗"
             
-            # 计算值范围
+            # Calculate value range
             orig_min, orig_max = orig_val.min().item(), orig_val.max().item()
             new_min, new_max = new_val.min().item(), new_val.max().item()
             
-            # 计算均值和标准差
+            # Calculate mean and standard deviation
             orig_mean, orig_std = orig_val.mean().item(), orig_val.std().item()
             new_mean, new_std = new_val.mean().item(), new_val.std().item()
             
             info_table.append({
-                "属性": f"{orig_name} → {new_name}",
-                "原形状": str(orig_shape),
-                "新形状": str(new_shape),
-                "形状匹配": shape_match,
-                "原范围": f"{orig_min:.4f} 到 {orig_max:.4f}",
-                "新范围": f"{new_min:.4f} 到 {new_max:.4f}",
-                "原均值/标准差": f"{orig_mean:.4f} / {orig_std:.4f}",
-                "新均值/标准差": f"{new_mean:.4f} / {new_std:.4f}",
+                "Attribute": f"{orig_name} → {new_name}",
+                "OrigShape": str(orig_shape),
+                "NewShape": str(new_shape),
+                "ShapeMatch": shape_match,
+                "OrigRange": f"{orig_min:.4f} to {orig_max:.4f}",
+                "NewRange": f"{new_min:.4f} to {new_max:.4f}",
+                "OrigMean/Std": f"{orig_mean:.4f} / {orig_std:.4f}",
+                "NewMean/Std": f"{new_mean:.4f} / {new_std:.4f}",
             })
     
-    # 检查姿态和变换
+    # Check pose and transform
     pose_attrs = {
         "global_orient": (smpl_nodes.instances_quats[0, instance_id], new_instance.get("global_orient")),
         "body_pose": (smpl_nodes.smpl_qauts[0, instance_id], new_instance.get("body_pose")),
@@ -174,45 +174,45 @@ def compare_instance_info(smpl_nodes, instance_id, new_instance, print_stats=Tru
     
     for attr_name, (orig_val, new_val) in pose_attrs.items():
         if orig_val is not None and new_val is not None:
-            # 对形状进行调整以便比较
+            # Adjust shape for comparison
             if attr_name == "global_orient":
                 if new_val.dim() > 2:
-                    new_val = new_val[0, 0]  # 取第一帧的全局旋转
+                    new_val = new_val[0, 0]  # Take first frame's global rotation
                 orig_val = orig_val.squeeze()
             elif attr_name == "body_pose":
                 if new_val.dim() > 2:
-                    new_val = new_val[0]  # 取第一帧的姿态
+                    new_val = new_val[0]  # Take first frame's pose
             elif attr_name == "translation":
                 if new_val.dim() > 1:
-                    new_val = new_val[0]  # 取第一帧的平移
+                    new_val = new_val[0]  # Take first frame's translation
             
-            # 检查形状
+            # Check shape
             orig_shape = orig_val.shape
             new_shape = new_val.shape
             shape_match = "✓" if orig_shape == new_shape else "✗"
             
-            # 值范围分析
+            # Value range analysis
             orig_min, orig_max = orig_val.min().item(), orig_val.max().item()
             new_min, new_max = new_val.min().item(), new_val.max().item()
             
             info_table.append({
-                "属性": attr_name,
-                "原形状": str(orig_shape),
-                "新形状": str(new_shape),
-                "形状匹配": shape_match,
-                "原范围": f"{orig_min:.4f} 到 {orig_max:.4f}",
-                "新范围": f"{new_min:.4f} 到 {new_max:.4f}",
-                "原内容": str(orig_val.flatten()[:4].tolist()) + "...",  # 只显示前几个值
-                "新内容": str(new_val.flatten()[:4].tolist()) + "...",
+                "Attribute": attr_name,
+                "OrigShape": str(orig_shape),
+                "NewShape": str(new_shape),
+                "ShapeMatch": shape_match,
+                "OrigRange": f"{orig_min:.4f} to {orig_max:.4f}",
+                "NewRange": f"{new_min:.4f} to {new_max:.4f}",
+                "OrigContent": str(orig_val.flatten()[:4].tolist()) + "...",  # Only show first few values
+                "NewContent": str(new_val.flatten()[:4].tolist()) + "...",
             })
     
-    # 检查映射关系
+    # Check mapping relationships
     if "mapping" in new_instance:
         mapping = new_instance["mapping"]
-        logger.info(f"新实例映射信息:")
+        logger.info(f"New instance mapping info:")
         for map_name, map_val in mapping.items():
             if map_val is not None:
-                logger.info(f"  {map_name}: 形状={map_val.shape}, 范围=[{map_val.min().item():.4f}, {map_val.max().item():.4f}]")
+                logger.info(f"  {map_name}: shape={map_val.shape}, range=[{map_val.min().item():.4f}, {map_val.max().item():.4f}]")
             else:
                 logger.info(f"  {map_name}: None")
     
@@ -237,7 +237,7 @@ def compare_instance_info(smpl_nodes, instance_id, new_instance, print_stats=Tru
 
 
 def load_and_convert_using_skeleton(ply_path: str, motion_path: str, smplx_path: str, frame_count: int) -> Dict:
-    """使用Skeleton类加载并转换数据为SMPLNodes格式"""
+    """Load and convert data to SMPLNodes format using Skeleton class"""
     logger.info(f"使用Skeleton加载数据: PLY={ply_path}, Motion={motion_path}, SMPLX={smplx_path}")
     try:
         # 创建Skeleton实例

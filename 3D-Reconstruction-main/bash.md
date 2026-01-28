@@ -171,8 +171,8 @@ python tools/quick_pose_visualization.py output/Kitti/dataset=Kitti/training_202
 python tools/pose_visualization.py --npz_file output/Kitti/dataset=Kitti/training_20250630_162211_FollowLeadingVehicleWithObstacle_1/camera_poses_eval/full_poses_2025-07-02_18-00-20.npz --camera_filter CAM_TOP --output_dir ./analysis
 
 
-蓝车id：0
-白车id: 11
+Blue car id: 0
+White car id: 11
 python scene_editing/edit_rigid.py \
     --resume_from output/waymo_new/dataset=waymo/3cams/checkpoint_final.pth \
     --operation remove \
@@ -199,7 +199,7 @@ python scene_editing/insert_instance.py \
     --output_dir ./insert_output
 
 
-1. 插入并变换实例:
+1. Insert and transform instance:
    python scene_editing/insert_instance.py \
        --resume_from output/waymo_3cams/dataset=waymo/5cams_788/checkpoint_final.pth \
        --operation insert_and_transform \

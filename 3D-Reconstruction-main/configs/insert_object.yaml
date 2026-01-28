@@ -1,18 +1,18 @@
-# 检查点参数
-source_checkpoint: ""  # 必须设置，从中提取对象的源检查点路径
-target_checkpoint: ""  # 必须设置，插入对象的目标检查点路径
+# Checkpoint parameters
+source_checkpoint: ""  # Required, path to source checkpoint to extract objects from
+target_checkpoint: ""  # Required, path to target checkpoint to insert objects into
 
-# 节点选择参数
-rigid_ids: null  # 要提取的刚性对象ID列表，例如 [1, 2, 3]
-smpl_ids: null   # 要提取的SMPL对象ID列表
-deformable_ids: null  # 要提取的可变形对象ID列表
+# Node selection parameters
+rigid_ids: null  # List of rigid object IDs to extract, e.g., [1, 2, 3]
+smpl_ids: null   # List of SMPL object IDs to extract
+deformable_ids: null  # List of deformable object IDs to extract
 
-# 节点ID偏移参数
-rigid_offset: null  # 插入时添加到刚性对象ID的偏移量
-smpl_offset: null   # 插入时添加到SMPL对象ID的偏移量
-deformable_offset: null  # 插入时添加到可变形对象ID的偏移量
+# Node ID offset parameters
+rigid_offset: null  # Offset to add to rigid object IDs when inserting
+smpl_offset: null   # Offset to add to SMPL object IDs when inserting
+deformable_offset: null  # Offset to add to deformable object IDs when inserting
 
-# 输出参数
-output_dir: "output_videos"  # 保存输出视频的目录
-video_name: "inserted_objects"  # 输出视频文件名(不含扩展名)
-fps: 30  # 输出视频的帧率
+# Output parameters
+output_dir: "output_videos"  # Directory to save output videos
+video_name: "inserted_objects"  # Output video filename (without extension)
+fps: 30  # Output video frame rate

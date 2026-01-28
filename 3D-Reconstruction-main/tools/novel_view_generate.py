@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from tqdm import tqdm
 from PIL import Image
 import imageio
-from scipy.spatial.transform import Rotation as R  # 导入旋转库
+from scipy.spatial.transform import Rotation as R  # Import rotation library
 
 from datasets.driving_dataset import DrivingDataset
 from utils.misc import import_str
@@ -22,23 +22,23 @@ def render_novel_views_as_images(
     single_frame: bool = True
 ) -> None:
     """
-    执行渲染并将结果保存为单独的图像文件。
+    Execute rendering and save results as individual image files.
     
     Args:
-        trainer: 包含渲染方法的训练器对象
-        render_data (list): 列表，每个元素包含渲染单帧所需的数据
-        save_dir (str): 保存输出图像的目录
-        single_frame (bool): 如果为True，只保存一个图像（第一帧）；如果为False，保存所有帧
+        trainer: Trainer object containing rendering methods
+        render_data (list): List, each element contains data needed to render a single frame
+        save_dir (str): Directory to save output images
+        single_frame (bool): If True, only save one image (first frame); if False, save all frames
     """
     os.makedirs(save_dir, exist_ok=True)
     
     with torch.no_grad():
         for i, frame_data in enumerate(render_data):
-            # 如果只需要一个图像且不是第一帧，跳过
+            # If only need one image and not first frame, skip
             if single_frame and i > 0:
                 break
                 
-            # 将数据移到GPU
+            # Move data to GPU
             for key, value in frame_data["cam_infos"].items():
                 if isinstance(value, torch.Tensor):
                     frame_data["cam_infos"][key] = value.cuda(non_blocking=True)
@@ -46,33 +46,33 @@ def render_novel_views_as_images(
                 if isinstance(value, torch.Tensor):
                     frame_data["image_infos"][key] = value.cuda(non_blocking=True)
             
-            # 执行渲染
+            # Execute rendering
             outputs = trainer(
                 image_infos=frame_data["image_infos"],
                 camera_infos=frame_data["cam_infos"],
                 novel_view=True
             )
             
-            # 提取RGB图像并裁剪
+            # Extract RGB image and clip
             rgb = outputs["rgb"].cpu().numpy().clip(0.0, 1.0)
             
-            # 转换为uint8并保存为图像
+            # Convert to uint8 and save as image
             rgb_uint8 = (rgb * 255).astype(np.uint8)
             
-            # 构建图像文件名
+            # Build image filename
             if single_frame:
                 img_path = os.path.join(save_dir, "image.png")
             else:
                 img_path = os.path.join(save_dir, f"frame_{i:04d}.png")
             
-            # 保存图像
+            # Save image
             Image.fromarray(rgb_uint8).save(img_path)
-            print(f"图像已保存到 {img_path}")
+            print(f"Image saved to {img_path}")
             
         if single_frame:
-            print(f"已保存单张图像到 {save_dir}")
+            print(f"Single image saved to {save_dir}")
         else:
-            print(f"已保存 {len(render_data)} 帧图像到 {save_dir}")
+            print(f"{len(render_data)} frames saved to {save_dir}")
 
 
 def generate_fixed_offset_trajectories(

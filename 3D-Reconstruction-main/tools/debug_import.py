@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-调试导入问题的测试脚本
+Test script for debugging import issues
 """
 
 import sys
 import os
 from pathlib import Path
 
-print("=== 调试信息 ===")
-print(f"Python版本: {sys.version}")
-print(f"当前工作目录: {os.getcwd()}")
-print(f"Python路径: {sys.path}")
+print("=== Debug Info ===")
+print(f"Python version: {sys.version}")
+print(f"Current working directory: {os.getcwd()}")
+print(f"Python path: {sys.path}")
 print()
 
-# 检查关键文件是否存在
+# Check if key files exist
 files_to_check = [
     "scene_editing/insert_instance.py",
     "scene_editing/scene_editing.py",
@@ -21,47 +21,47 @@ files_to_check = [
     "datasets/driving_dataset.py"
 ]
 
-print("=== 文件存在性检查 ===")
+print("=== File Existence Check ===")
 for file_path in files_to_check:
     exists = os.path.exists(file_path)
     print(f"{file_path}: {'✓' if exists else '✗'}")
 
 print()
 
-# 尝试导入关键模块
-print("=== 模块导入测试 ===")
+# Try importing key modules
+print("=== Module Import Test ===")
 
 try:
     from utils.misc import import_str
-    print("✓ utils.misc 导入成功")
+    print("✓ utils.misc import successful")
 except Exception as e:
-    print(f"✗ utils.misc 导入失败: {e}")
+    print(f"✗ utils.misc import failed: {e}")
 
 try:
     from datasets.driving_dataset import DrivingDataset
-    print("✓ datasets.driving_dataset 导入成功")
+    print("✓ datasets.driving_dataset import successful")
 except Exception as e:
-    print(f"✗ datasets.driving_dataset 导入失败: {e}")
+    print(f"✗ datasets.driving_dataset import failed: {e}")
 
 try:
     from omegaconf import OmegaConf
-    print("✓ omegaconf 导入成功")
+    print("✓ omegaconf import successful")
 except Exception as e:
-    print(f"✗ omegaconf 导入失败: {e}")
+    print(f"✗ omegaconf import failed: {e}")
 
-# 检查scene_editing模块
+# Check scene_editing module
 print()
-print("=== scene_editing 模块检查 ===")
+print("=== scene_editing Module Check ===")
 try:
-    # 添加当前目录到路径
+    # Add current directory to path
     current_dir = Path(__file__).parent
     project_root = current_dir.parent if current_dir.name == "scene_editing" else current_dir
     sys.path.insert(0, str(project_root))
     
     import scene_editing.scene_editing as se
-    print("✓ scene_editing.scene_editing 导入成功")
+    print("✓ scene_editing.scene_editing import successful")
     
-    # 检查关键函数是否存在
+    # Check if key functions exist
     required_functions = [
         'save_smpl_instance',
         'save_rigid_instance', 
@@ -72,13 +72,13 @@ try:
     
     for func_name in required_functions:
         if hasattr(se, func_name):
-            print(f"  ✓ 函数 {func_name} 存在")
+            print(f"  ✓ Function {func_name} exists")
         else:
-            print(f"  ✗ 函数 {func_name} 不存在")
+            print(f"  ✗ Function {func_name} does not exist")
             
 except Exception as e:
-    print(f"✗ scene_editing.scene_editing 导入失败: {e}")
+    print(f"✗ scene_editing.scene_editing import failed: {e}")
     import traceback
     traceback.print_exc()
 
-print("\n=== 检查完成 ===")
+print("\n=== Check Complete ===")

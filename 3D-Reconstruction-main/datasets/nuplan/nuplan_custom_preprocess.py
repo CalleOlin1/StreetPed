@@ -9,7 +9,7 @@ from utils.geometry import get_corners, project_camera_points_to_image
 import yaml
 from collections import defaultdict
 
-# 添加KITTI类别定义
+# Add KITTI category definitions
 KITTI_LABELS = [
 'vehicle', 'pedestrian', 'bicycle'
 ]
@@ -40,7 +40,7 @@ class CustomProcessor(object):
         self.process_keys = process_keys
         self.workers = workers
 
-        # 定义相机名称和后缀的映射
+        # Define camera name to suffix mapping
         self.cam_mapping = {
             "SUB_RGB_1": "1",
             "SUB_RGB_2": "2",
@@ -52,7 +52,7 @@ class CustomProcessor(object):
             "SUB_RGB_8": "8",
         }
 
-        # 定义相机名称和图像标签路径的映射
+        # Define camera name to image label path mapping
         self.image_label_mapping = {
             "SUB_RGB_1": "camera_1",
             "SUB_RGB_2": "camera_2",
@@ -63,7 +63,7 @@ class CustomProcessor(object):
             "SUB_RGB_7": "camera_7",
             "SUB_RGB_8": "camera_8",
         }
-        # 读取场景列表
+        # Read scene list
         if self.split_file is not None:
             with open(self.split_file, "r") as f:
                 self.process_id_list = [
@@ -71,10 +71,10 @@ class CustomProcessor(object):
                 ]
         else:
             self.process_id_list = (
-                process_id_list  # 如果未提供 split_file，使用传入的 process_id_list
+                process_id_list  # If split_file not provided, use passed process_id_list
             )
 
-        # 其他初始化代码
+        # Other initialization code
         # self.HW = (720, 1280)
         self.HW = (1080, 1920)
         self.cam_list = ["SUB_RGB_1", "SUB_RGB_2", "SUB_RGB_3", "SUB_RGB_4", 
@@ -184,34 +184,34 @@ class CustomProcessor(object):
         self.create_folder()
 
     def convert(self):
-        """转换数据."""
+        """Convert data."""
         if self.process_id_list is None:
-            # 如果未提供 process_id_list，处理所有场景
+            # If process_id_list not provided, process all scenes
             scene_names = os.listdir(os.path.join(self.load_dir, self.split))
         else:
-            # 使用 process_id_list 处理指定场景
+            # Use process_id_list to process specified scenes
             scene_names = self.process_id_list
 
         for scene_name in scene_names:
             self.convert_one(scene_name)
 
     def convert_one(self, scene_name: str):
-        """处理单个场景."""
-        # 确保路径包含 2025_02_20_drive_0000_sync
+        """Process single scene."""
+        # Ensure path contains 2025_02_20_drive_0000_sync
         basedir = os.path.join(self.load_dir, self.split, scene_name)
         print(f"Processing scene: {basedir}")
 
-        # 处理图像
+        # Process images
         if "images" in self.process_keys:
             self.save_image(basedir, scene_name)
             print(f"Processing Image: {basedir}")
 
-        # 处理标定数据
+        # Process calibration data
         if "calib" in self.process_keys:
             self.save_calib(basedir, scene_name)
             print(f"Processing Calib: {basedir}")
 
-        # 其他处理逻辑
+        # Other processing logic
         # ...
         if "pose" in self.process_keys:
             self.save_pose(basedir, scene_name)
@@ -225,23 +225,23 @@ class CustomProcessor(object):
         if "objects" in self.process_keys:
             os.makedirs(f"{self.save_dir}/{scene_name}/instances", exist_ok=True)
 
-            # 必须先保存实例信息
+            # Must save instance info first
             self.save_instances_info(basedir, scene_name)
 
-            # 然后生成帧实例映射
+            # Then generate frame instance mapping
             self.save_frame_instances(basedir, scene_name)
 
     def calculate_intrinsic(self, calib_data: Dict[str, np.ndarray], cam_idx: int):
-        """从 calib.txt 中读取相机内参."""
-        # 获取对应的投影矩阵（P0, P1, P2, P3）
+        """Read camera intrinsics from calib.txt."""
+        # Get corresponding projection matrix (P0, P1, P2, P3)
         proj_matrix = calib_data[f"P{cam_idx}"]
 
-        # 提取前 3x3 部分作为内参矩阵
+        # Extract top-left 3x3 part as intrinsic matrix
         intrinsic_matrix = proj_matrix[:3, :3]
         return intrinsic_matrix
 
     def calculate_extrinsic(self, cam_config, calib_data):
-        """根据config计算相机外参，直接使用旋转矩阵"""
+        """Calculate camera extrinsics from config, using rotation matrix directly"""
         location = cam_config["TRANSFORM"]["location"]
         rotation_matrix = np.array(cam_config["TRANSFORM"]["rotation_matrix"])
         

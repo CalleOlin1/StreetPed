@@ -53,7 +53,7 @@ def look_at_rotation(
     direction: torch.Tensor, up: torch.Tensor = torch.tensor([0.0, 0.0, 1.0])
 ) -> torch.Tensor:
     """Calculate rotation matrix to look at a specific direction."""
-    # 确保输入张量在相同设备
+    # Ensure input tensors are on the same device
     up = up.to(direction.device)  # [!code ++]
     front = torch.nn.functional.normalize(direction, dim=-1)
     right = torch.nn.functional.normalize(torch.cross(front, up), dim=-1)
@@ -75,7 +75,7 @@ def get_interp_novel_trajectories(
         "front_center_interp": front_center_interp,
         "s_curve": s_curve,
         "three_key_poses": three_key_poses_trajectory,
-        # 新增轨迹类型
+        # New trajectory types
         "circle_trajectory": circle_trajectory,
         "spiral_trajectory": spiral_trajectory,
         "look_around_trajectory": look_around_trajectory,
@@ -111,25 +111,25 @@ def kitti_fixed_path(
     target_frames: int,
     num_loops: int = 1,
     npz_path = "output/Kitti/dataset=Kitti/change_line_gt/camera_poses_eval/full_poses_2025-07-02_18-00-20.npz",
-    position_offset: Optional[List[float]] = None,  # 新增：位置偏移 [x, y, z]
-    rotation_offset: Optional[List[float]] = None,  # 新增：旋转偏移 [roll, pitch, yaw] (弧度)
+    position_offset: Optional[List[float]] = None,  # New: position offset [x, y, z]
+    rotation_offset: Optional[List[float]] = None,  # New: rotation offset [roll, pitch, yaw] (radians)
 ) -> torch.Tensor:
     """
-    从NPZ文件读取完整的相机轨迹，不做插值，直接使用原始数据
+    Read complete camera trajectory from NPZ file, no interpolation, use raw data directly
     
     Args:
-        dataset_type (str): 数据集类型（此函数中未使用）
-        per_cam_poses (Dict[int, torch.Tensor]): 每相机poses（此函数中未使用）
-        original_frames (int): 原始帧数（此函数中未使用）
-        target_frames (int): 目标帧数（如果超过原始帧数则重复或截断）
-        num_loops (int): 循环次数（此函数中未使用）
-        position_offset (List[float], optional): 位置偏移 [x, y, z]，单位米
-        rotation_offset (List[float], optional): 旋转偏移 [roll, pitch, yaw]，单位弧度
+        dataset_type (str): Dataset type (unused in this function)
+        per_cam_poses (Dict[int, torch.Tensor]): Per-camera poses (unused in this function)
+        original_frames (int): Original frame count (unused in this function)
+        target_frames (int): Target frame count (if exceeds original frames, will repeat or truncate)
+        num_loops (int): Number of loops (unused in this function)
+        position_offset (List[float], optional): Position offset [x, y, z] in meters
+        rotation_offset (List[float], optional): Rotation offset [roll, pitch, yaw] in radians
         
     Returns:
-        torch.Tensor: 原始轨迹数据，形状为 (actual_frames, 4, 4)
+        torch.Tensor: Original trajectory data, shape (actual_frames, 4, 4)
     """
-    # 写死的NPZ文件路径
+    # Hardcoded NPZ file path
     # npz_path = "output/Kitti/dataset=Kitti/change_line_gt/camera_poses_eval/full_poses_2025-07-02_18-00-20.npz"
     
     print(f"🔍 Loading complete trajectory from NPZ (no interpolation):")
@@ -137,16 +137,16 @@ def kitti_fixed_path(
     # position_offset = [0, 0, 0]
     
     try:
-        # 加载NPZ文件
+        # Load NPZ file
         data = np.load(npz_path, allow_pickle=True)
-        camera_poses = data['camera_poses']  # 形状: (N, 4, 4)
-        cam_names = data['cam_names']        # 相机名称列表
-        frame_indices = data['frame_indices'] # 帧索引
+        camera_poses = data['camera_poses']  # Shape: (N, 4, 4)
+        cam_names = data['cam_names']        # Camera name list
+        frame_indices = data['frame_indices'] # Frame indices
         
         print(f"   NPZ contains {len(camera_poses)} total poses")
         print(f"   Available cameras: {set(cam_names)}")
         
-        # 寻找前视中心相机（尝试多种可能的命名）
+        # Find front center camera (try various possible naming conventions)
         front_center_mask = None
         found_camera = None
         
@@ -157,7 +157,7 @@ def kitti_fixed_path(
                 found_camera = candidate
                 break
         
-        # 如果没找到，使用第一个相机
+        # If not found, use the first camera
         if front_center_mask is None:
             front_center_mask = np.ones(len(cam_names), dtype=bool)
             front_center_mask[1:] = False  # 只保留第一个

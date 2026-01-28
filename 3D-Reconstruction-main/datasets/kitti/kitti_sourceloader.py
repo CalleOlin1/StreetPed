@@ -40,8 +40,8 @@ OPENCV2DATASET = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1
 # KITTI Camera List:
 # 0: CAM_LEFT
 # 1: CAM_RIGHT
-AVAILABLE_CAM_LIST = [0, 1,2,3,4]
-# AVAILABLE_CAM_LIST = [0, 1]
+# AVAILABLE_CAM_LIST = [0, 1,2,3,4]
+AVAILABLE_CAM_LIST = [0, 1]
 
 
 class KITTICameraData(CameraData):
