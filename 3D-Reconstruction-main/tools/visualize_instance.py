@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Instance可视化工具
-读取保存的instance数据，并可视化其位置信息、序列长度等
+InstanceVisualization Tool
+Read the saved instance data and visualize its position information, sequence length, etc.
 
-使用示例:
-export PYTHONPATH=$(pwd)
+Usage example:export PYTHONPATH=$(pwd)
 python tools/visualize_instance.py \
     --instance_file ./saved_instances/smpl_instance_0.pkl \
     --output_dir ./instance_visualization
 
-# 批量可视化多个实例
+# Visualize multiple instances in batches
 python tools/visualize_instance.py \
     --instance_files ./saved_instances/*.pkl \
     --output_dir ./instance_visualization
 
-# 可视化特定类型的实例
+
 python tools/visualize_instance.py \
     --instance_file ./saved_instances/smpl_instance_0.pkl \
     --instance_type smpl \
@@ -33,12 +32,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import torch
 
-# 确保能够导入项目模块
+# Make sure you can import the project module
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
 sys.path.insert(0, str(project_root))
 
-# 导入场景编辑模块
+# Import scene editing module
 try:
     from scene_editing.scene_editing import load_instance_data
 except ImportError:
@@ -47,7 +46,7 @@ except ImportError:
         with open(file_path, 'rb') as f:
             return pickle.load(f)
 
-# 配置日志
+# Configuration log
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -62,7 +61,7 @@ class InstanceVisualizer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 设置matplotlib样式
+        # Set matplotlib style
         plt.style.use('default')
         plt.rcParams['figure.dpi'] = 300
         plt.rcParams['savefig.dpi'] = 300
@@ -70,113 +69,113 @@ class InstanceVisualizer:
         
     def load_instance_data(self, file_path: str) -> Dict[str, Any]:
         """加载实例数据"""
-        logger.info(f"加载实例数据: {file_path}")
+        logger.info(f"Load instance data: {file_path}")
         
         try:
             instance_data = load_instance_data(file_path)
-            logger.info(f"成功加载实例数据，文件大小: {Path(file_path).stat().st_size / 1024 / 1024:.2f} MB")
+            logger.info(f"Instance data loaded successfully, file size: {Path(file_path).stat().st_size /1024 /1024:.2f} MB")
             return instance_data
         except Exception as e:
-            logger.error(f"加载实例数据失败: {str(e)}")
+            logger.error(f"Failed to load instance data: {str(e)}")
             raise
     
     def extract_motion_info(self, instance_data: Dict[str, Any]) -> Dict[str, Any]:
         """提取运动信息"""
         motion_info = {}
         
-        # 获取运动数据
+        # Get sports data
         motion = instance_data.get("motion", {})
         
-        # 提取位置信息
+        # Extract location information
         if "instances_trans" in motion:
             trans = motion["instances_trans"]
             if isinstance(trans, torch.Tensor):
                 trans = trans.cpu().numpy()
             
-            # 处理不同维度的位置数据
+            # Processing location data in different dimensions
             if trans.ndim == 1:
-                # 单个位置点
+                # single location point
                 trans = trans.reshape(1, -1)
             elif trans.ndim == 2 and trans.shape[1] == 3:
-                # 已经是正确的形状 (num_frames, 3)
+                # Already the correct shape (num_frames, 3)
                 pass
             elif trans.ndim == 3:
-                # 可能是 (num_frames, num_instances, 3)，取第一个实例
+                # May be (num_frames, num_instances, 3), take the first instance
                 if trans.shape[1] == 1:
                     trans = trans.squeeze(1)
                 else:
-                    logger.warning(f"多实例位置数据，取第一个实例。形状: {trans.shape}")
+                    logger.warning(f"Multiple instance location data, take the first instance. Shape: {trans.shape}")
                     trans = trans[:, 0, :]
             
             motion_info["translation"] = trans
             motion_info["num_frames"] = len(trans)
             
-        # 提取旋转信息
+        # Extract rotation information
         if "instances_quats" in motion:
             quats = motion["instances_quats"]
             if isinstance(quats, torch.Tensor):
                 quats = quats.cpu().numpy()
             
-            # 处理不同维度的四元数数据
+            # Processing quaternion data in different dimensions
             if quats.ndim == 1:
-                # 单个四元数
+                # single quaternion
                 quats = quats.reshape(1, -1)
             elif quats.ndim == 2:
-                # 检查是否是正确的形状
+                # Check if it is the correct shape
                 if quats.shape[1] == 4:
-                    # 正确的形状 (num_frames, 4)
+                    # correct shape (num_frames, 4)
                     pass
                 elif quats.shape[1] == 1:
-                    # 可能是 (num_frames, 1) 需要进一步处理
-                    logger.warning(f"四元数数据形状异常: {quats.shape}")
+                    # May be (num_frames, 1) needs further processing
+                    logger.warning(f"Abnormal shape of quaternion data: {quats.shape}")
                     quats = None
                 else:
-                    logger.warning(f"未知的四元数形状: {quats.shape}")
+                    logger.warning(f"Unknown quaternion shape: {quats.shape}")
                     quats = None
             elif quats.ndim == 3:
-                # 可能是 (num_frames, num_instances, 4) 或 (num_frames, 1, 4)
+                # May be (num_frames, num_instances, 4) or (num_frames, 1, 4)
                 if quats.shape[1] == 1:
-                    quats = quats.squeeze(1)  # 去掉实例维度
+                    quats = quats.squeeze(1)  # Remove instance dimension
                 else:
-                    logger.warning(f"多实例四元数数据，取第一个实例。形状: {quats.shape}")
+                    logger.warning(f"Multi-instance quaternion data, take the first instance. Shape: {quats.shape}")
                     quats = quats[:, 0, :]
             
             if quats is not None:
                 motion_info["quaternions"] = quats
             
-        # 提取SMPL特有的旋转信息
+        # Extract smpl-specific rotation information
         if "smpl_qauts" in motion:
             smpl_quats = motion["smpl_qauts"]
             if isinstance(smpl_quats, torch.Tensor):
                 smpl_quats = smpl_quats.cpu().numpy()
             
-            # 处理SMPL四元数数据 (通常是 (num_frames, 23, 4) 或 (num_frames, num_instances, 23, 4))
+            # Handles SMPL quaternion data (usually (num_frames, 23, 4) or (num_frames, num_instances, 23, 4))
             if smpl_quats.ndim == 3:
-                # (num_frames, 23, 4) - 正确的形状
+                # (num_frames, 23, 4) -correct shape
                 motion_info["smpl_quaternions"] = smpl_quats
             elif smpl_quats.ndim == 4:
-                # (num_frames, num_instances, 23, 4) - 取第一个实例
-                logger.warning(f"多实例SMPL四元数数据，取第一个实例。形状: {smpl_quats.shape}")
+                # (num_frames, num_instances, 23, 4) -take the first instance
+                logger.warning(f"Multi-instance SMPL quaternion data, take the first instance. Shape: {smpl_quats.shape}")
                 motion_info["smpl_quaternions"] = smpl_quats[:, 0, :, :]
             else:
-                logger.warning(f"SMPL四元数形状异常: {smpl_quats.shape}")
+                logger.warning(f"SMPL quaternion shape abnormality: {smpl_quats.shape}")
             
-        # 提取帧有效性信息
+        # Extract frame validity information
         if "instances_fv" in motion:
             fv = motion["instances_fv"]
             if isinstance(fv, torch.Tensor):
                 fv = fv.cpu().numpy()
             
-            # 处理不同维度的帧有效性数据
+            # Processing frame validity data in different dimensions
             if fv.ndim == 1:
-                # 正确的形状 (num_frames,)
+                # correct shape (num_frames,)
                 motion_info["frame_validity"] = fv
             elif fv.ndim == 2:
-                # 可能是 (num_frames, num_instances)
+                # May be (num_frames, num_instances)
                 if fv.shape[1] == 1:
                     motion_info["frame_validity"] = fv.squeeze(1)
                 else:
-                    logger.warning(f"多实例帧有效性数据，取第一个实例。形状: {fv.shape}")
+                    logger.warning(f"Multi-instance frame validity data, take the first instance. Shape: {fv.shape}")
                     motion_info["frame_validity"] = fv[:, 0]
             
         return motion_info
@@ -185,10 +184,10 @@ class InstanceVisualizer:
         """提取几何信息"""
         geometry_info = {}
         
-        # 获取几何数据
+        # Get geometric data
         geometry = instance_data.get("geometry", {})
         
-        # 提取点坐标
+        # Extract point coordinates
         if "_means" in geometry:
             means = geometry["_means"]
             if isinstance(means, torch.Tensor):
@@ -196,14 +195,14 @@ class InstanceVisualizer:
             geometry_info["points"] = means
             geometry_info["num_points"] = len(means)
             
-        # 提取点大小
+        # Extract point size
         if "_scales" in geometry:
             scales = geometry["_scales"]
             if isinstance(scales, torch.Tensor):
                 scales = scales.cpu().numpy()
             geometry_info["scales"] = scales
             
-        # 提取点不透明度
+        # Extract point opacity
         if "_opacities" in geometry:
             opacities = geometry["_opacities"]
             if isinstance(opacities, torch.Tensor):
@@ -220,32 +219,32 @@ class InstanceVisualizer:
             
         translation = motion_info["translation"]
         
-        # 确保translation是正确的形状
+        # Make sure the translation is the correct shape
         if translation.ndim != 2 or translation.shape[1] != 3:
-            logger.warning(f"位置数据形状不正确: {translation.shape}，跳过3D轨迹绘制")
+            logger.warning(f"Position data shape is incorrect: {translation.shape}, skipping 3D trajectory drawing")
             return
         
         fig = plt.figure(figsize=(12, 8))
         ax = fig.add_subplot(111, projection='3d')
         
-        # 绘制轨迹
+        # draw trajectory
         ax.plot(translation[:, 0], translation[:, 1], translation[:, 2], 
                 'b-', linewidth=2, alpha=0.7, label='轨迹')
         
-        # 标记起始点和结束点
+        # Mark start and end points
         ax.scatter(translation[0, 0], translation[0, 1], translation[0, 2], 
                   c='green', s=100, marker='o', label='起始点')
         ax.scatter(translation[-1, 0], translation[-1, 1], translation[-1, 2], 
                   c='red', s=100, marker='s', label='结束点')
         
-        # 设置坐标轴
+        # Set axes
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
         ax.set_title('Instance 3D轨迹')
         ax.legend()
         
-        # 设置等比例坐标轴
+        # Set proportional axes
         try:
             max_range = np.array([translation[:, 0].max()-translation[:, 0].min(),
                                  translation[:, 1].max()-translation[:, 1].min(),
@@ -258,13 +257,13 @@ class InstanceVisualizer:
             ax.set_ylim(mid_y - max_range, mid_y + max_range)
             ax.set_zlim(mid_z - max_range, mid_z + max_range)
         except:
-            # 如果设置等比例坐标轴失败，使用默认设置
+            # If setting the proportional axis fails, use the default settings
             logger.warning("设置等比例坐标轴失败，使用默认设置")
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"3D轨迹图保存到: {save_path}")
+        logger.info(f"Save the 3D trajectory map to: {save_path}")
     
     def plot_trajectory_2d(self, motion_info: Dict[str, Any], save_path: str):
         """绘制2D轨迹图"""
@@ -274,9 +273,9 @@ class InstanceVisualizer:
             
         translation = motion_info["translation"]
         
-        # 确保translation是正确的形状
+        # Make sure the translation is the correct shape
         if translation.ndim != 2 or translation.shape[1] != 3:
-            logger.warning(f"位置数据形状不正确: {translation.shape}，跳过2D轨迹绘制")
+            logger.warning(f"Position data shape is incorrect: {translation.shape}, skipping 2D trajectory drawing")
             return
             
         num_frames = len(translation)
@@ -284,7 +283,7 @@ class InstanceVisualizer:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('Instance 2D轨迹分析', fontsize=16)
         
-        # XY平面图
+        # Xy plan
         ax1 = axes[0, 0]
         ax1.plot(translation[:, 0], translation[:, 1], 'b-', linewidth=2, alpha=0.7)
         ax1.scatter(translation[0, 0], translation[0, 1], c='green', s=100, marker='o', label='起始点')
@@ -295,13 +294,13 @@ class InstanceVisualizer:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 尝试设置等比例坐标轴
+        # Try setting proportional axes
         try:
             ax1.axis('equal')
         except:
             logger.warning("设置等比例坐标轴失败")
         
-        # 时间序列图
+        # time series diagram
         ax2 = axes[0, 1]
         frames = np.arange(num_frames)
         ax2.plot(frames, translation[:, 0], 'r-', label='X', linewidth=2)
@@ -313,7 +312,7 @@ class InstanceVisualizer:
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
-        # 速度分析
+        # speed analysis
         ax3 = axes[1, 0]
         if num_frames > 1:
             try:
@@ -333,7 +332,7 @@ class InstanceVisualizer:
                     ha='center', va='center', fontsize=12)
             ax3.set_title('速度分析')
         
-        # 帧有效性（如果有）
+        # Frame validity (if any)
         ax4 = axes[1, 1]
         if "frame_validity" in motion_info:
             fv = motion_info["frame_validity"]
@@ -356,7 +355,7 @@ class InstanceVisualizer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"2D轨迹图保存到: {save_path}")
+        logger.info(f"Save the 2D trajectory map to: {save_path}")
     
     def plot_rotation_analysis(self, motion_info: Dict[str, Any], save_path: str):
         """绘制旋转分析图"""
@@ -367,7 +366,7 @@ class InstanceVisualizer:
         quaternions = motion_info["quaternions"]
         num_frames = len(quaternions)
         
-        # 检查四元数维度并处理
+        # Check quaternion dimensions and process
         if quaternions.ndim == 1:
             logger.warning("四元数数据是1D，可能是单个四元数，跳过旋转分析")
             return
@@ -375,19 +374,19 @@ class InstanceVisualizer:
             logger.warning("四元数数据维度不正确，跳过旋转分析")
             return
         elif quaternions.ndim == 3:
-            # 如果是3D，取第一个实例或者reshape
+            # If it is 3D, take the first instance or reshape
             if quaternions.shape[1] == 1:
-                quaternions = quaternions.squeeze(1)  # 去掉实例维度
+                quaternions = quaternions.squeeze(1)  # Remove instance dimension
             else:
                 logger.warning("多实例四元数数据，取第一个实例")
                 quaternions = quaternions[:, 0, :]
         
-        # 确保四元数是正确的形状 (num_frames, 4)
+        # Make sure the quaternion is the correct shape (num_frames, 4)
         if quaternions.shape[1] != 4:
-            logger.warning(f"四元数形状不正确: {quaternions.shape}，跳过旋转分析")
+            logger.warning(f"Incorrect quaternion shape: {quaternions.shape}, skipping rotation analysis")
             return
         
-        # 转换四元数为欧拉角
+        # Convert quaternion to Euler angles
         def quat_to_euler(q):
             """四元数转欧拉角 (roll, pitch, yaw)"""
             w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -414,7 +413,7 @@ class InstanceVisualizer:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('Instance 旋转分析', fontsize=16)
         
-        # 四元数时间序列
+        # Quaternion time series
         ax1 = axes[0, 0]
         frames = np.arange(num_frames)
         ax1.plot(frames, quaternions[:, 0], 'r-', label='w', linewidth=2)
@@ -427,7 +426,7 @@ class InstanceVisualizer:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 欧拉角时间序列
+        # Euler angle time series
         ax2 = axes[0, 1]
         ax2.plot(frames, euler_degrees[:, 0], 'r-', label='Roll', linewidth=2)
         ax2.plot(frames, euler_degrees[:, 1], 'g-', label='Pitch', linewidth=2)
@@ -438,7 +437,7 @@ class InstanceVisualizer:
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
-        # 角速度分析
+        # Angular velocity analysis
         ax3 = axes[1, 0]
         if num_frames > 1:
             angular_velocity = np.diff(euler_angles, axis=0)
@@ -449,7 +448,7 @@ class InstanceVisualizer:
             ax3.set_title('角速度分析')
             ax3.grid(True, alpha=0.3)
         
-        # 旋转统计
+        # Spin Statistics
         ax4 = axes[1, 1]
         ax4.axis('off')
         
@@ -474,7 +473,7 @@ class InstanceVisualizer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"旋转分析图保存到: {save_path}")
+        logger.info(f"Save the rotation analysis chart to: {save_path}")
     
     def plot_geometry_analysis(self, geometry_info: Dict[str, Any], save_path: str):
         """绘制几何分析图"""
@@ -488,12 +487,12 @@ class InstanceVisualizer:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('Instance 几何分析', fontsize=16)
         
-        # 点云分布（3D）
+        # Point cloud distribution (3D)
         ax1 = axes[0, 0]
         ax1.remove()
         ax1 = fig.add_subplot(2, 2, 1, projection='3d')
         
-        # 随机采样点以提高可视化性能
+        # Randomly sample points to improve visualization performance
         if num_points > 5000:
             indices = np.random.choice(num_points, 5000, replace=False)
             sample_points = points[indices]
@@ -507,7 +506,7 @@ class InstanceVisualizer:
         ax1.set_zlabel('Z')
         ax1.set_title(f'点云分布 (显示 {len(sample_points)}/{num_points} 点)')
         
-        # 点云分布（2D投影）
+        # Point cloud distribution (2D projection)
         ax2 = axes[0, 1]
         ax2.scatter(sample_points[:, 0], sample_points[:, 1], c='blue', s=1, alpha=0.6)
         ax2.set_xlabel('X')
@@ -516,7 +515,7 @@ class InstanceVisualizer:
         ax2.grid(True, alpha=0.3)
         ax2.axis('equal')
         
-        # 点规模分布
+        # point size distribution
         ax3 = axes[1, 0]
         if "scales" in geometry_info:
             scales = geometry_info["scales"]
@@ -531,7 +530,7 @@ class InstanceVisualizer:
                     ha='center', va='center', fontsize=12)
             ax3.set_title('点规模分布')
         
-        # 不透明度分布
+        # Opacity distribution
         ax4 = axes[1, 1]
         if "opacities" in geometry_info:
             opacities = geometry_info["opacities"]
@@ -549,7 +548,7 @@ class InstanceVisualizer:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"几何分析图保存到: {save_path}")
+        logger.info(f"Save the geometric analysis diagram to: {save_path}")
     
     def generate_summary_report(self, instance_data: Dict[str, Any], 
                               motion_info: Dict[str, Any], 
@@ -562,7 +561,7 @@ class InstanceVisualizer:
         report_lines.append("=" * 60)
         report_lines.append("")
         
-        # 元数据信息
+        # metadata information
         if "metadata" in instance_data:
             metadata = instance_data["metadata"]
             report_lines.append("元数据信息:")
@@ -571,16 +570,16 @@ class InstanceVisualizer:
                 report_lines.append(f"  {key}: {value}")
             report_lines.append("")
         
-        # 几何信息
+        # Geometric information
         if geometry_info:
             report_lines.append("几何信息:")
             report_lines.append("-" * 30)
             if "num_points" in geometry_info:
-                report_lines.append(f"  点数量: {geometry_info['num_points']}")
+                report_lines.append(f" Number of points: {geometry_info['num_points']}")
             
             if "points" in geometry_info:
                 points = geometry_info["points"]
-                report_lines.append(f"  点坐标范围:")
+                report_lines.append(f" Point coordinate range:")
                 report_lines.append(f"    X: [{points[:, 0].min():.3f}, {points[:, 0].max():.3f}]")
                 report_lines.append(f"    Y: [{points[:, 1].min():.3f}, {points[:, 1].max():.3f}]")
                 report_lines.append(f"    Z: [{points[:, 2].min():.3f}, {points[:, 2].max():.3f}]")
@@ -589,137 +588,137 @@ class InstanceVisualizer:
                 scales = geometry_info["scales"]
                 if scales.ndim > 1:
                     scales = np.linalg.norm(scales, axis=1)
-                report_lines.append(f"  点规模范围: [{scales.min():.3f}, {scales.max():.3f}]")
+                report_lines.append(f" Point scale range: [{scales.min():.3f}, {scales.max():.3f}]")
             
             if "opacities" in geometry_info:
                 opacities = geometry_info["opacities"]
                 if opacities.ndim > 1:
                     opacities = opacities.flatten()
-                report_lines.append(f"  不透明度范围: [{opacities.min():.3f}, {opacities.max():.3f}]")
+                report_lines.append(f" Opacity range: [{opacities.min():.3f}, {opacities.max():.3f}]")
             
             report_lines.append("")
         
-        # 运动信息
+        # Sports information
         if motion_info:
             report_lines.append("运动信息:")
             report_lines.append("-" * 30)
             if "num_frames" in motion_info:
-                report_lines.append(f"  帧数: {motion_info['num_frames']}")
+                report_lines.append(f" Number of frames: {motion_info['num_frames']}")
             
             if "translation" in motion_info:
                 translation = motion_info["translation"]
-                report_lines.append(f"  位置信息:")
-                report_lines.append(f"    起始位置: [{translation[0, 0]:.3f}, {translation[0, 1]:.3f}, {translation[0, 2]:.3f}]")
-                report_lines.append(f"    结束位置: [{translation[-1, 0]:.3f}, {translation[-1, 1]:.3f}, {translation[-1, 2]:.3f}]")
+                report_lines.append(f"Location information:")
+                report_lines.append(f" starting position: [{translation[0, 0]:.3f}, {translation[0, 1]:.3f}, {translation[0, 2]:.3f}]")
+                report_lines.append(f" end position: [{translation[-1, 0]:.3f}, {translation[-1, 1]:.3f}, {translation[-1, 2]:.3f}]")
                 
                 if len(translation) > 1:
                     total_distance = np.sum(np.linalg.norm(np.diff(translation, axis=0), axis=1))
-                    report_lines.append(f"    总移动距离: {total_distance:.3f} m")
-                    report_lines.append(f"    平均移动速度: {total_distance / (len(translation) - 1):.3f} m/frame")
+                    report_lines.append(f" Total moving distance: {total_distance:.3f} m")
+                    report_lines.append(f" Average moving speed: {total_distance /(len(translation) -1):.3f} m/frame")
             
             if "quaternions" in motion_info:
                 quaternions = motion_info["quaternions"]
-                report_lines.append(f"  旋转信息:")
-                report_lines.append(f"    四元数形状: {quaternions.shape}")
-                report_lines.append(f"    起始四元数: [{quaternions[0, 0]:.3f}, {quaternions[0, 1]:.3f}, {quaternions[0, 2]:.3f}, {quaternions[0, 3]:.3f}]")
-                report_lines.append(f"    结束四元数: [{quaternions[-1, 0]:.3f}, {quaternions[-1, 1]:.3f}, {quaternions[-1, 2]:.3f}, {quaternions[-1, 3]:.3f}]")
+                report_lines.append(f" Rotation information:")
+                report_lines.append(f" Quaternion shape: {quaternions.shape}")
+                report_lines.append(f" Starting quaternions: [{quaternions[0, 0]:.3f}, {quaternions[0, 1]:.3f}, {quaternions[0, 2]:.3f}, {quaternions[0, 3]:.3f}]")
+                report_lines.append(f" end quaternions: [{quaternions[-1, 0]:.3f}, {quaternions[-1, 1]:.3f}, {quaternions[-1, 2]:.3f}, {quaternions[-1, 3]:.3f}]")
             
             if "frame_validity" in motion_info:
                 fv = motion_info["frame_validity"]
                 valid_frames = np.sum(fv)
-                report_lines.append(f"  帧有效性: {valid_frames}/{len(fv)} 帧有效")
+                report_lines.append(f" Frame validity: {valid_frames}/{len(fv)} frames are valid")
             
             report_lines.append("")
         
-        # 保存报告
+        # save report
         with open(save_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(report_lines))
         
-        logger.info(f"详细报告保存到: {save_path}")
+        logger.info(f"Save detailed report to: {save_path}")
     
     def visualize_instance(self, instance_file: str, instance_type: str = None):
         """可视化单个实例"""
         logger.info(f"=" * 60)
-        logger.info(f"开始可视化实例: {instance_file}")
+        logger.info(f"Start visualizing instance: {instance_file}")
         logger.info(f"=" * 60)
         
-        # 加载实例数据
+        # Load instance data
         instance_data = self.load_instance_data(instance_file)
         
-        # 提取信息
+        # Extract information
         motion_info = self.extract_motion_info(instance_data)
         geometry_info = self.extract_geometry_info(instance_data)
         
-        # 获取文件名用作前缀
+        # Get filename to use as prefix
         file_name = Path(instance_file).stem
         
-        # 生成可视化图
+        # Generate visualization diagram
         if motion_info:
-            # 3D轨迹
+            # 3D trajectory
             trajectory_3d_path = self.output_dir / f"{file_name}_trajectory_3d.png"
             self.plot_trajectory_3d(motion_info, str(trajectory_3d_path))
             
-            # 2D轨迹分析
+            # 2D trajectory analysis
             trajectory_2d_path = self.output_dir / f"{file_name}_trajectory_2d.png"
             self.plot_trajectory_2d(motion_info, str(trajectory_2d_path))
             
-            # 旋转分析
+            # rotation analysis
             rotation_path = self.output_dir / f"{file_name}_rotation_analysis.png"
             self.plot_rotation_analysis(motion_info, str(rotation_path))
         
         if geometry_info:
-            # 几何分析
+            # geometric analysis
             geometry_path = self.output_dir / f"{file_name}_geometry_analysis.png"
             self.plot_geometry_analysis(geometry_info, str(geometry_path))
         
-        # 生成详细报告
+        # Generate detailed reports
         report_path = self.output_dir / f"{file_name}_report.txt"
         self.generate_summary_report(instance_data, motion_info, geometry_info, str(report_path))
         
-        logger.info(f"实例可视化完成！结果保存到: {self.output_dir}")
+        logger.info(f"Instance visualization completed! The results are saved to: {self.output_dir}")
     
     def visualize_multiple_instances(self, instance_files: List[str]):
         """可视化多个实例"""
         logger.info(f"=" * 60)
-        logger.info(f"开始批量可视化 {len(instance_files)} 个实例")
+        logger.info(f"Start batch visualization of {len(instance_files)} instances")
         logger.info(f"=" * 60)
         
-        # 收集所有实例的信息用于比较
+        # Collect information from all instances for comparison
         all_motion_info = []
         all_geometry_info = []
         file_names = []
         
         for instance_file in instance_files:
             try:
-                logger.info(f"处理实例: {instance_file}")
+                logger.info(f"Processing instance: {instance_file}")
                 
-                # 加载实例数据
+                # Load instance data
                 instance_data = self.load_instance_data(instance_file)
                 
-                # 提取信息
+                # Extract information
                 motion_info = self.extract_motion_info(instance_data)
                 geometry_info = self.extract_geometry_info(instance_data)
                 
-                # 获取文件名
+                # Get file name
                 file_name = Path(instance_file).stem
                 file_names.append(file_name)
                 
-                # 可视化单个实例
+                # Visualize a single instance
                 self.visualize_instance(instance_file)
                 
-                # 收集信息用于比较
+                # Gather information for comparison
                 all_motion_info.append(motion_info)
                 all_geometry_info.append(geometry_info)
                 
             except Exception as e:
-                logger.error(f"处理实例 {instance_file} 时出错: {str(e)}")
+                logger.error(f"Error processing instance {instance_file}: {str(e)}")
                 continue
         
-        # 生成比较图
+        # Generate comparison graph
         if len(all_motion_info) > 1:
             self.plot_instances_comparison(all_motion_info, all_geometry_info, file_names)
         
-        logger.info(f"批量可视化完成！结果保存到: {self.output_dir}")
+        logger.info(f"Batch visualization completed! The results are saved to: {self.output_dir}")
     
     def plot_instances_comparison(self, all_motion_info: List[Dict], 
                                  all_geometry_info: List[Dict], 
@@ -732,13 +731,13 @@ class InstanceVisualizer:
         
         colors = plt.cm.tab10(np.linspace(0, 1, len(file_names)))
         
-        # 比较轨迹长度
+        # Compare track lengths
         ax1 = axes[0, 0]
         trajectory_lengths = []
         point_counts = []
         
         for i, (motion_info, geometry_info, name) in enumerate(zip(all_motion_info, all_geometry_info, file_names)):
-            # 计算轨迹长度
+            # Calculate trajectory length
             if "translation" in motion_info:
                 translation = motion_info["translation"]
                 if len(translation) > 1:
@@ -750,7 +749,7 @@ class InstanceVisualizer:
             else:
                 trajectory_lengths.append(0)
             
-            # 统计点数
+            # Statistics points
             if "num_points" in geometry_info:
                 point_counts.append(geometry_info["num_points"])
             else:
@@ -764,7 +763,7 @@ class InstanceVisualizer:
         ax1.set_xticks(x_pos)
         ax1.set_xticklabels(file_names, rotation=45, ha='right')
         
-        # 比较点数量
+        # Number of comparison points
         ax2 = axes[0, 1]
         ax2.bar(x_pos, point_counts, color=colors)
         ax2.set_xlabel('实例')
@@ -773,7 +772,7 @@ class InstanceVisualizer:
         ax2.set_xticks(x_pos)
         ax2.set_xticklabels(file_names, rotation=45, ha='right')
         
-        # 比较序列长度
+        # Compare sequence lengths
         ax3 = axes[1, 0]
         frame_counts = []
         for motion_info in all_motion_info:
@@ -789,14 +788,14 @@ class InstanceVisualizer:
         ax3.set_xticks(x_pos)
         ax3.set_xticklabels(file_names, rotation=45, ha='right')
         
-        # 轨迹重叠显示
+        # Track overlap display
         ax4 = axes[1, 1]
         for i, (motion_info, name) in enumerate(zip(all_motion_info, file_names)):
             if "translation" in motion_info:
                 translation = motion_info["translation"]
                 ax4.plot(translation[:, 0], translation[:, 1], 
                         color=colors[i], linewidth=2, label=name, alpha=0.7)
-                # 标记起点
+                # mark starting point
                 ax4.scatter(translation[0, 0], translation[0, 1], 
                           color=colors[i], s=50, marker='o', alpha=0.8)
         
@@ -811,13 +810,13 @@ class InstanceVisualizer:
         save_path = self.output_dir / "instances_comparison.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"比较图保存到: {save_path}")
+        logger.info(f"Save comparison chart to: {save_path}")
     
     def create_dashboard(self, instance_files: List[str]):
         """创建综合仪表盘"""
         logger.info("创建综合仪表盘...")
         
-        # 收集所有实例的统计信息
+        # Collect statistics for all instances
         stats = []
         
         for instance_file in instance_files:
@@ -828,7 +827,7 @@ class InstanceVisualizer:
                 
                 file_name = Path(instance_file).stem
                 
-                # 收集统计信息
+                # Collect statistics
                 stat = {
                     'name': file_name,
                     'num_points': geometry_info.get('num_points', 0),
@@ -838,7 +837,7 @@ class InstanceVisualizer:
                     'valid_frames': 0
                 }
                 
-                # 计算轨迹长度和平均速度
+                # Calculate trajectory length and average speed
                 if "translation" in motion_info:
                     translation = motion_info["translation"]
                     if len(translation) > 1:
@@ -846,7 +845,7 @@ class InstanceVisualizer:
                         stat['trajectory_length'] = np.sum(distances)
                         stat['avg_speed'] = stat['trajectory_length'] / (len(translation) - 1)
                 
-                # 计算有效帧数
+                # Calculate the number of effective frames
                 if "frame_validity" in motion_info:
                     fv = motion_info["frame_validity"]
                     stat['valid_frames'] = np.sum(fv)
@@ -856,25 +855,25 @@ class InstanceVisualizer:
                 stats.append(stat)
                 
             except Exception as e:
-                logger.error(f"处理实例 {instance_file} 时出错: {str(e)}")
+                logger.error(f"Error processing instance {instance_file}: {str(e)}")
                 continue
         
-        # 生成仪表盘
+        # Generate dashboard
         fig = plt.figure(figsize=(20, 12))
         gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
         
-        # 实例概览表格
+        # Instance overview table
         ax1 = fig.add_subplot(gs[0, :2])
         ax1.axis('off')
         
-        # 创建表格数据
+        # Create tabular data
         table_data = []
         headers = ['实例名称', '点数', '帧数', '轨迹长度(m)', '平均速度', '有效帧比例']
         
         for stat in stats:
             valid_ratio = stat['valid_frames'] / stat['num_frames'] if stat['num_frames'] > 0 else 0
             table_data.append([
-                stat['name'][:20],  # 限制名称长度
+                stat['name'][:20],  # Limit name length
                 f"{stat['num_points']:,}",
                 f"{stat['num_frames']}",
                 f"{stat['trajectory_length']:.2f}",
@@ -889,7 +888,7 @@ class InstanceVisualizer:
         table.scale(1.2, 1.5)
         ax1.set_title('实例概览', fontsize=14, pad=20)
         
-        # 点数分布
+        # Point distribution
         ax2 = fig.add_subplot(gs[0, 2])
         point_counts = [stat['num_points'] for stat in stats]
         ax2.hist(point_counts, bins=min(10, len(stats)), alpha=0.7, color='skyblue')
@@ -898,7 +897,7 @@ class InstanceVisualizer:
         ax2.set_title('点数分布')
         ax2.grid(True, alpha=0.3)
         
-        # 帧数分布
+        # Frame number distribution
         ax3 = fig.add_subplot(gs[0, 3])
         frame_counts = [stat['num_frames'] for stat in stats]
         ax3.hist(frame_counts, bins=min(10, len(stats)), alpha=0.7, color='lightgreen')
@@ -907,7 +906,7 @@ class InstanceVisualizer:
         ax3.set_title('帧数分布')
         ax3.grid(True, alpha=0.3)
         
-        # 轨迹长度对比
+        # Track length comparison
         ax4 = fig.add_subplot(gs[1, :2])
         names = [stat['name'] for stat in stats]
         trajectory_lengths = [stat['trajectory_length'] for stat in stats]
@@ -919,13 +918,13 @@ class InstanceVisualizer:
         ax4.set_xticks(range(len(names)))
         ax4.set_xticklabels(names, rotation=45, ha='right')
         
-        # 在柱状图上显示数值
+        # Display values ​​on a bar chart
         for bar, value in zip(bars, trajectory_lengths):
             height = bar.get_height()
             ax4.text(bar.get_x() + bar.get_width()/2., height + height*0.01,
                     f'{value:.1f}', ha='center', va='bottom', fontsize=8)
         
-        # 速度分布
+        # speed distribution
         ax5 = fig.add_subplot(gs[1, 2])
         speeds = [stat['avg_speed'] for stat in stats]
         ax5.hist(speeds, bins=min(10, len(stats)), alpha=0.7, color='orange')
@@ -934,11 +933,11 @@ class InstanceVisualizer:
         ax5.set_title('速度分布')
         ax5.grid(True, alpha=0.3)
         
-        # 统计摘要
+        # Statistical summary
         ax6 = fig.add_subplot(gs[1, 3])
         ax6.axis('off')
         
-        # 计算统计摘要
+        # Compute statistical summary
         total_instances = len(stats)
         total_points = sum(stat['num_points'] for stat in stats)
         avg_frames = np.mean([stat['num_frames'] for stat in stats])
@@ -960,7 +959,7 @@ class InstanceVisualizer:
         ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes, 
                 verticalalignment='top', fontfamily='monospace', fontsize=10)
         
-        # 有效帧比例
+        # Effective frame ratio
         ax7 = fig.add_subplot(gs[2, :])
         valid_ratios = [stat['valid_frames'] / stat['num_frames'] if stat['num_frames'] > 0 else 0 for stat in stats]
         
@@ -972,7 +971,7 @@ class InstanceVisualizer:
         ax7.set_xticklabels(names, rotation=45, ha='right')
         ax7.set_ylim(0, 1)
         
-        # 在柱状图上显示百分比
+        # Show percentages on bar chart
         for bar, value in zip(bars, valid_ratios):
             height = bar.get_height()
             ax7.text(bar.get_x() + bar.get_width()/2., height + 0.01,
@@ -984,14 +983,14 @@ class InstanceVisualizer:
         save_path = self.output_dir / "dashboard.png"
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"仪表盘保存到: {save_path}")
+        logger.info(f"Save the dashboard to: {save_path}")
 
 
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="Instance可视化工具")
     
-    # 输入选项
+    # Enter options
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--instance_file", type=str, 
                       help="单个实例文件路径")
@@ -1000,26 +999,26 @@ def main():
     group.add_argument("--instance_dir", type=str,
                       help="包含实例文件的目录")
     
-    # 输出选项
+    # Output options
     parser.add_argument("--output_dir", type=str, default="./instance_visualization",
                        help="输出目录")
     
-    # 实例类型（可选）
+    # Instance type (optional)
     parser.add_argument("--instance_type", type=str, 
                        choices=["smpl", "rigid"],
                        help="实例类型过滤")
     
-    # 可视化选项
+    # Visualization options
     parser.add_argument("--create_dashboard", action="store_true",
                        help="创建综合仪表盘")
     
     args = parser.parse_args()
     
     try:
-        # 创建可视化器
+        # Create a visualizer
         visualizer = InstanceVisualizer(args.output_dir)
         
-        # 确定要处理的文件
+        # Determine which files to process
         instance_files = []
         
         if args.instance_file:
@@ -1027,21 +1026,21 @@ def main():
         elif args.instance_files:
             instance_files = args.instance_files
         elif args.instance_dir:
-            # 搜索目录中的实例文件
+            # Search directory for instance files
             instance_dir = Path(args.instance_dir)
             if not instance_dir.exists():
-                logger.error(f"目录不存在: {instance_dir}")
+                logger.error(f"Directory does not exist: {instance_dir}")
                 return
             
-            # 查找.pkl文件
+            # Find .pkl files
             instance_files = list(instance_dir.glob("*.pkl"))
             if not instance_files:
-                logger.error(f"在目录 {instance_dir} 中没有找到.pkl文件")
+                logger.error(f"No .pkl file found in directory {instance_dir}")
                 return
             
             instance_files = [str(f) for f in instance_files]
         
-        # 类型过滤
+        # Type filtering
         if args.instance_type:
             instance_files = [f for f in instance_files if args.instance_type in Path(f).stem]
         
@@ -1049,15 +1048,15 @@ def main():
             logger.error("没有找到要处理的实例文件")
             return
         
-        logger.info(f"找到 {len(instance_files)} 个实例文件")
+        logger.info(f"{len(instance_files)} instance files found")
         
-        # 验证文件存在
+        # Verify file exists
         valid_files = []
         for file_path in instance_files:
             if Path(file_path).exists():
                 valid_files.append(file_path)
             else:
-                logger.warning(f"文件不存在，跳过: {file_path}")
+                logger.warning(f"File does not exist, skip: {file_path}")
         
         instance_files = valid_files
         
@@ -1065,23 +1064,23 @@ def main():
             logger.error("没有有效的实例文件")
             return
         
-        # 执行可视化
+        # Perform visualization
         if len(instance_files) == 1:
             visualizer.visualize_instance(instance_files[0], args.instance_type)
         else:
             visualizer.visualize_multiple_instances(instance_files)
         
-        # 创建仪表盘
+        # Create a dashboard
         if args.create_dashboard and len(instance_files) > 1:
             visualizer.create_dashboard(instance_files)
         
         logger.info("=" * 60)
         logger.info("可视化完成！")
-        logger.info(f"结果保存到: {args.output_dir}")
+        logger.info(f"Save the results to: {args.output_dir}")
         logger.info("=" * 60)
         
     except Exception as e:
-        logger.error(f"可视化过程中发生错误: {str(e)}")
+        logger.error(f"An error occurred during visualization: {str(e)}")
         logger.error(traceback.format_exc())
 
 
