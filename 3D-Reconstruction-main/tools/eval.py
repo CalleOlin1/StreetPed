@@ -21,6 +21,31 @@ logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
 
+def apply_render_frame_limit(dataset: DrivingDataset, max_render_frames: Optional[int]) -> Optional[int]:
+    if max_render_frames is None:
+        return None
+    max_render_frames = int(max_render_frames)
+    if max_render_frames <= 0:
+        logger.warning("max_render_frames <= 0, skipping frame limiting.")
+        return None
+    max_render_frames = min(max_render_frames, dataset.num_img_timesteps)
+    max_img_idx = max_render_frames * dataset.pixel_source.num_cams
+
+    dataset.train_indices = [i for i in dataset.train_indices if i < max_img_idx]
+    dataset.train_timesteps = dataset.train_timesteps[dataset.train_timesteps < max_render_frames]
+    dataset.train_image_set.split_indices = dataset.train_indices
+
+    dataset.full_image_set.split_indices = list(range(max_img_idx))
+
+    if dataset.test_image_set is not None:
+        dataset.test_indices = [i for i in dataset.test_indices if i < max_img_idx]
+        dataset.test_timesteps = dataset.test_timesteps[dataset.test_timesteps < max_render_frames]
+        dataset.test_image_set.split_indices = dataset.test_indices
+
+    logger.info(f"Limiting rendering to first {max_render_frames} frames.")
+    return max_render_frames
+
+
 @torch.no_grad()
 def do_evaluation(
     step: int = 0,
@@ -32,6 +57,7 @@ def do_evaluation(
     post_fix: str = "",
     log_metrics: bool = True,
     extract_camera_poses: bool = True,  # new parameter
+    max_render_frames: Optional[int] = None,
 ):
     trainer.set_eval()
     # New: camera pose extraction feature
@@ -132,11 +158,12 @@ def do_evaluation(
             video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}.mp4"
         else:
             video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}_{args.render_video_postfix}.mp4"
+        num_test_frames = dataset.num_test_timesteps
         vis_frame_dict = save_videos(
             render_results,
             video_output_pth,
             layout=dataset.layout,
-            num_timestamps=dataset.num_test_timesteps,
+            num_timestamps=num_test_frames,
             keys=render_keys,
             num_cams=dataset.pixel_source.num_cams,
             save_seperate_video=cfg.logging.save_seperate_video,
@@ -189,11 +216,12 @@ def do_evaluation(
             video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}.mp4"
         else:
             video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}_{args.render_video_postfix}.mp4"
+        num_full_frames = max_render_frames or dataset.num_img_timesteps
         vis_frame_dict = save_videos(
             render_results,
             video_output_pth,
             layout=dataset.layout,
-            num_timestamps=dataset.num_img_timesteps,
+            num_timestamps=num_full_frames,
             keys=render_keys,
             num_cams=dataset.pixel_source.num_cams,
             save_seperate_video=cfg.logging.save_seperate_video,
@@ -294,6 +322,8 @@ def main(args):
     if args.save_catted_videos:
         cfg.logging.save_seperate_video = False
 
+    max_render_frames = apply_render_frame_limit(dataset, args.max_render_frames)
+
     do_evaluation(
         step=trainer.step,
         cfg=cfg,
@@ -302,6 +332,7 @@ def main(args):
         render_keys=render_keys,
         args=args,
         post_fix="_eval",
+        max_render_frames=max_render_frames,
     )
 
     if args.enable_viewer:
@@ -330,6 +361,12 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="visualize lidar on image",
+    )
+    parser.add_argument(
+        "--max_render_frames",
+        type=int,
+        default=None,
+        help="limit rendering to the first N frames without changing dataset timesteps",
     )
 
     # viewer

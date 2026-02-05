@@ -76,6 +76,7 @@ def get_interp_novel_trajectories(
         "s_curve": s_curve,
         "three_key_poses": three_key_poses_trajectory,
         # New trajectory types
+        "front_center_novel": front_center_novel,
         "circle_trajectory": circle_trajectory,
         "spiral_trajectory": spiral_trajectory,
         "look_around_trajectory": look_around_trajectory,
@@ -1059,6 +1060,17 @@ def smooth_lane_change_trajectory(
             lane_change_trajectory[frame_idx, :3, :3] = original_rotation @ identity_rot
     
     return lane_change_trajectory
+
+# OUR FUNCTION FOR MOVING THE CAMERA!!!
+def front_center_novel(
+    dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int, num_loops: int = 1
+) -> torch.Tensor:
+    """Interpolate key frames from the front center camera."""
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required for front_center_interp"
+    # key_poses = per_cam_poses[0][::original_frames//4]  # Select every 4th frame as key frame
+    poses = per_cam_poses[0].clone()
+    poses[:, :3, 3] += torch.tensor([0, 5.0, 0], device=poses.device)
+    return interpolate_poses(poses, target_frames)
 
 def s_curve(
     dataset_type: str,
