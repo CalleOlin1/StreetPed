@@ -77,6 +77,7 @@ def get_interp_novel_trajectories(
         "three_key_poses": three_key_poses_trajectory,
         # New trajectory types
         "front_center_novel": front_center_novel,
+        "birds_eye": birds_eye,
         "circle_trajectory": circle_trajectory,
         "spiral_trajectory": spiral_trajectory,
         "look_around_trajectory": look_around_trajectory,
@@ -1071,6 +1072,28 @@ def front_center_novel(
     poses = per_cam_poses[0].clone()
     poses[:, :3, 3] += torch.tensor([0, 5.0, 0], device=poses.device)
     return interpolate_poses(poses, target_frames)
+
+# Creates a birds eye view of the scene
+def birds_eye(
+    dataset_type: str, per_cam_poses: dict, original_frames: int, target_frames: int, num_loops: int = 1
+) -> torch.Tensor:
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required"
+    
+    poses = per_cam_poses[0].clone()
+    
+    # Raise camera
+    poses[:, :3, 3] += torch.tensor([0, 0, 10], device=poses.device)
+    
+    # Point camera straight down
+    downward_rot = torch.tensor([
+        [1, 0, 0],
+        [0, 0, -1],
+        [0, 1, 0]
+    ], device=poses.device)
+    poses[:, :3, :3] = downward_rot
+    
+    return interpolate_poses(poses, target_frames)
+
 
 def s_curve(
     dataset_type: str,
