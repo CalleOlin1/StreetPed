@@ -1,3 +1,9 @@
+"""
+This code is used to generate a static dataset for IFix3D+.
+Because IFix3D+ does not handle dynamically moving objects, we create a dataset by only exporting the static mask.
+"""
+
+
 from typing import List, Optional
 from omegaconf import OmegaConf
 import os
@@ -20,247 +26,45 @@ from models.video_utils import render_images, save_videos, render_novel_views, e
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
-
-def apply_render_frame_limit(dataset: DrivingDataset, max_render_frames: Optional[int]) -> Optional[int]:
-    if max_render_frames is None:
-        return None
-    max_render_frames = int(max_render_frames)
-    if max_render_frames <= 0:
-        logger.warning("max_render_frames <= 0, skipping frame limiting.")
-        return None
-    max_render_frames = min(max_render_frames, dataset.num_img_timesteps)
-    max_img_idx = max_render_frames * dataset.pixel_source.num_cams
-
-    dataset.train_indices = [i for i in dataset.train_indices if i < max_img_idx]
-    dataset.train_timesteps = dataset.train_timesteps[dataset.train_timesteps < max_render_frames]
-    dataset.train_image_set.split_indices = dataset.train_indices
-
-    dataset.full_image_set.split_indices = list(range(max_img_idx))
-
-    if dataset.test_image_set is not None:
-        dataset.test_indices = [i for i in dataset.test_indices if i < max_img_idx]
-        dataset.test_timesteps = dataset.test_timesteps[dataset.test_timesteps < max_render_frames]
-        dataset.test_image_set.split_indices = dataset.test_indices
-
-    logger.info(f"Limiting rendering to first {max_render_frames} frames.")
-    return max_render_frames
-
-
 @torch.no_grad()
-def do_evaluation(
-    step: int = 0,
-    cfg: OmegaConf = None,
-    trainer: BasicTrainer = None,
-    dataset: DrivingDataset = None,
-    args: argparse.Namespace = None,
-    render_keys: Optional[List[str]] = None,
+def render_and_save_only(
+    step: int,
+    cfg: OmegaConf,
+    trainer: BasicTrainer,
+    dataset: DrivingDataset,
+    render_keys: List[str],
     post_fix: str = "",
-    log_metrics: bool = True,
-    extract_camera_poses: bool = True,  # new parameter
-    max_render_frames: Optional[int] = None,
 ):
     trainer.set_eval()
-    # New: camera pose extraction feature
-    if extract_camera_poses:
-        logger.info("Extracting camera poses...")
-        
-        # Extract poses for each dataset
-        pose_save_dir = f"{cfg.log_dir}/camera_poses{post_fix}"
-        os.makedirs(pose_save_dir, exist_ok=True)
-        
-        # Extract test set poses
-        if dataset.test_image_set is not None:
-            logger.info("Extracting poses from test set...")
-            test_poses = extract_camera_poses_from_dataset(
-                dataset=dataset.test_image_set,
-                trainer=trainer
-            )
-            test_pose_file = os.path.join(pose_save_dir, f"test_poses_{current_time}.npz")
-            save_camera_poses(test_poses, test_pose_file)
-            analyze_camera_trajectory(test_poses)
-        
-        # Extract full dataset poses
-        if cfg.render.render_full:
-            logger.info("Extracting poses from full set...")
-            full_poses = extract_camera_poses_from_dataset(
-                dataset=dataset.full_image_set,
-                trainer=trainer
-            )
-            full_pose_file = os.path.join(pose_save_dir, f"full_poses_{current_time}.npz")
-            save_camera_poses(full_poses, full_pose_file)
-            analyze_camera_trajectory(full_poses)
 
-    logger.info("Evaluating Pixels...")
-    if dataset.test_image_set is not None and cfg.render.render_test:
-        logger.info("Evaluating Test Set Pixels...")
-        render_results = render_images(
-            trainer=trainer,
-            dataset=dataset.test_image_set,
-            compute_metrics=True,
-            compute_error_map=cfg.render.vis_error,
-            extract_poses=extract_camera_poses,  # new parameter
-        )
+    os.makedirs(f"{cfg.log_dir}/videos{post_fix}", exist_ok=True)
 
-        # New: save test set pose information (if extracted during render)
-        if extract_camera_poses and "camera_poses" in render_results:
-            test_render_pose_file = os.path.join(pose_save_dir, f"test_render_poses_{current_time}.npz")
-            poses_dict = {
-                'frame_indices': render_results['frame_indices'],
-                'camera_poses': render_results['camera_poses'],
-                'camera_positions': render_results['camera_positions'],
-                'camera_rotations': render_results['camera_rotations'],
-                'camera_intrinsics': render_results['camera_intrinsics'],
-                'cam_names': render_results['cam_names'],
-                'cam_ids': render_results['cam_ids'],
-                'heights': render_results['heights'],
-                'widths': render_results['widths']
-            }
-            save_camera_poses(poses_dict, test_render_pose_file)
-  
-    logger.info("Evaluating Pixels...")
-    if dataset.test_image_set is not None and cfg.render.render_test:
-        logger.info("Evaluating Test Set Pixels...")
-        render_results = render_images(
-            trainer=trainer,
-            dataset=dataset.test_image_set,
-            compute_metrics=True,
-            compute_error_map=cfg.render.vis_error,
-        )
+    logger.info("Rendering full set...")
 
-    
-        if log_metrics:
-            eval_dict = {}
-            for k, v in render_results.items():
-                if k in [
-                    "psnr",
-                    "ssim",
-                    "lpips",
-                    "occupied_psnr",
-                    "occupied_ssim",
-                    "masked_psnr",
-                    "masked_ssim",
-                    "human_psnr",
-                    "human_ssim",
-                    "vehicle_psnr",
-                    "vehicle_ssim",
-                ]:
-                    eval_dict[f"image_metrics/test/{k}"] = v
-            if args.enable_wandb:
-                wandb.log(eval_dict)
-            test_metrics_file = (
-                f"{cfg.log_dir}/metrics{post_fix}/images_test_{current_time}.json"
-            )
-            with open(test_metrics_file, "w") as f:
-                json.dump(eval_dict, f)
-            logger.info(f"Image evaluation metrics saved to {test_metrics_file}")
+    render_results = render_images(
+        trainer=trainer,
+        dataset=dataset.full_image_set,
+        compute_metrics=False,
+        compute_error_map=False,
+    )
 
-        if args.render_video_postfix is None:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}.mp4"
-        else:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}_{args.render_video_postfix}.mp4"
-        num_test_frames = dataset.num_test_timesteps
-        vis_frame_dict = save_videos(
-            render_results,
-            video_output_pth,
-            layout=dataset.layout,
-            num_timestamps=num_test_frames,
-            keys=render_keys,
-            num_cams=dataset.pixel_source.num_cams,
-            save_seperate_video=cfg.logging.save_seperate_video,
-            fps=2,
-            verbose=True,
-            save_images=False,
-        )
-        if args.enable_wandb:
-            for k, v in vis_frame_dict.items():
-                wandb.log({"image_rendering/test/" + k: wandb.Image(v)})
-        del render_results, vis_frame_dict
-        torch.cuda.empty_cache()
+    video_path = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}.mp4"
 
-    if cfg.render.render_full:
-        logger.info("Evaluating Full Set...")
-        render_results = render_images(
-            trainer=trainer,
-            dataset=dataset.full_image_set,
-            compute_metrics=True,
-            compute_error_map=cfg.render.vis_error,
-        )
+    save_videos(
+        render_results,
+        video_path,
+        layout=dataset.layout,
+        num_timestamps=dataset.num_img_timesteps,
+        keys=render_keys,
+        num_cams=dataset.pixel_source.num_cams,
+        save_seperate_video=cfg.logging.save_seperate_video,
+        fps=cfg.render.fps,
+        save_images=True,
+        verbose=True,
+    )
 
-        if log_metrics:
-            eval_dict = {}
-            for k, v in render_results.items():
-                if k in [
-                    "psnr",
-                    "ssim",
-                    "lpips",
-                    "occupied_psnr",
-                    "occupied_ssim",
-                    "masked_psnr",
-                    "masked_ssim",
-                    "human_psnr",
-                    "human_ssim",
-                    "vehicle_psnr",
-                    "vehicle_ssim",
-                ]:
-                    eval_dict[f"image_metrics/full/{k}"] = v
-            if args.enable_wandb:
-                wandb.log(eval_dict)
-            full_metrics_file = (
-                f"{cfg.log_dir}/metrics{post_fix}/images_full_{current_time}.json"
-            )
-            with open(full_metrics_file, "w") as f:
-                json.dump(eval_dict, f)
-            logger.info(f"Image evaluation metrics saved to {full_metrics_file}")
-
-        if args.render_video_postfix is None:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}.mp4"
-        else:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}_{args.render_video_postfix}.mp4"
-        num_full_frames = max_render_frames or dataset.num_img_timesteps
-        vis_frame_dict = save_videos(
-            render_results,
-            video_output_pth,
-            layout=dataset.layout,
-            num_timestamps=num_full_frames,
-            keys=render_keys,
-            num_cams=dataset.pixel_source.num_cams,
-            save_seperate_video=cfg.logging.save_seperate_video,
-            fps=cfg.render.fps,
-            verbose=True,
-        )
-        if args.enable_wandb:
-            for k, v in vis_frame_dict.items():
-                wandb.log({"image_rendering/full/" + k: wandb.Image(v)})
-        del render_results, vis_frame_dict
-        torch.cuda.empty_cache()
-
-    render_novel_cfg = cfg.render.get("render_novel", None)
-    if render_novel_cfg is not None:
-        logger.info("Rendering novel views...")
-        render_traj = dataset.get_novel_render_traj(
-            traj_types=render_novel_cfg.traj_types,
-            target_frames=render_novel_cfg.get("frames", dataset.frame_num),
-        )
-        video_output_dir = f"{cfg.log_dir}/videos{post_fix}/novel_{step}"
-        if not os.path.exists(video_output_dir):
-            os.makedirs(video_output_dir)
-
-        for traj_type, traj in render_traj.items():
-            # Prepare rendering data
-            render_data = dataset.prepare_novel_view_render_data(traj)
-
-            # Render and save video
-            save_path = os.path.join(video_output_dir, f"{traj_type}.mp4")
-            render_novel_views(
-                trainer,
-                render_data,
-                save_path,
-                fps=render_novel_cfg.get("fps", cfg.render.fps),
-                traj_type=traj_type  # new parameter
-            )
-            logger.info(
-                f"Saved novel view video for trajectory type: {traj_type} to {save_path}"
-            )
+    del render_results
+    torch.cuda.empty_cache()
 
 
 def main(args):
@@ -302,9 +106,9 @@ def main(args):
         "gt_rgbs",
         "rgbs",
         "Background_rgbs",
-        "RigidNodes_rgbs",
-        "DeformableNodes_rgbs",
-        "SMPLNodes_rgbs",
+        # "RigidNodes_rgbs",
+        # "DeformableNodes_rgbs",
+        # "SMPLNodes_rgbs",
         # "depths",
         # "Background_depths",
         # "RigidNodes_depths",
@@ -322,9 +126,7 @@ def main(args):
     if args.save_catted_videos:
         cfg.logging.save_seperate_video = False
 
-    max_render_frames = apply_render_frame_limit(dataset, args.max_render_frames)
-
-    do_evaluation(
+    render_and_save_only(
         step=trainer.step,
         cfg=cfg,
         trainer=trainer,
@@ -332,7 +134,6 @@ def main(args):
         render_keys=render_keys,
         args=args,
         post_fix="_eval",
-        max_render_frames=max_render_frames,
     )
 
     if args.enable_viewer:
@@ -341,7 +142,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")
+    parser = argparse.ArgumentParser("Export static view scene")
     # eval
     parser.add_argument(
         "--resume_from",
@@ -361,12 +162,6 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="visualize lidar on image",
-    )
-    parser.add_argument(
-        "--max_render_frames",
-        type=int,
-        default=None,
-        help="limit rendering to the first N frames without changing dataset timesteps",
     )
 
     # viewer
