@@ -133,7 +133,6 @@ def main(args):
         trainer=trainer,
         dataset=dataset,
         render_keys=render_keys,
-        args=args,
         post_fix="_eval",
     )
 
