@@ -1082,13 +1082,13 @@ def birds_eye(
     poses = per_cam_poses[0].clone()
     
     # Raise camera
-    poses[:, :3, 3] += torch.tensor([0, 0, 10], device=poses.device)
+    poses[:, :3, 3] += torch.tensor([0, 0, 80], device=poses.device)
     
     # Point camera straight down
     downward_rot = torch.tensor([
-        [1, 0, 0],
-        [0, 0, -1],
-        [0, 1, 0]
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0]
     ], device=poses.device)
     poses[:, :3, :3] = downward_rot
     
