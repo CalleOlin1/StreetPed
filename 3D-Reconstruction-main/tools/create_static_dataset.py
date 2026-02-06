@@ -62,6 +62,7 @@ def render_and_save_only(
         save_images=True,
         verbose=True,
     )
+    print("Saved video path at:", video_path)
 
     del render_results
     torch.cuda.empty_cache()
