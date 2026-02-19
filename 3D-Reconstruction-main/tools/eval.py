@@ -59,6 +59,7 @@ def do_evaluation(
     extract_camera_poses: bool = True,  # new parameter
     max_render_frames: Optional[int] = None,
 ):
+    print("Save images is", args.save_images)
     trainer.set_eval()
     # New: camera pose extraction feature
     if extract_camera_poses:
