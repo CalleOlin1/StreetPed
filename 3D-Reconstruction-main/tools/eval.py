@@ -356,7 +356,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--render_video_postfix",
         type=str,
-        default=False,
+        default="",
         help="an optional postfix for video",
     )
     # Save images from rendered video
