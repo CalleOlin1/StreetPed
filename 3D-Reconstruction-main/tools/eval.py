@@ -363,8 +363,7 @@ if __name__ == "__main__":
     # Save images from rendered video
     parser.add_argument(
         "--save_images",
-        type=bool,
-        default=False,
+        action="store_true",
         help="Saves images in a folder at the resultant video output folder.",
     )
     parser.add_argument(
