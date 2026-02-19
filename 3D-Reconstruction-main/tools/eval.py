@@ -393,4 +393,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     print("Save images status", args.save_images)
+    print("--- Args: ---", args)
     main(args)
