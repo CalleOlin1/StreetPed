@@ -6,6 +6,8 @@ import logging
 import imageio
 import json
 
+from PIL import Image
+
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -660,7 +662,10 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     raw_output_dir = os.path.join(os.path.dirname(save_path), f"raw_{traj_type}")
     os.makedirs(raw_output_dir, exist_ok=True)
     logger.info(f"Created trajectory-specific raw output: {raw_output_dir}")
-
+    if save_images:
+        image_output_dir = os.path.join(os.path.dirname(save_path), f"images_{traj_type}")
+        os.makedirs(image_output_dir, exist_ok=True)
+        print(f"Created folder for all images at {image_output_dir}")
     
     with torch.no_grad():
         for frame_data in render_data:
@@ -702,9 +707,15 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
             # Convert to uint8 and write to video
             rgb_uint8 = (rgb * 255).astype(np.uint8)
             writer.append_data(rgb_uint8)
-    
-    writer.close()
-    print(f"video_utils.py:706 > Video saved to {save_path}")
+
+            # Save image
+            if save_images:
+                img_path = os.path.join(image_output_dir, f"frame{frame_idx:04d}.png")
+                img = Image.fromarray(rgb_uint8)
+                img.save(img_path)
+                
+        writer.close()
+        print(f"video_utils.py:706 > Video saved to {save_path}")
 
 # This is called from create static dataset
 def save_concatenated_videos(
