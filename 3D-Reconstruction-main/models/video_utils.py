@@ -654,6 +654,8 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
         traj_type (str): Trajectory type parameter
         save_images (bool): Boolean to enable saving the images in a folder at the same location as the reultant video file.
     """
+    print("render_novel_views.py:657")
+    print("Save images argument:", save_images)
     trainer.set_eval()  
     
     writer = imageio.get_writer(save_path, mode='I', fps=fps)
