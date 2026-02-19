@@ -379,7 +379,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--skip_original_render",
-        type=bool,
         action="store_true",
         help="Skips running some metrics as well as rendering the original viewpoint.",
     )
