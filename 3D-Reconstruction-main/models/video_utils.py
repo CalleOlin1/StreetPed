@@ -705,7 +705,7 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     writer.close()
     print(f"Video saved to {save_path}")
 
-
+# This is called from create static dataset
 def save_concatenated_videos(
     render_results: Dict[str, List[Tensor]],
     save_pth: str,
