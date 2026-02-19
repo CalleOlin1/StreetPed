@@ -703,7 +703,7 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
             writer.append_data(rgb_uint8)
     
     writer.close()
-    print(f"Video saved to {save_path}")
+    print(f"video_utils.py:706 > Video saved to {save_path}")
 
 # This is called from create static dataset
 def save_concatenated_videos(

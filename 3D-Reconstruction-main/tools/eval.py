@@ -256,7 +256,7 @@ def do_evaluation(
                 render_data,
                 save_path,
                 fps=render_novel_cfg.get("fps", cfg.render.fps),
-                traj_type=traj_type  # new parameter
+                traj_type=traj_type
             )
             logger.info(
                 f"Saved novel view video for trajectory type: {traj_type} to {save_path}"
@@ -350,11 +350,19 @@ if __name__ == "__main__":
         type=str,
         required=True,
     )
+    # Custom file end name
     parser.add_argument(
         "--render_video_postfix",
         type=str,
         default=False,
         help="an optional postfix for video",
+    )
+    # Save images from rendered video
+    parser.add_argument(
+        "--save_images",
+        type=bool,
+        default=False,
+        help="Saves images in a folder at the resultant video output folder.",
     )
     parser.add_argument(
         "--save_catted_videos",
