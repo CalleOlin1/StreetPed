@@ -258,7 +258,7 @@ def do_evaluation(
                 save_path,
                 fps=render_novel_cfg.get("fps", cfg.render.fps),
                 traj_type=traj_type,
-                save_images=cfg.save_images
+                save_images=args.save_images
             )
             logger.info(
                 f"Saved novel view video for trajectory type: {traj_type} to {save_path}"
