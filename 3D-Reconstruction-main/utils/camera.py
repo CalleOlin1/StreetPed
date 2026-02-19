@@ -1070,7 +1070,7 @@ def front_center_novel(
     assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required for front_center_interp"
     # key_poses = per_cam_poses[0][::original_frames//4]  # Select every 4th frame as key frame
     poses = per_cam_poses[0].clone()
-    poses[:, :3, 3] += torch.tensor([0, 5.0, 0], device=poses.device)
+    poses[:, :3, 3] += torch.tensor([0, 0.5, 0], device=poses.device)
     return interpolate_poses(poses, target_frames)
 
 # Creates a birds eye view of the scene
