@@ -270,6 +270,7 @@ def main(args):
     log_dir = os.path.dirname(args.resume_from)
     cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
+    
     args.enable_wandb = False
     for folder in ["videos_eval", "metrics_eval"]:
         os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
@@ -315,6 +316,7 @@ def main(args):
         # "SMPLNodes_depths",
         # "mask"
     ]
+    # Override config values
     if cfg.render.vis_lidar:
         render_keys.insert(0, "lidar_on_images")
     if cfg.render.vis_sky:
@@ -324,6 +326,9 @@ def main(args):
 
     if args.save_catted_videos:
         cfg.logging.save_seperate_video = False
+    if args.skip_original_render:
+        print("Skipping rendering and evaluation")
+        cfg.render.render_full = False
 
     max_render_frames = apply_render_frame_limit(dataset, args.max_render_frames)
 
@@ -371,6 +376,12 @@ if __name__ == "__main__":
         type=bool,
         default=False,
         help="visualize lidar on image",
+    )
+    parser.add_argument(
+        "--skip_original_render",
+        type=bool,
+        action="store_true",
+        help="Skips running some metrics as well as rendering the original viewpoint.",
     )
     parser.add_argument(
         "--max_render_frames",
