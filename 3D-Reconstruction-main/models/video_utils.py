@@ -644,12 +644,13 @@ def save_videos(
     return return_frame
 
 
-def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30, traj_type: str = None) -> None:
+def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30, traj_type: str = None, save_images: bool = False) -> None:
     """
     Perform rendering and save the result as a video.
     
     Args:
         traj_type (str): Trajectory type parameter
+        save_images (bool): Boolean to enable saving the images in a folder at the same location as the reultant video file.
     """
     trainer.set_eval()  
     

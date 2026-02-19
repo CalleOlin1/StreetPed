@@ -251,6 +251,7 @@ def do_evaluation(
 
             # Render and save video
             save_path = os.path.join(video_output_dir, f"{traj_type}.mp4")
+            print("eval.py > Started rendering novel view")
             render_novel_views(
                 trainer,
                 render_data,
