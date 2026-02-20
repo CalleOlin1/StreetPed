@@ -119,13 +119,13 @@ def setup(args):
     return cfg
 
 
-def build_dataset_and_trainer(args):
-    cfg = setup(args)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def build_dataset(data):
     # build dataset
-    dataset = DrivingDataset(data_cfg=cfg.data)
+    dataset = DrivingDataset(data)
+    return dataset
 
+def build_trainer(dataset, cfg):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # setup trainer
     trainer = import_str(cfg.trainer.type)(
         **cfg.trainer,
@@ -228,13 +228,22 @@ def run_evaluation(cfg, dataset, trainer, render_keys, step, args):
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 def main(args):
-    cfg, dataset, trainer = build_dataset_and_trainer(args)
+    cfg = setup(args)
+    # Initialize configuration (OmegaConf object), dataset (DrivingDataset), and trainer (Trainer instance)
+    dataset = build_dataset(cfg.data)
+    trainer = build_trainer(dataset, cfg)
+    # Prepare the list of keys (list of str) that will be rendered/visualized during training
     render_keys = setup_render_keys(cfg, dataset)
+    # Run the main training loop: forward/backward passes, logging, saving, and optional visualization
+    # Returns the last training step (int)
     step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+    # Perform final evaluation (no return value) and optionally start the viewer for inspection
     run_evaluation(cfg, dataset, trainer, render_keys, step, args)
+    # Return the last training step (int)
     return step
-
+# ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")
     parser.add_argument("--config_file", help="path to config file", type=str)

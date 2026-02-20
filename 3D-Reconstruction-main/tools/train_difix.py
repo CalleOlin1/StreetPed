@@ -44,16 +44,19 @@ def load_dataset(dataset_path: str):
     pass
 
 def train(dataset, all_synthetic_data: list = None):
-    args = make_args(
-        dataset_path=dataset_path,
-        enable_wandb=False,
-    )
+    args = make_args(dataset_path=dataset_path)
+    cfg = train.setup(args)
+
+
     step = train.main(args)
 
 def render_novel(model, curr_offset):
     pass
 
 def get_fine_dynamic_masks(novel_frames, reference_images = None):
+    pass
+
+def apply_difix(unprocessed_novel_rgbs):
     pass
 
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -77,7 +80,7 @@ def iterative_training(dataset_path: str, checkpoint_path: str, num_iterations: 
         curr_synthetic_data["processed_novel_rgbs"] = apply_difix(unprocessed_novel_rbgs)
 
         print(f"--- Applying fine dynamic masks for frames in novel view ---")
-        fine_dynamic_masks = get_fine_dynamic_masks(novel_frames, reference_images = )
+        fine_dynamic_masks = get_fine_dynamic_masks(unprocessed_novel_rbgs, reference_images = )
 
         print(f"--- Saving data and preparing for next iteration ---")
         all_synthetic_data.append(curr_synthetic_data)
