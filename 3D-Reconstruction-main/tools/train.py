@@ -119,7 +119,7 @@ def setup(args):
     return cfg
 
 
-def main(args):
+def build_dataset_and_trainer(args):
     cfg = setup(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -138,128 +138,49 @@ def main(args):
         device=device,
     )
 
-    # NOTE: If resume, gaussians will be loaded from checkpoint
-    #       If not, gaussians will be initialized from dataset
+    # initialize gaussians
     if args.resume_from is not None:
         trainer.resume_from_checkpoint(ckpt_path=args.resume_from, load_only_model=True)
-        logger.info(
-            f"Resuming training from {args.resume_from}, starting at step {trainer.step}"
-        )
+        logger.info(f"Resuming training from {args.resume_from}, starting at step {trainer.step}")
     else:
         trainer.init_gaussians_from_dataset(dataset=dataset)
-        logger.info(
-            f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}"
-        )
+        logger.info(f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}")
 
     if args.enable_viewer:
-        # a simple viewer for background visualization
         trainer.init_viewer(port=args.viewer_port)
 
-    # define render keys
+    trainer.initialize_optimizer()
+    return cfg, dataset, trainer
+
+def setup_render_keys(cfg, dataset):
     render_keys = [
-        "gt_rgbs",
-        "rgbs",
-        "Background_rgbs",
-        "Dynamic_rgbs",
-        "RigidNodes_rgbs",
-        "DeformableNodes_rgbs",
-        "SMPLNodes_rgbs",
-        # "depths",
-        # "Background_depths",
-        # "Dynamic_depths",
-        # "RigidNodes_depths",
-        # "DeformableNodes_depths",
-        # "SMPLNodes_depths",
-        # "mask"
+        "gt_rgbs", "rgbs", "Background_rgbs", "Dynamic_rgbs",
+        "RigidNodes_rgbs", "DeformableNodes_rgbs", "SMPLNodes_rgbs"
     ]
     if cfg.render.vis_lidar:
         render_keys.insert(0, "lidar_on_images")
     if cfg.render.vis_sky:
         render_keys += ["rgb_sky_blend", "rgb_sky"]
     if cfg.render.vis_error:
-        render_keys.insert(render_keys.index("rgbs") + 1, "rgb_error_maps")
+        render_keys.insert(render_keys.index("rgbs")+1, "rgb_error_maps")
+    return render_keys
 
-    # setup optimizer
-    trainer.initialize_optimizer()
-
-    # setup metric logger
+def run_training_loop(cfg, dataset, trainer, render_keys, args):
     metrics_file = os.path.join(cfg.log_dir, "metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     all_iters = np.arange(trainer.step, trainer.num_iters + 1)
 
-    # DEBUG USE
-    # do_evaluation(
-    #     step=0,
-    #     cfg=cfg,
-    #     trainer=trainer,
-    #     dataset=dataset,
-    #     render_keys=render_keys,
-    #     args=args,
-    # )
-
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
-        # ----------------------------------------------------------------------------
-        # ----------------------------     Validate     ------------------------------
+        # visualization
         if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
-            logger.info("Visualizing...")
-            vis_timestep = np.linspace(
-                0,
-                dataset.num_img_timesteps,
-                trainer.num_iters // cfg.logging.vis_freq + 1,
-                endpoint=False,
-                dtype=int,
-            )[step // cfg.logging.vis_freq]
-            with torch.no_grad():
-                render_results = render_images(
-                    trainer=trainer,
-                    dataset=dataset.full_image_set,
-                    compute_metrics=True,
-                    compute_error_map=cfg.render.vis_error,
-                    vis_indices=[
-                        vis_timestep * dataset.pixel_source.num_cams + i
-                        for i in range(dataset.pixel_source.num_cams)
-                    ],
-                )
-            if args.enable_wandb:
-                wandb.log(
-                    {
-                        "image_metrics/psnr": render_results["psnr"],
-                        "image_metrics/ssim": render_results["ssim"],
-                        "image_metrics/occupied_psnr": render_results["occupied_psnr"],
-                        "image_metrics/occupied_ssim": render_results["occupied_ssim"],
-                    }
-                )
-            vis_frame_dict = save_videos(
-                render_results,
-                save_pth=os.path.join(
-                    cfg.log_dir, "images", f"step_{step}.png"
-                ),  # don't save the video
-                layout=dataset.layout,
-                num_timestamps=1,
-                keys=render_keys,
-                save_seperate_video=cfg.logging.save_seperate_video,
-                num_cams=dataset.pixel_source.num_cams,
-                fps=cfg.render.fps,
-                verbose=False,
-            )
-            if args.enable_wandb:
-                for k, v in vis_frame_dict.items():
-                    wandb.log({"image_rendering/" + k: wandb.Image(v)})
-            del render_results
-            torch.cuda.empty_cache()
+            visualize_step(cfg, dataset, trainer, render_keys, step, args)
 
-        # ----------------------------------------------------------------------------
-        # ----------------------------  training step  -------------------------------
-        # prepare for training
+        # training step
         trainer.set_train()
         trainer.preprocess_per_train_step(step=step)
-        trainer.optimizer_zero_grad()  # zero grad
-
-        # get data
+        trainer.optimizer_zero_grad()
         train_step_camera_downscale = trainer._get_downscale_factor()
-        image_infos, cam_infos = dataset.train_image_set.next(
-            train_step_camera_downscale
-        )
+        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
@@ -267,114 +188,52 @@ def main(args):
             if isinstance(v, torch.Tensor):
                 cam_infos[k] = v.cuda(non_blocking=True)
 
-        # forward & backward
         outputs = trainer(image_infos, cam_infos)
         trainer.update_visibility_filter()
-        loss_dict = trainer.compute_losses(
-            outputs=outputs,
-            image_infos=image_infos,
-            cam_infos=cam_infos,
-        )
-        # check nan or inf
-        for k, v in loss_dict.items():
-            if torch.isnan(v).any():
-                raise ValueError(f"NaN detected in loss {k} at step {step}")
-            if torch.isinf(v).any():
-                raise ValueError(f"Inf detected in loss {k} at step {step}")
-        trainer.backward(loss_dict)
+        loss_dict = trainer.compute_losses(outputs, image_infos, cam_infos)
 
-        # after training step
+        # check for NaNs/Infs
+        for k, v in loss_dict.items():
+            if torch.isnan(v).any() or torch.isinf(v).any():
+                raise ValueError(f"Invalid value in loss {k} at step {step}")
+
+        trainer.backward(loss_dict)
         trainer.postprocess_per_train_step(step=step)
 
-        # ----------------------------------------------------------------------------
-        # -------------------------------  logging  ----------------------------------
+        # logging
         with torch.no_grad():
-            # cal stats
-            metric_dict = trainer.compute_metrics(
-                outputs=outputs,
-                image_infos=image_infos,
-            )
-        metric_logger.update(
-            **{"train_metrics/" + k: v.item() for k, v in metric_dict.items()}
-        )
-        metric_logger.update(
-            **{
-                "train_stats/gaussian_num_" + k: v
-                for k, v in trainer.get_gaussian_count().items()
-            }
-        )
-        metric_logger.update(**{"losses/" + k: v.item() for k, v in loss_dict.items()})
-        metric_logger.update(
-            **{
-                "train_stats/lr_" + group["name"]: group["lr"]
-                for group in trainer.optimizer.param_groups
-            }
-        )
+            metric_dict = trainer.compute_metrics(outputs, image_infos)
+        metric_logger.update(**{"train_metrics/"+k: v.item() for k,v in metric_dict.items()})
+        metric_logger.update(**{"train_stats/gaussian_num_"+k:v for k,v in trainer.get_gaussian_count().items()})
+        metric_logger.update(**{"losses/"+k:v.item() for k,v in loss_dict.items()})
+        metric_logger.update(**{"train_stats/lr_"+group["name"]:group["lr"] for group in trainer.optimizer.param_groups})
+
         if args.enable_wandb:
-            wandb.log({k: v.avg for k, v in metric_logger.meters.items()})
+            wandb.log({k:v.avg for k,v in metric_logger.meters.items()})
 
-        # ----------------------------------------------------------------------------
-        # ----------------------------     Saving     --------------------------------
-        do_save = (
-            step > 0
-            and ((step % cfg.logging.saveckpt_freq == 0) or (step == trainer.num_iters))
-            and (args.resume_from is None)
-        )
+        # saving
+        do_save = step>0 and ((step%cfg.logging.saveckpt_freq==0) or step==trainer.num_iters) and args.resume_from is None
         if do_save:
-            trainer.save_checkpoint(
-                log_dir=cfg.log_dir,
-                save_only_model=True,
-                is_final=step == trainer.num_iters,
-            )
+            trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
 
-        # ----------------------------------------------------------------------------
-        # ------------------------    Cache Image Error    ---------------------------
-        if (
-            step > 0
-            and trainer.optim_general.cache_buffer_freq > 0
-            and step % trainer.optim_general.cache_buffer_freq == 0
-        ):
-            logger.info("Caching image error...")
-            trainer.set_eval()
-            with torch.no_grad():
-                dataset.pixel_source.update_downscale_factor(
-                    1 / dataset.pixel_source.buffer_downscale
-                )
-                render_results = render_images(
-                    trainer=trainer,
-                    dataset=dataset.full_image_set,
-                )
-                dataset.pixel_source.reset_downscale_factor()
-                dataset.pixel_source.update_image_error_maps(render_results)
+        # cache image errors
+        if step>0 and trainer.optim_general.cache_buffer_freq>0 and step%trainer.optim_general.cache_buffer_freq==0:
+            cache_image_errors(cfg, dataset, trainer, step)
 
-                # save error maps
-                merged_error_video = dataset.pixel_source.get_image_error_video(
-                    dataset.layout
-                )
-                imageio.mimsave(
-                    os.path.join(cfg.log_dir, "buffer_maps", f"buffer_maps_{step}.mp4"),
-                    merged_error_video,
-                    fps=cfg.render.fps,
-                )
-            logger.info("Done caching rgb error maps")
+    return step
 
-    logger.info("Training done!")
-
-    do_evaluation(
-        step=step,
-        cfg=cfg,
-        trainer=trainer,
-        dataset=dataset,
-        render_keys=render_keys,
-        args=args,
-    )
-
+def run_evaluation(cfg, dataset, trainer, render_keys, step, args):
+    do_evaluation(step=step, cfg=cfg, trainer=trainer, dataset=dataset, render_keys=render_keys, args=args)
     if args.enable_viewer:
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 
+def main(args):
+    cfg, dataset, trainer = build_dataset_and_trainer(args)
+    render_keys = setup_render_keys(cfg, dataset)
+    step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+    run_evaluation(cfg, dataset, trainer, render_keys, step, args)
     return step
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Train Gaussian Splatting for a single scene")
