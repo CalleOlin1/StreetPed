@@ -9,7 +9,7 @@ import logging
 import argparse
 
 import torch
-from tools.eval import do_evaluation
+from tools.eval import do_evaluation, apply_render_frame_limit
 from utils.misc import import_str
 from utils.backup import backup_project
 from utils.logging import MetricLogger, setup_logging
@@ -17,10 +17,29 @@ from models.video_utils import render_images, save_videos
 from datasets.driving_dataset import DrivingDataset
 from datasets.base.pixel_source import get_rays
 from tools.difix_sender_receiver import difix_repair
+from PIL import Image
 
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
+def tensor_to_image(tensor):
+    # Ensure HWC format
+    if tensor.ndim == 3 and tensor.shape[0] == 3:  # CHW
+        tensor = tensor.permute(1, 2, 0)
+    img = tensor.numpy()
+    # Clamp values to [0, 1] and scale to [0, 255]
+    img = np.clip(img, 0, 1) * 255
+    img = img.astype(np.uint8)
+    return Image.fromarray(img)
+
+def image_to_tensor(img: Image.Image, normalize: bool = True) -> torch.Tensor:
+    img_np = np.array(img)  # H x W x C, uint8
+    if normalize:
+        img_np = img_np.astype(np.float32) / 255.0
+    else:
+        img_np = img_np.astype(np.float32)
+    tensor = torch.from_numpy(img_np).permute(2, 0, 1)
+    return tensor
 
 def set_seeds(seed=31):
     """
@@ -304,8 +323,23 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
 
     return step
 
-def run_evaluation(cfg, dataset, trainer, render_keys, step, args):
-    do_evaluation(step=step, cfg=cfg, trainer=trainer, dataset=dataset, render_keys=render_keys, args=args)
+def run_evaluation(cfg, dataset, trainer, render_keys, step, args, max_render_frames=None):
+    if max_render_frames is not None:
+        for cam_id in dataset.pixel_source.camera_list:
+            cam = dataset.pixel_source.camera_data[cam_id]
+            cam.cam_to_worlds = cam.cam_to_worlds[:max_render_frames]
+
+        max_render_frames = apply_render_frame_limit(dataset, max_render_frames)
+
+    do_evaluation(
+        step=step,
+        cfg=cfg,
+        trainer=trainer,
+        dataset=dataset,
+        render_keys=render_keys,
+        args=args,
+        max_render_frames=max_render_frames,
+    )
     if args.enable_viewer:
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
@@ -441,6 +475,7 @@ def main(args):
     cfg = setup(args)
     # Initialize configuration (OmegaConf object), dataset (DrivingDataset), and trainer (Trainer instance)
     dataset = build_dataset(cfg.data)
+    original_num_img_timesteps = dataset.num_img_timesteps
     trainer = build_trainer(dataset, cfg, args)
     # Prepare the list of keys (list of strings) that will be rendered/visualized during training
     render_keys = setup_render_keys(cfg, dataset)
@@ -450,7 +485,9 @@ def main(args):
 
     lateral_offset_m = 0.5
     num_iterations_refine = 1000
+    synthetic_images = 50
 
+    # for _ in range(synthetic_images):
     novel_sample = render_single_offset_novel_view(
         dataset=dataset,
         trainer=trainer,
@@ -458,7 +495,11 @@ def main(args):
     )
     novel_rgb = novel_sample["rendered_rgb"]
     reference_rgb = novel_sample["reference_rgb"]
-    novel_sample["rendered_rgb"] = difix_repair(novel_rgb, reference_rgb)
+    print(f"Novel RGB shape: {novel_rgb.shape}, Reference RGB shape: {reference_rgb.shape}")
+    repaired_image = difix_repair(tensor_to_image(novel_rgb), tensor_to_image(reference_rgb))
+    repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0) # H, W, C
+    novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
+    print(f"Repaired image shape: {novel_sample['rendered_rgb'].shape}")
 
     append_novel_sample_to_training_dataset(dataset, novel_sample)
 
@@ -472,7 +513,15 @@ def main(args):
     step = run_training_loop(cfg, dataset, trainer, render_keys, args)
 
     # Perform final evaluation (no return value) and optionally start the viewer for inspection
-    run_evaluation(cfg, dataset, trainer, render_keys, step, args)
+    run_evaluation(
+        cfg,
+        dataset,
+        trainer,
+        render_keys,
+        step,
+        args,
+        max_render_frames=original_num_img_timesteps,
+    )
     # Return the last training step (int)
     return step
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
