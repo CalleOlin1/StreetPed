@@ -91,6 +91,7 @@ def setup(args):
         "configs_bk",
         "buffer_maps",
         "backup",
+        "synthetic_image_samples"
     ]:
         os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
 
@@ -346,6 +347,7 @@ def run_evaluation(cfg, dataset, trainer, render_keys, step, args, max_render_fr
 
 
 def render_single_offset_novel_view(dataset, trainer, lateral_offset_m: float):
+    # This code should shift the camera left by lateral_offset_m meters.
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
 
@@ -353,7 +355,7 @@ def render_single_offset_novel_view(dataset, trainer, lateral_offset_m: float):
     ref_image_infos, ref_cam_infos = cam0.get_image(reference_frame_idx)
 
     ref_c2w = cam0.cam_to_worlds[reference_frame_idx].clone()
-    lateral_axis = ref_c2w[:3, 1]
+    lateral_axis = ref_c2w[:3, 0]
     lateral_axis = lateral_axis / (torch.linalg.norm(lateral_axis) + 1e-8)
     novel_c2w = ref_c2w.clone()
     novel_c2w[:3, 3] = ref_c2w[:3, 3] + lateral_offset_m * lateral_axis
@@ -483,34 +485,41 @@ def main(args):
     # Returns the last training step (int)
     step = run_training_loop(cfg, dataset, trainer, render_keys, args)
 
-    lateral_offset_m = 0.5
-    num_iterations_refine = 1000
-    synthetic_images = 50
+    lateral_offset_m = 5
+    lateral_offset_max = 7 # We will iterate towards this value
+    num_iterations_refine = 750
+    synthetic_images = 100
+    lateral_offset_incremenet = (lateral_offset_max - lateral_offset_m) / max(synthetic_images - 1, 1)
 
-    # for _ in range(synthetic_images):
-    novel_sample = render_single_offset_novel_view(
-        dataset=dataset,
-        trainer=trainer,
-        lateral_offset_m=lateral_offset_m,
-    )
-    novel_rgb = novel_sample["rendered_rgb"]
-    reference_rgb = novel_sample["reference_rgb"]
-    print(f"Novel RGB shape: {novel_rgb.shape}, Reference RGB shape: {reference_rgb.shape}")
-    repaired_image = difix_repair(tensor_to_image(novel_rgb), tensor_to_image(reference_rgb))
-    repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0) # H, W, C
-    novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
-    print(f"Repaired image shape: {novel_sample['rendered_rgb'].shape}")
+    for _ in range(synthetic_images):
+        novel_sample = render_single_offset_novel_view(
+            dataset=dataset,
+            trainer=trainer,
+            lateral_offset_m=-lateral_offset_m,
+        )
+        novel_rgb = novel_sample["rendered_rgb"]
+        reference_rgb = novel_sample["reference_rgb"]
+        print(f"Novel RGB shape: {novel_rgb.shape}, Reference RGB shape: {reference_rgb.shape}")
+        repaired_image = difix_repair(tensor_to_image(novel_rgb), tensor_to_image(reference_rgb))
+        if step % 500 == 0:
+            # Save repaied image for inspection
+            repaired_image.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"repaired_{step}.png"))
 
-    append_novel_sample_to_training_dataset(dataset, novel_sample)
+        repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0) # H, W, C
+        novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
+        print(f"Repaired image shape: {novel_sample['rendered_rgb'].shape}")
 
-    trainer.num_train_images = len(dataset.train_image_set)
-    trainer.step = step + 1
-    trainer.num_iters = step + num_iterations_refine
-    logger.info(
-        f"Starting refinement training with updated dataset for {num_iterations_refine} iterations "
-        f"(from step {trainer.step} to {trainer.num_iters})"
-    )
-    step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+        append_novel_sample_to_training_dataset(dataset, novel_sample)
+
+        trainer.num_train_images = len(dataset.train_image_set)
+        trainer.step = step + 1
+        trainer.num_iters = step + num_iterations_refine
+        logger.info(
+            f"Starting refinement training with updated dataset for {num_iterations_refine} iterations "
+            f"(from step {trainer.step} to {trainer.num_iters})"
+        )
+        step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+        lateral_offset_m += lateral_offset_incremenet
 
     # Perform final evaluation (no return value) and optionally start the viewer for inspection
     run_evaluation(

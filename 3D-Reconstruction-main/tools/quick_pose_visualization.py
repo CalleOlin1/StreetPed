@@ -1,12 +1,13 @@
+
 #!/usr/bin/env python3
 """
-快速相机pose查看器
-简单快速地可视化相机轨迹
+Quick camera pose viewer
+Visualize camera trajectories easily and quickly
 
-使用方法:
+How to use:
 python quick_pose_viewer.py pose_file.npz
-python quick_pose_viewer.py pose_file.npz --show  # 直接显示图片
-python quick_pose_viewer.py pose_file.npz --output result.png  # 指定输出
+python quick_pose_viewer.py pose_file.npz --show # Display the picture directly
+python quick_pose_viewer.py pose_file.npz --output result.png #Specify output
 """
 
 import sys
@@ -19,7 +20,7 @@ import json
 
 
 def load_poses(npz_path):
-    """快速加载pose数据"""
+    """Quickly load pose data"""
     print(f"Loading: {npz_path}")
     data = np.load(npz_path, allow_pickle=True)
     
@@ -32,7 +33,7 @@ def load_poses(npz_path):
 
 
 def quick_stats(poses_dict):
-    """快速统计信息"""
+    """Quick statistics"""
     positions = np.array(poses_dict['camera_positions'])
     
     print("\n=== QUICK STATS ===")
@@ -53,22 +54,22 @@ def quick_stats(poses_dict):
 
 
 def quick_plot(poses_dict, output_path=None, show=False):
-    """快速绘制轨迹"""
+    """Quickly draw trajectories"""
     print("\nGenerating plots...")
     
     positions = np.array(poses_dict['camera_positions'])
     cam_names = poses_dict['cam_names']
     frame_indices = poses_dict['frame_indices']
     
-    # 创建颜色映射
+    # Create a color map
     unique_cameras = list(set(cam_names))
     colors = plt.cm.tab10(np.linspace(0, 1, len(unique_cameras)))
     camera_colors = {cam: colors[i] for i, cam in enumerate(unique_cameras)}
     
-    # 创建2x2子图
+    # Create a 2x2 subplot
     fig = plt.figure(figsize=(14, 10))
     
-    # 1. 3D轨迹
+    # 1. 3D trajectory
     ax1 = fig.add_subplot(221, projection='3d')
     for cam_name in unique_cameras:
         mask = np.array(cam_names) == cam_name
@@ -89,8 +90,24 @@ def quick_plot(poses_dict, output_path=None, show=False):
     ax1.set_title('3D Trajectory')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
+
+    # 3D等比例坐标轴
+    x = positions[:, 0]
+    y = positions[:, 1]
+    z = positions[:, 2]
+    x_mid = (x.max() + x.min()) / 2.0
+    y_mid = (y.max() + y.min()) / 2.0
+    z_mid = (z.max() + z.min()) / 2.0
+    max_range = max(x.max() - x.min(), y.max() - y.min(), z.max() - z.min())
+    if max_range == 0:
+        max_range = 1.0
+
+    ax1.set_xlim(x_mid - max_range / 2.0, x_mid + max_range / 2.0)
+    ax1.set_ylim(y_mid - max_range / 2.0, y_mid + max_range / 2.0)
+    ax1.set_zlim(z_mid - max_range / 2.0, z_mid + max_range / 2.0)
+    ax1.set_box_aspect((1, 1, 1))
     
-    # 2. XY平面
+    # 2. XY plane
     ax2 = fig.add_subplot(222)
     for cam_name in unique_cameras:
         mask = np.array(cam_names) == cam_name
@@ -108,9 +125,9 @@ def quick_plot(poses_dict, output_path=None, show=False):
     ax2.set_title('XY View (Top Down)')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    ax2.axis('equal')
+    ax2.set_aspect('equal', adjustable='box')
     
-    # 3. Z高度变化
+    # 3. Z height change
     ax3 = fig.add_subplot(223)
     for cam_name in unique_cameras:
         mask = np.array(cam_names) == cam_name
@@ -127,7 +144,7 @@ def quick_plot(poses_dict, output_path=None, show=False):
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     
-    # 4. 移动速度
+    # 4. Movement speed
     ax4 = fig.add_subplot(224)
     if len(positions) > 1:
         distances = np.linalg.norm(np.diff(positions, axis=0), axis=1)
@@ -144,14 +161,14 @@ def quick_plot(poses_dict, output_path=None, show=False):
         ax4.legend()
         ax4.grid(True, alpha=0.3)
     
-    # 添加总标题
+    # Add general title
     plt.suptitle(f'Camera Trajectory Analysis\n'
                 f'{len(positions)} frames, {len(unique_cameras)} cameras', 
                 fontsize=14, fontweight='bold')
     
     plt.tight_layout()
     
-    # 保存或显示
+    # save or show
     if output_path:
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         print(f"Plot saved to: {output_path}")
@@ -163,7 +180,7 @@ def quick_plot(poses_dict, output_path=None, show=False):
 
 
 def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
-    """每N帧保存一次相机pose到txt文件"""
+    """Save camera pose to txt file every n frames"""
     from scipy.spatial.transform import Rotation as R
     
     output_dir = Path(output_dir)
@@ -177,7 +194,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
     
     print(f"\n=== SAVING POSES EVERY {interval} FRAMES ===")
     
-    # 创建主要的pose文件
+    # Create the main pose file
     pose_txt_path = output_dir / f"camera_poses_every_{interval}_frames.txt"
     
     with open(pose_txt_path, 'w') as f:
@@ -188,7 +205,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
         f.write(f"Saving interval: {interval} frames\n")
         f.write(f"Total saved frames: {len(range(0, len(frame_indices), interval))}\n\n")
         
-        # 写入格式说明
+        # Write format description
         f.write("FORMAT EXPLANATION:\n")
         f.write("-" * 40 + "\n")
         f.write("Frame Index: Original frame number\n")
@@ -206,7 +223,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
             rot = rotations[i]
             pose_4x4 = poses[i]
             
-            # 计算欧拉角
+            # Calculate Euler angles
             euler_angles = R.from_matrix(rot).as_euler('xyz', degrees=True)
             
             f.write(f"FRAME {saved_count + 1:03d} (Original Frame {frame_idx})\n")
@@ -215,12 +232,12 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
             f.write(f"Position: [{pos[0]:10.6f}, {pos[1]:10.6f}, {pos[2]:10.6f}] m\n")
             f.write(f"Rotation (Euler XYZ): [{euler_angles[0]:8.3f}, {euler_angles[1]:8.3f}, {euler_angles[2]:8.3f}] degrees\n")
             
-            # 写入4x4变换矩阵
+            # Write a 4x4 transformation matrix
             f.write("4x4 Transformation Matrix (Camera-to-World):\n")
             for row in pose_4x4:
                 f.write("  [" + ", ".join(f"{val:12.6f}" for val in row) + "]\n")
             
-            # 写入3x3旋转矩阵
+            # Write a 3x3 rotation matrix
             f.write("3x3 Rotation Matrix:\n")
             for row in rot:
                 f.write("  [" + ", ".join(f"{val:12.6f}" for val in row) + "]\n")
@@ -230,7 +247,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
     
     print(f"Detailed poses saved to: {pose_txt_path}")
     
-    # 创建简化的pose文件（仅位置和欧拉角）
+    # Create a simplified pose file (only positions and Euler angles)
     simple_txt_path = output_dir / f"simple_poses_every_{interval}_frames.txt"
     
     with open(simple_txt_path, 'w') as f:
@@ -245,7 +262,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
             pos = positions[i]
             rot = rotations[i]
             
-            # 计算欧拉角
+            # Calculate Euler angles
             euler_angles = R.from_matrix(rot).as_euler('xyz', degrees=True)
             
             f.write(f"{frame_idx:5d} {cam_name:12s} {pos[0]:10.6f} {pos[1]:10.6f} {pos[2]:10.6f} ")
@@ -253,7 +270,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
     
     print(f"Simple poses saved to: {simple_txt_path}")
     
-    # 创建COLMAP格式的文件（每N帧）
+    # Create files in colmap format (every n frames)
     colmap_txt_path = output_dir / f"colmap_images_every_{interval}_frames.txt"
     
     with open(colmap_txt_path, 'w') as f:
@@ -269,24 +286,24 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
             pos = positions[i]
             rot = rotations[i]
             
-            # 转换为world-to-camera (COLMAP格式)
+            # Convert to world-to-camera (COLMAP format)
             w2c_rot = rot.T
             w2c_pos = -w2c_rot @ pos
             
-            # 转换为四元数 [w, x, y, z]
+            # Convert to quaternion [w, x, y, z]
             quat = R.from_matrix(w2c_rot).as_quat()  # [x, y, z, w]
             qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
             
             f.write(f"{image_id} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} ")
             f.write(f"{w2c_pos[0]:.6f} {w2c_pos[1]:.6f} {w2c_pos[2]:.6f} ")
             f.write(f"1 {cam_name}_frame_{frame_idx:04d}.jpg\n")
-            f.write("\n")  # 空行表示没有2D点
+            f.write("\n")  # Blank lines indicate no 2D points
             
             image_id += 1
     
     print(f"COLMAP format saved to: {colmap_txt_path}")
     
-    # 创建TUM格式的文件（每N帧）
+    # Create files in tum format (every n frames)
     tum_txt_path = output_dir / f"tum_trajectory_every_{interval}_frames.txt"
     
     with open(tum_txt_path, 'w') as f:
@@ -299,7 +316,7 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
             pos = positions[i]
             rot = rotations[i]
             
-            # 转换为四元数 [x, y, z, w]
+            # Convert to quaternion [x, y, z, w]
             quat = R.from_matrix(rot).as_quat()
             timestamp = float(frame_idx)
             
@@ -313,13 +330,13 @@ def save_poses_every_n_frames(poses_dict, output_dir, interval=10):
 
 
 def export_summary(poses_dict, output_dir):
-    """导出简单的汇总信息"""
+    """Export simple summary information"""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
     
     positions = np.array(poses_dict['camera_positions'])
     
-    # 导出CSV
+    # export csv
     csv_path = output_dir / "trajectory.csv"
     with open(csv_path, 'w') as f:
         f.write("frame_idx,cam_name,x,y,z\n")
@@ -332,7 +349,7 @@ def export_summary(poses_dict, output_dir):
     
     print(f"CSV exported to: {csv_path}")
     
-    # 导出统计JSON
+    # Export statistics json
     stats = {
         "total_frames": len(poses_dict['frame_indices']),
         "cameras": list(set(poses_dict['cam_names'])),
@@ -361,7 +378,7 @@ def export_summary(poses_dict, output_dir):
 
 
 def print_coordinate_list(poses_dict, num_frames=10):
-    """打印前几帧的坐标"""
+    """Print the coordinates of the first few frames"""
     positions = np.array(poses_dict['camera_positions'])
     frame_indices = poses_dict['frame_indices']
     cam_names = poses_dict['cam_names']
@@ -393,33 +410,33 @@ def main():
     
     args = parser.parse_args()
     
-    # 检查文件存在
+    # Check file exists
     if not Path(args.npz_file).exists():
         print(f"Error: File {args.npz_file} not found!")
         sys.exit(1)
     
     try:
-        # 加载数据
+        # Load data
         poses_dict = load_poses(args.npz_file)
         
-        # 打印统计信息
+        # Print statistics
         quick_stats(poses_dict)
         
-        # 打印坐标列表
+        # Print coordinate list
         if args.list > 0:
             print_coordinate_list(poses_dict, args.list)
         
-        # 保存pose文件
+        # Save pose file
         if args.save_poses:
             save_poses_every_n_frames(poses_dict, args.save_poses, args.pose_interval)
         
-        # 如果只要统计信息，就结束
+        # If you only want statistics, it’s over
         if args.stats_only:
             return
         
-        # 生成图片
+        # Generate pictures
         if not args.show and not args.output:
-            # 自动生成输出文件名
+            # Automatically generate output file names
             input_path = Path(args.npz_file)
             output_path = input_path.parent / f"{input_path.stem}_quick_view.png"
         else:
@@ -427,7 +444,7 @@ def main():
         
         quick_plot(poses_dict, output_path, args.show)
         
-        # 导出数据
+        # Export data
         if args.export:
             export_summary(poses_dict, args.export)
         
