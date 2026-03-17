@@ -569,6 +569,81 @@ def _print_camera_comparison(
     pprint(summary, sort_dicts=False)
 
 
+def _print_cross_run_camera_comparison(
+    poses_a: np.ndarray,
+    poses_b_aligned: np.ndarray,
+    positions_a: np.ndarray,
+    positions_b_aligned: np.ndarray,
+    frame_indices_a: np.ndarray,
+    frame_indices_b: np.ndarray,
+) -> None:
+    """Debug print comparing camera A to aligned camera B on shared frames."""
+    poses_a = np.asarray(poses_a, dtype=np.float64)
+    poses_b = np.asarray(poses_b_aligned, dtype=np.float64)
+    pos_a = np.asarray(positions_a, dtype=np.float64)
+    pos_b = np.asarray(positions_b_aligned, dtype=np.float64)
+    fi_a = np.asarray(frame_indices_a, dtype=np.int64)
+    fi_b = np.asarray(frame_indices_b, dtype=np.int64)
+
+    if len(poses_a) == 0 or len(poses_b) == 0:
+        pprint({"cross_run_camera_comparison": "empty pose arrays"})
+        return
+
+    common = np.intersect1d(fi_a, fi_b)
+    if len(common) == 0:
+        n = min(len(poses_a), len(poses_b), len(pos_a), len(pos_b))
+        if n == 0:
+            pprint({"cross_run_camera_comparison": "no overlapping frames and no fallback samples"})
+            return
+        idx_a = np.arange(n)
+        idx_b = np.arange(n)
+        frame_label = "index_aligned_fallback"
+    else:
+        map_a = {int(f): i for i, f in enumerate(fi_a.tolist())}
+        map_b = {int(f): i for i, f in enumerate(fi_b.tolist())}
+        idx_a = np.asarray([map_a[int(f)] for f in common], dtype=np.int64)
+        idx_b = np.asarray([map_b[int(f)] for f in common], dtype=np.int64)
+        frame_label = "shared_frame_indices"
+
+    pa = poses_a[idx_a]
+    pb = poses_b[idx_b]
+    xa = pos_a[idx_a]
+    xb = pos_b[idx_b]
+
+    pos_delta = xb - xa
+    delta_norm = np.linalg.norm(pos_delta, axis=1)
+
+    # Relative rotation: R_rel = R_a^T * R_b. Report Euler xyz in degrees as a compact tilt indicator.
+    r_rel = np.einsum("nij,njk->nik", np.transpose(pa[:, :3, :3], (0, 2, 1)), pb[:, :3, :3])
+    pitch = np.degrees(np.arcsin(np.clip(-r_rel[:, 2, 0], -1.0, 1.0)))
+    roll = np.degrees(np.arctan2(r_rel[:, 2, 1], r_rel[:, 2, 2]))
+    yaw = np.degrees(np.arctan2(r_rel[:, 1, 0], r_rel[:, 0, 0]))
+
+    summary = {
+        "cross_run_camera_comparison": {
+            "num_compared": int(len(idx_a)),
+            "frame_mode": frame_label,
+            "position_delta_mean_xyz": pos_delta.mean(axis=0).round(6).tolist(),
+            "position_delta_std_xyz": pos_delta.std(axis=0).round(6).tolist(),
+            "position_delta_l2_mean": float(delta_norm.mean()),
+            "position_delta_l2_max": float(delta_norm.max()),
+            "relative_euler_deg_mean_xyz": [
+                float(np.mean(roll)),
+                float(np.mean(pitch)),
+                float(np.mean(yaw)),
+            ],
+            "relative_euler_deg_std_xyz": [
+                float(np.std(roll)),
+                float(np.std(pitch)),
+                float(np.std(yaw)),
+            ],
+            "relative_pitch_deg_abs_mean": float(np.mean(np.abs(pitch))),
+            "relative_roll_deg_abs_mean": float(np.mean(np.abs(roll))),
+        }
+    }
+    pprint(summary, sort_dicts=False)
+
+
 def _transform_camera_poses_3d(camera_poses: np.ndarray, r3: np.ndarray, t3: np.ndarray) -> np.ndarray:
     """Apply world-space 3D rigid transform (rotation + translation) to c2w camera poses."""
     poses = np.asarray(camera_poses, dtype=np.float64)
@@ -692,6 +767,15 @@ def main() -> None:
         traj_b_aligned = _apply_transform_xyz(traj_b, r_pc3, t_pc3)
         pc_b_aligned = _apply_transform_xyz(pc_b_plot, r_pc3, t_pc3)
         pose_b_aligned = _transform_camera_poses_3d(traj_bundle_b["camera_poses"], r_pc3, t_pc3)
+
+        _print_cross_run_camera_comparison(
+            poses_a=traj_bundle_a["camera_poses"],
+            poses_b_aligned=pose_b_aligned,
+            positions_a=traj_bundle_a["positions"],
+            positions_b_aligned=traj_b_aligned,
+            frame_indices_a=traj_bundle_a["frame_indices"],
+            frame_indices_b=traj_bundle_b["frame_indices"],
+        )
 
         yaw_deg = float(np.degrees(np.arctan2(r_pc3[1, 0], r_pc3[0, 0])))
         print("Estimated 3D rigid transform from point clouds only (B -> A):")
