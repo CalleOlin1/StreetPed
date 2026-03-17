@@ -228,24 +228,59 @@ class KITTIPixelSource(ScenePixelSource):
         frame_instances_path = os.path.join(
             self.data_path, "instances", "frame_instances.json"
         )
+        if not (os.path.exists(instances_info_path) and os.path.exists(frame_instances_path)):
+            logger.warning(
+                "[KITTI] Missing instance annotations under %s/instances. "
+                "Continuing without dynamic/static objects.",
+                self.data_path,
+            )
+            self._set_empty_objects()
+            return
+
         with open(instances_info_path, "r") as f:
             instances_info = json.load(f)
         with open(frame_instances_path, "r") as f:
             frame_instances = json.load(f)
+
+        try:
+            self._load_objects_from_annotations(instances_info, frame_instances)
+        except Exception as e:
+            logger.warning(
+                "[KITTI] Failed to parse instance annotations (%s). "
+                "Continuing without dynamic/static objects.",
+                str(e),
+            )
+            self._set_empty_objects()
+
+    def _set_empty_objects(self):
+        num_frames = self.end_timestep - self.start_timestep
+        self.instances_pose = torch.zeros((num_frames, 0, 4, 4), dtype=torch.float32)
+        self.instances_size = torch.zeros((0, 3), dtype=torch.float32)
+        self.per_frame_instance_mask = torch.zeros((num_frames, 0), dtype=torch.bool)
+        self.instances_true_id = torch.zeros((0,), dtype=torch.long)
+        self.instances_model_types = torch.zeros((0,), dtype=torch.long)
+
+    def _load_objects_from_annotations(self, instances_info, frame_instances):
         # get pose of each instance at each frame
         # shape (num_frames, num_instances, 4, 4)
-        num_instances = len(instances_info)
+        instance_ids = [int(k) for k in instances_info.keys()]
+        instance_id_to_local_idx = {
+            ins_id: local_idx for local_idx, ins_id in enumerate(sorted(instance_ids))
+        }
+        num_instances = len(instance_ids)
         num_full_frames = len(frame_instances)
         instances_pose = np.zeros((num_full_frames, num_instances, 4, 4))
         instances_size = np.zeros((num_full_frames, num_instances, 3))
-        instances_true_id = np.arange(num_instances)
+        instances_true_id = np.array(sorted(instance_ids))
         instances_model_types = np.ones(num_instances) * -1
 
         ego_to_world_start = np.loadtxt(
             os.path.join(self.data_path, "ego_pose", f"{self.start_timestep:03d}.txt")
         )
         for k, v in instances_info.items():
-            instances_model_types[int(k)] = OBJECT_CLASS_NODE_MAPPING[v["class_name"]]
+            true_instance_id = int(k)
+            local_idx = instance_id_to_local_idx[true_instance_id]
+            instances_model_types[local_idx] = OBJECT_CLASS_NODE_MAPPING[v["class_name"]]
             for frame_idx, obj_to_world, box_size in zip(
                 v["frame_annotations"]["frame_idx"],
                 v["frame_annotations"]["obj_to_world"],
@@ -254,14 +289,19 @@ class KITTIPixelSource(ScenePixelSource):
                 # the first ego pose as the origin of the world coordinate system.
                 obj_to_world = np.array(obj_to_world).reshape(4, 4)
                 obj_to_world = np.linalg.inv(ego_to_world_start) @ obj_to_world
-                instances_pose[frame_idx, int(k)] = np.array(obj_to_world)
-                instances_size[frame_idx, int(k)] = np.array(box_size)
+                instances_pose[frame_idx, local_idx] = np.array(obj_to_world)
+                instances_size[frame_idx, local_idx] = np.array(box_size)
 
         # get frame valid instances
         # shape (num_frames, num_instances)
         per_frame_instance_mask = np.zeros((num_full_frames, num_instances))
         for frame_idx, valid_instances in frame_instances.items():
-            per_frame_instance_mask[int(frame_idx), valid_instances] = 1
+            valid_local_indices = [
+                instance_id_to_local_idx[int(ins_id)]
+                for ins_id in valid_instances
+                if int(ins_id) in instance_id_to_local_idx
+            ]
+            per_frame_instance_mask[int(frame_idx), valid_local_indices] = 1
 
         # select the frames that are in the range of start_timestep and end_timestep
         instances_pose = torch.from_numpy(

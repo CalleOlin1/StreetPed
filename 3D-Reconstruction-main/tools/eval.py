@@ -21,6 +21,56 @@ logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
 
+def _load_novel_trajectory_from_file(
+    trajectory_file: str, device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """Load a novel trajectory from .npy/.npz and return a tensor of shape (N, 4, 4)."""
+    if not os.path.isfile(trajectory_file):
+        raise FileNotFoundError(f"Trajectory file not found: {trajectory_file}")
+
+    ext = os.path.splitext(trajectory_file)[1].lower()
+    if ext == ".npy":
+        poses = np.asarray(np.load(trajectory_file, allow_pickle=True))
+    elif ext == ".npz":
+        data = np.load(trajectory_file, allow_pickle=True)
+        candidate_keys = ["camera_poses", "poses", "trajectory"]
+        key = next((k for k in candidate_keys if k in data), None)
+        if key is None:
+            raise ValueError(
+                f"Unsupported trajectory file format in {trajectory_file}. "
+                f"Expected one of keys: {candidate_keys}"
+            )
+        poses = np.asarray(data[key])
+
+        # If the file stores interleaved multi-camera poses, keep a single camera stream.
+        if key == "camera_poses" and poses.ndim == 3 and poses.shape[-2:] == (4, 4):
+            if "cam_ids" in data and len(np.asarray(data["cam_ids"])) == len(poses):
+                cam_ids = np.asarray(data["cam_ids"]).reshape(-1)
+                poses = poses[cam_ids == cam_ids[0]]
+            elif "cam_names" in data and len(np.asarray(data["cam_names"])) == len(poses):
+                cam_names = np.asarray(data["cam_names"]).reshape(-1)
+                poses = poses[cam_names == cam_names[0]]
+    else:
+        raise ValueError(
+            f"Unsupported trajectory file extension: {ext}. Use .npy or .npz"
+        )
+
+    if poses.ndim != 3:
+        raise ValueError(f"Trajectory must be a 3D array, got shape {poses.shape}")
+
+    if poses.shape[-2:] == (3, 4):
+        bottom_row = np.zeros((poses.shape[0], 1, 4), dtype=poses.dtype)
+        bottom_row[:, 0, 3] = 1.0
+        poses = np.concatenate([poses, bottom_row], axis=1)
+
+    if poses.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"Trajectory poses must be [N,4,4] or [N,3,4], got shape {poses.shape}"
+        )
+
+    return torch.as_tensor(poses, dtype=torch.float32, device=device)
+
+
 def apply_render_frame_limit(dataset: DrivingDataset, max_render_frames: Optional[int]) -> Optional[int]:
     if max_render_frames is None:
         return None
@@ -58,6 +108,7 @@ def do_evaluation(
     log_metrics: bool = True,
     extract_camera_poses: bool = True,  # new parameter
     max_render_frames: Optional[int] = None,
+    trajectory_file: Optional[str] = None,
 ):
     print("Save images is", args.save_images)
     trainer.set_eval()
@@ -236,12 +287,22 @@ def do_evaluation(
         torch.cuda.empty_cache()
 
     render_novel_cfg = cfg.render.get("render_novel", None)
-    if render_novel_cfg is not None:
+    if render_novel_cfg is not None or trajectory_file is not None:
         logger.info("Rendering novel views...")
-        render_traj = dataset.get_novel_render_traj(
-            traj_types=render_novel_cfg.traj_types,
-            target_frames=render_novel_cfg.get("frames", dataset.frame_num),
-        )
+        if trajectory_file is not None:
+            loaded_traj = _load_novel_trajectory_from_file(
+                trajectory_file, device=dataset.pixel_source.device
+            )
+            traj_name = os.path.splitext(os.path.basename(trajectory_file))[0]
+            render_traj = {f"file_{traj_name}": loaded_traj}
+            logger.info(
+                f"Using custom trajectory file for novel rendering: {trajectory_file}"
+            )
+        else:
+            render_traj = dataset.get_novel_render_traj(
+                traj_types=render_novel_cfg.traj_types,
+                target_frames=render_novel_cfg.get("frames", dataset.frame_num),
+            )
         video_output_dir = f"{cfg.log_dir}/videos{post_fix}/novel_{step}"
         if not os.path.exists(video_output_dir):
             os.makedirs(video_output_dir)
@@ -257,7 +318,11 @@ def do_evaluation(
                 trainer,
                 render_data,
                 save_path,
-                fps=render_novel_cfg.get("fps", cfg.render.fps),
+                fps=(
+                    render_novel_cfg.get("fps", cfg.render.fps)
+                    if render_novel_cfg is not None
+                    else cfg.render.fps
+                ),
                 traj_type=traj_type,
                 save_images=args.save_images
             )
@@ -341,6 +406,7 @@ def main(args):
         args=args,
         post_fix="_eval"+args.render_video_postfix,
         max_render_frames=max_render_frames,
+        trajectory_file=args.trajectory_file,
     )
 
     if args.enable_viewer:
@@ -387,6 +453,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="limit rendering to the first N frames without changing dataset timesteps",
+    )
+    parser.add_argument(
+        "--trajectory_file",
+        type=str,
+        default=None,
+        help="path to a .npy/.npz camera trajectory file used for novel-view rendering",
     )
 
     # viewer
