@@ -83,22 +83,46 @@ def main():
 
     num_frames = len(dataset.full_image_set)
     frame_idx = 0
+    # Camera translation offsets
+    offset_step = 0.5  # Amount to move per key press (meters)
+    cam_offset_x = 0.0
+    cam_offset_y = 0.0
+    cam_offset_z = 0.0
+    cam_offset_forward = 0.0
 
-    def render_frame(idx):
+    def render_frame(idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward):
+        split_idx = dataset.full_image_set.split_indices[idx]
         single_image_dataset = SplitWrapper(
             datasource=dataset.full_image_set.datasource,
-            split_indices=[dataset.full_image_set.split_indices[idx]],
+            split_indices=[split_idx],
         )
-        render_results = render_images(
-            trainer=trainer,
-            dataset=single_image_dataset,
-            compute_metrics=False,
-            compute_error_map=False,
+        # Get image and camera infos
+        image_infos, cam_infos = single_image_dataset.get_image(0, camera_downscale=1.0)
+        device = trainer.device if hasattr(trainer, 'device') else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Move all tensors to the correct device
+        for k, v in image_infos.items():
+            if isinstance(v, torch.Tensor):
+                image_infos[k] = v.to(device)
+        for k, v in cam_infos.items():
+            if isinstance(v, torch.Tensor):
+                cam_infos[k] = v.to(device)
+        # Modify camera pose: apply translation in local directions
+        c2w = cam_infos["camera_to_world"].clone()
+        translation = (
+            cam_offset_x * c2w[:3, 0] +  # X (right/left)
+            cam_offset_y * c2w[:3, 1] +  # Y (up/down)
+            cam_offset_z * c2w[:3, 2] +  # Z (forward/backward)
+            cam_offset_forward * c2w[:3, 2]  # Forward/backward (same as Z)
         )
-        rgb_image = render_results["rgbs"][0]
-        return (np.clip(rgb_image, 0, 1) * 255).astype(np.uint8)
+        c2w[:3, 3] += translation
+        cam_infos["camera_to_world"] = c2w
+        # Render with modified camera pose
+        render_results = trainer(image_infos, cam_infos)
+        rgb_image = render_results["rgb"].detach().cpu().numpy()
+        rgb_image = np.clip(rgb_image, 0, 1)
+        return (rgb_image * 255).astype(np.uint8)
 
-    rgb_uint8 = render_frame(frame_idx)
+    rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
 
     while True:
         cv2.imshow(window_name, rgb_uint8[..., ::-1])  # Convert RGB to BGR for OpenCV
@@ -107,11 +131,30 @@ def main():
             break
         elif key == 81:  # Left arrow
             frame_idx = (frame_idx - 1) % num_frames
-            rgb_uint8 = render_frame(frame_idx)
+            cam_offset_x = cam_offset_y = cam_offset_z = cam_offset_forward = 0.0
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
         elif key == 83:  # Right arrow
             frame_idx = (frame_idx + 1) % num_frames
-            rgb_uint8 = render_frame(frame_idx)
-        # Optionally, add up/down for other controls
+            cam_offset_x = cam_offset_y = cam_offset_z = cam_offset_forward = 0.0
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == ord('a'):
+            cam_offset_x -= offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == ord('d'):
+            cam_offset_x += offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == ord('w'):
+            cam_offset_forward += offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == ord('s'):
+            cam_offset_forward -= offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == 32:  # Space for up
+            cam_offset_y -= offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+        elif key == ord('z'):  # Z for down
+            cam_offset_y += offset_step
+            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
