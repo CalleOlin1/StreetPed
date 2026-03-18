@@ -131,11 +131,9 @@ def main():
             break
         elif key == 81:  # Left arrow
             frame_idx = (frame_idx - 1) % num_frames
-            cam_offset_x = cam_offset_y = cam_offset_z = cam_offset_forward = 0.0
             rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
         elif key == 83:  # Right arrow
             frame_idx = (frame_idx + 1) % num_frames
-            cam_offset_x = cam_offset_y = cam_offset_z = cam_offset_forward = 0.0
             rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
         elif key == ord('a'):
             cam_offset_x -= offset_step
