@@ -19,13 +19,10 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to .pth checkpoint file')
     args = parser.parse_args()
 
-    # Step 1: Load the .pth checkpoint
-    try:
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
-        print(f"Loaded checkpoint from {args.checkpoint}")
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}")
-        sys.exit(1)
+
+    # Step 1: Prepare to load the .pth checkpoint using trainer's resume_from_checkpoint
+    checkpoint_path = args.checkpoint
+    print(f"Loaded checkpoint from {checkpoint_path}")
 
     # Step 2: Always infer config path from checkpoint directory
     ckpt_dir = os.path.dirname(args.checkpoint)
@@ -55,7 +52,8 @@ def main():
         scene_aabb=dataset.get_aabb().reshape(2, 3),
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     )
-    trainer.load_state_dict(checkpoint['model'] if 'model' in checkpoint else checkpoint)
+    # Use resume_from_checkpoint for proper loading
+    trainer.resume_from_checkpoint(ckpt_path=checkpoint_path, load_only_model=True)
     trainer.eval()
 
     # Step 4: Render a single frame (first full image)
