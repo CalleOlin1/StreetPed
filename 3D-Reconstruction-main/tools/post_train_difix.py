@@ -183,12 +183,16 @@ def sanitize_broken_models(trainer, reason: str) -> int:
     return len(removable)
 
 
-def build_trainer(dataset, cfg, args):
+
+def build_trainer(dataset, cfg, args, ckpt_to_load=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(dataset.num_img_timesteps)
     # setup trainer
+    trainer_cfg = dict(cfg.trainer)
+    trainer_cfg.pop('resume_from', None)
+    trainer_cfg.pop('resume_workflow_from', None)
     trainer = import_str(cfg.trainer.type)(
-        **cfg.trainer,
+        **trainer_cfg,
         num_timesteps=dataset.num_img_timesteps,
         model_config=cfg.model,
         num_train_images=len(dataset.train_image_set),
@@ -199,11 +203,9 @@ def build_trainer(dataset, cfg, args):
     )
 
     # initialize gaussians
-    resume_ckpt_path = args.resume_workflow_from if args.resume_workflow_from is not None else args.resume_from
-    if resume_ckpt_path is not None:
-        # Always load only model weights, never optimizer state
-        trainer.resume_from_checkpoint(ckpt_path=resume_ckpt_path, load_only_model=True)
-        logger.info(f"Resuming training from {resume_ckpt_path}, starting at step {trainer.step}")
+    if ckpt_to_load is not None:
+        trainer.resume_from_checkpoint(ckpt_path=ckpt_to_load, load_only_model=True)
+        logger.info(f"Resuming training from {ckpt_to_load}, starting at step {trainer.step}")
     else:
         trainer.init_gaussians_from_dataset(dataset=dataset)
         logger.info(f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}")
@@ -568,64 +570,73 @@ def main(args):
     synthetic_images = 10
     lateral_offset_incremenet = (lateral_offset_max - lateral_offset_m) / max(synthetic_images - 1, 1)
     loss_threshold = 0.002  # TODO Set desired threshold here
+    loss_threshold = 0.100  # TODO Set desired threshold here
+    disable_splitting_steps = 250
     step = 0
-    last_ckpt_path = args.resume_from
+    current_ckpt_path = args.resume_from
     for synth_round in range(synthetic_images):
         current_lateral_offset = lateral_offset_m + synth_round * lateral_offset_incremenet
 
+        # Both minimal and full trainers must load from the same checkpoint at the start of each round
+        ckpt_to_load = current_ckpt_path
+
         # --- Minimal trainer for rendering ---
-        dataset = build_dataset(cfg.data)
-        render_keys = setup_render_keys(cfg, dataset)
+        minimal_dataset = build_dataset(cfg.data)
+        # Remove resume_from and resume_workflow_from from cfg.trainer to prevent autoloading
+        trainer_cfg = dict(cfg.trainer)
+        trainer_cfg.pop('resume_from', None)
+        trainer_cfg.pop('resume_workflow_from', None)
         minimal_trainer = import_str(cfg.trainer.type)(
-            **cfg.trainer,
-            num_timesteps=dataset.num_img_timesteps,
+            **trainer_cfg,
+            num_timesteps=minimal_dataset.num_img_timesteps,
             model_config=cfg.model,
-            num_train_images=len(dataset.train_image_set),
-            num_full_images=len(dataset.full_image_set),
-            test_set_indices=dataset.test_timesteps,
-            scene_aabb=dataset.get_aabb().reshape(2, 3),
+            num_train_images=len(minimal_dataset.train_image_set),
+            num_full_images=len(minimal_dataset.full_image_set),
+            test_set_indices=minimal_dataset.test_timesteps,
+            scene_aabb=minimal_dataset.get_aabb().reshape(2, 3),
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         )
-        minimal_trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
+        print(f"[ROUND {synth_round}] Loading checkpoint: {ckpt_to_load}")
+        minimal_trainer.resume_from_checkpoint(ckpt_path=ckpt_to_load, load_only_model=True)
         novel_sample = render_single_offset_novel_view(
-            dataset=dataset,
+            dataset=minimal_dataset,
             trainer=minimal_trainer,
             lateral_offset_m=-current_lateral_offset,
         )
         novel_rgb = novel_sample["rendered_rgb"]
         reference_rgb = novel_sample["reference_rgb"]
         raw_image = tensor_to_image(novel_rgb)
-        # repaired_image is produced by difix_repair above
         repaired_image = difix_repair(raw_image, tensor_to_image(reference_rgb))
 
         # Save side-by-side comparison of novel and repaired images using correct step value
         side_by_side = Image.new('RGB', (raw_image.width + repaired_image.width, raw_image.height))
         side_by_side.paste(raw_image, (0, 0))
         side_by_side.paste(repaired_image, (raw_image.width, 0))
-        # Use minimal_trainer.step if available, else fallback to step
-        initial_step = getattr(minimal_trainer, 'step', step)
+        initial_step = getattr(minimal_trainer, 'step', 0)
         side_by_side.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"sidebyside_{initial_step}_ref_{novel_sample['reference_frame_idx']}.png"))
 
         repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0)
         novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
-        append_novel_sample_to_training_dataset(dataset, novel_sample)
+        append_novel_sample_to_training_dataset(minimal_dataset, novel_sample)
         del minimal_trainer
-        del dataset
+        del minimal_dataset
         gc.collect()
         torch.cuda.empty_cache()
 
         # --- Full trainer for training ---
         dataset = build_dataset(cfg.data)
         render_keys = setup_render_keys(cfg, dataset)
-        trainer = build_trainer(dataset, cfg, args)
-        trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
+        trainer = build_trainer(dataset, cfg, args, ckpt_to_load=ckpt_to_load)
+        print(f"[ROUND {synth_round}] Loading full trainer checkpoint: {ckpt_to_load}")
         trainer.num_train_images = len(dataset.train_image_set)
         step = trainer.step
         splitting_disabled = False
-        disable_splitting_steps = 2000
         while True:
             trainer.num_iters = trainer.step + 250
             step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+            # After training, update current_ckpt_path to latest checkpoint
+            current_ckpt_path = os.path.join(cfg.log_dir, "checkpoint_final.pth")
+
             eval_sample = render_single_offset_novel_view(
                 dataset=dataset,
                 trainer=trainer,
@@ -663,8 +674,7 @@ def main(args):
                     disable_steps += min(250, disable_splitting_steps - disable_steps)
                 break
         trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=False)
-        # Update last_ckpt_path to point to the latest checkpoint for the next round
-        last_ckpt_path = os.path.join(cfg.log_dir, "checkpoint_final.pth")
+        current_ckpt_path = os.path.join(cfg.log_dir, "checkpoint_final.pth")
         del trainer
         del dataset
         gc.collect()
@@ -672,8 +682,7 @@ def main(args):
     # Final evaluation
     dataset = build_dataset(cfg.data)
     render_keys = setup_render_keys(cfg, dataset)
-    trainer = build_trainer(dataset, cfg, args)
-    trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
+    trainer = build_trainer(dataset, cfg, args, ckpt_to_load=current_ckpt_path)
     run_evaluation(
         cfg,
         dataset,
