@@ -1,3 +1,9 @@
+"""
+This is our main training script.
+It is used to load a checkpoint that has been succesfully pretrained.
+
+"""
+
 from omegaconf import OmegaConf
 import numpy as np
 import os
@@ -179,6 +185,7 @@ def sanitize_broken_models(trainer, reason: str) -> int:
 
 def build_trainer(dataset, cfg, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(dataset.num_img_timesteps)
     # setup trainer
     trainer = import_str(cfg.trainer.type)(
         **cfg.trainer,
@@ -194,6 +201,7 @@ def build_trainer(dataset, cfg, args):
     # initialize gaussians
     resume_ckpt_path = args.resume_workflow_from if args.resume_workflow_from is not None else args.resume_from
     if resume_ckpt_path is not None:
+        # Always load only model weights, never optimizer state
         trainer.resume_from_checkpoint(ckpt_path=resume_ckpt_path, load_only_model=True)
         logger.info(f"Resuming training from {resume_ckpt_path}, starting at step {trainer.step}")
     else:
@@ -203,18 +211,39 @@ def build_trainer(dataset, cfg, args):
     if args.enable_viewer:
         trainer.init_viewer(port=args.viewer_port)
 
+    # Always re-initialize optimizer from scratch, never load from checkpoint
     try:
         trainer.initialize_optimizer()
     except AttributeError as e:
-        # Resume checkpoints can omit dynamic node tensors when those nodes were removed.
-        # In that case, drop invalid models and retry optimizer setup.
         logger.warning(f"Optimizer init failed on first attempt: {e}")
         removed = sanitize_broken_models(trainer, reason="optimizer init")
-
         if removed == 0:
             raise
-
+        # After model removal, always re-initialize optimizer
+        if hasattr(trainer, 'reset_optimizer_state'):
+            trainer.reset_optimizer_state()  # If your trainer supports explicit reset
         trainer.initialize_optimizer()
+        logger.info("Optimizer re-initialized after model removal.")
+    # --- DUMMY OPTIMIZER STEP TO INITIALIZE STATE ---
+    try:
+        trainer.set_train()
+        # Get a single batch from the training set
+        image_infos, cam_infos = dataset.train_image_set.next(1.0)
+        for k, v in image_infos.items():
+            if isinstance(v, torch.Tensor):
+                image_infos[k] = v.cuda(non_blocking=True)
+        for k, v in cam_infos.items():
+            if isinstance(v, torch.Tensor):
+                cam_infos[k] = v.cuda(non_blocking=True)
+        outputs = trainer(image_infos, cam_infos)
+        loss_dict = trainer.compute_losses(outputs, image_infos, cam_infos)
+        trainer.optimizer_zero_grad()
+        trainer.backward(loss_dict)
+        trainer.optimizer.step()
+        trainer.optimizer_zero_grad()
+        logger.info("Dummy optimizer step performed to initialize optimizer state.")
+    except Exception as e:
+        logger.warning(f"Dummy optimizer step failed: {e}")
     return trainer
 
 def setup_render_keys(cfg, dataset):
@@ -395,10 +424,8 @@ def render_single_offset_novel_view(
     dataset,
     trainer,
     lateral_offset_m: float,
-    collision_radius_m: float = 1.0,
     max_reference_search_tries: int = 32,
-    gaussian_radius_sigma: float = 2.0,
-    gaussian_opacity_threshold: float = 0.01,    max_gaussian_radius: float = 3.0,    min_reference_frame: int = 40,
+    min_reference_frame: int = 40,
 ):
     # This code should shift the camera left by lateral_offset_m meters.
     pixel_source = dataset.pixel_source
@@ -423,102 +450,10 @@ def render_single_offset_novel_view(
         }
         return ref_image_infos_local, ref_cam_infos_local, intrinsics_local, novel_c2w_local, novel_cam_infos_local
 
-    def _camera_intersects_gaussians(ref_image_infos_local, novel_cam_infos_local, radius_m: float):
-        with torch.no_grad():
-            cam_infos_device = {}
-            for k, v in novel_cam_infos_local.items():
-                if isinstance(v, torch.Tensor):
-                    cam_infos_device[k] = v.to(trainer.device)
-                else:
-                    cam_infos_device[k] = v
-
-            image_ids = ref_image_infos_local["img_idx"]
-            if isinstance(image_ids, torch.Tensor):
-                image_ids = image_ids.to(trainer.device)
-            else:
-                image_ids = torch.tensor(image_ids, device=trainer.device)
-
-            cam_dict = trainer.process_camera(
-                camera_infos=cam_infos_device,
-                image_ids=image_ids,
-                novel_view=True,
-            )
-            gaussians = trainer.collect_gaussians(cam=cam_dict, image_ids=image_ids)
-
-            if gaussians.means.numel() == 0:
-                return False, float("inf")
-
-            camera_center = cam_dict.camtoworlds[:3, 3]
-            if cam_dict.camtoworlds.ndim == 3:
-                camera_center = cam_dict.camtoworlds[0, :3, 3]
-
-            scales = gaussians.scales
-            if scales.ndim == 1:
-                scales = scales[:, None]
-            gaussian_radii = (gaussian_radius_sigma * scales.max(dim=-1).values).clamp(max=max_gaussian_radius)
-
-            opacities = gaussians.opacities
-            if opacities.ndim > 1:
-                opacities = opacities.squeeze(-1)
-            valid_mask = opacities > gaussian_opacity_threshold
-
-            if valid_mask.any():
-                means = gaussians.means[valid_mask]
-                gaussian_radii = gaussian_radii[valid_mask]
-            else:
-                means = gaussians.means
-
-            dists = torch.linalg.norm(means - camera_center[None, :], dim=-1)
-            if gaussian_radii.shape[0] == dists.shape[0]:
-                signed_dists = dists - gaussian_radii
-            else:
-                signed_dists = dists
-
-            min_signed_dist = signed_dists.min().item()
-            return min_signed_dist <= radius_m, min_signed_dist
-
-    total_frames = len(cam0)
-    original_frame_count = int(getattr(dataset, "num_img_timesteps", total_frames))
-    selectable_end = max(1, min(total_frames, original_frame_count))
-    selectable_start = min(min_reference_frame, selectable_end - 1)
-    selectable_pool = list(range(selectable_start, selectable_end))
-    candidate_count = min(max_reference_search_tries, len(selectable_pool))
-    candidate_indices = random.sample(selectable_pool, k=candidate_count)
-
-    selected_candidate = None
-    best_candidate = None
-    best_min_dist = -float("inf")
-    for candidate_idx in candidate_indices:
-        candidate = _build_novel_camera_from_reference(candidate_idx)
-        is_intersecting, min_dist = _camera_intersects_gaussians(
-            ref_image_infos_local=candidate[0],
-            novel_cam_infos_local=candidate[4],
-            radius_m=collision_radius_m,
-        )
-
-        if min_dist > best_min_dist:
-            best_min_dist = min_dist
-            best_candidate = (candidate_idx, candidate)
-
-        if not is_intersecting:
-            selected_candidate = (candidate_idx, candidate)
-            break
-        logger.warning(f"Intersecting candidate frame {candidate_idx} with nearest-gaussian distance {min_dist:.3f}m")
-
-    if selected_candidate is None:
-        selected_candidate = best_candidate
-        logger.warning(
-            "All %d candidate reference frames intersected gaussians within radius %.3fm; "
-            "falling back to frame %d with nearest-gaussian distance %.3fm",
-            candidate_count,
-            collision_radius_m,
-            selected_candidate[0],
-            best_min_dist,
-        )
-
-    selected_candidate = (100, _build_novel_camera_from_reference(100)) # TODO This code is a temporary override, to try a simpler diffusion algorithm
-    reference_frame_idx = selected_candidate[0]
-    ref_image_infos, ref_cam_infos, intrinsics, novel_c2w, novel_cam_infos = selected_candidate[1]
+    # Use a fixed frame number (e.g., 100)
+    fixed_frame_idx = 154
+    reference_frame_idx = fixed_frame_idx
+    ref_image_infos, ref_cam_infos, intrinsics, novel_c2w, novel_cam_infos = _build_novel_camera_from_reference(fixed_frame_idx)
 
     H, W = cam0.HEIGHT, cam0.WIDTH
     x, y = torch.meshgrid(
@@ -554,8 +489,7 @@ def render_single_offset_novel_view(
 
     logger.info(
         f"Rendered one novel view from cam0 reference frame {reference_frame_idx} "
-        f"with lateral offset {lateral_offset_m:.3f}m and collision radius {collision_radius_m:.3f}m "
-        f"(gaussian_sigma={gaussian_radius_sigma:.2f}, max_gaussian_radius={max_gaussian_radius:.2f}m, opacity_thresh={gaussian_opacity_threshold:.3f})"
+        f"with lateral offset {lateral_offset_m:.3f}m"
     )
     return {
         "reference_frame_idx": reference_frame_idx,
@@ -628,79 +562,118 @@ def append_novel_sample_to_training_dataset(dataset, novel_sample):
 def main(args):
     cfg = setup(args)
     # Initialize configuration (OmegaConf object), dataset (DrivingDataset), and trainer (Trainer instance)
-    dataset = build_dataset(cfg.data)
-    original_num_img_timesteps = dataset.num_img_timesteps
-    trainer = build_trainer(dataset, cfg, args)
-    # Prepare the list of keys (list of strings) that will be rendered/visualized during training
-    render_keys = setup_render_keys(cfg, dataset)
-    # Run the base training stage unless checkpoint step already passed it.
-    base_training_iters = int(cfg.trainer.optim.num_iters)
-    if trainer.step < base_training_iters:
-        trainer.num_iters = base_training_iters
-        step = run_training_loop(cfg, dataset, trainer, render_keys, args)
-    else:
-        step = trainer.step
-        logger.info(
-            "Skipping base training loop because checkpoint step %d already reached/passed base target %d",
-            step,
-            base_training_iters,
-        )
-
+    import gc
     lateral_offset_m = 0.5
-    lateral_offset_max = 3 # We will iterate towards this value
-    num_iterations_refine = 1000
-    synthetic_images = 100
+    lateral_offset_max = 3
+    synthetic_images = 10
     lateral_offset_incremenet = (lateral_offset_max - lateral_offset_m) / max(synthetic_images - 1, 1)
-
-    start_synth_round = 0
-    if step > base_training_iters:
-        synth_progress = step - base_training_iters
-        start_synth_round = min(synthetic_images, math.ceil(synth_progress / num_iterations_refine))
-        if synth_progress % num_iterations_refine != 0:
-            logger.warning(
-                "Checkpoint step %d is mid-refinement stage; resuming from synthetic round %d using step as reference",
-                step,
-                start_synth_round,
-            )
-        else:
-            logger.info(
-                "Recovered workflow progress from checkpoint step %d: starting at synthetic round %d/%d",
-                step,
-                start_synth_round,
-                synthetic_images,
-            )
-
-    for synth_round in range(start_synth_round, synthetic_images):
+    loss_threshold = 0.002  # TODO Set desired threshold here
+    step = 0
+    last_ckpt_path = args.resume_from
+    for synth_round in range(synthetic_images):
         current_lateral_offset = lateral_offset_m + synth_round * lateral_offset_incremenet
+
+        # --- Minimal trainer for rendering ---
+        dataset = build_dataset(cfg.data)
+        render_keys = setup_render_keys(cfg, dataset)
+        minimal_trainer = import_str(cfg.trainer.type)(
+            **cfg.trainer,
+            num_timesteps=dataset.num_img_timesteps,
+            model_config=cfg.model,
+            num_train_images=len(dataset.train_image_set),
+            num_full_images=len(dataset.full_image_set),
+            test_set_indices=dataset.test_timesteps,
+            scene_aabb=dataset.get_aabb().reshape(2, 3),
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+        minimal_trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
         novel_sample = render_single_offset_novel_view(
             dataset=dataset,
-            trainer=trainer,
+            trainer=minimal_trainer,
             lateral_offset_m=-current_lateral_offset,
         )
         novel_rgb = novel_sample["rendered_rgb"]
         reference_rgb = novel_sample["reference_rgb"]
-        print(f"Novel RGB shape: {novel_rgb.shape}, Reference RGB shape: {reference_rgb.shape}")
-        repaired_image = difix_repair(tensor_to_image(novel_rgb), tensor_to_image(reference_rgb))
-        if True:
-            # Save repaied image for inspection
-            repaired_image.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"repaired_{step}_ref_{novel_sample['reference_frame_idx']}.png"))
+        raw_image = tensor_to_image(novel_rgb)
+        # repaired_image is produced by difix_repair above
+        repaired_image = difix_repair(raw_image, tensor_to_image(reference_rgb))
 
-        repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0) # H, W, C
+        # Save side-by-side comparison of novel and repaired images using correct step value
+        side_by_side = Image.new('RGB', (raw_image.width + repaired_image.width, raw_image.height))
+        side_by_side.paste(raw_image, (0, 0))
+        side_by_side.paste(repaired_image, (raw_image.width, 0))
+        # Use minimal_trainer.step if available, else fallback to step
+        initial_step = getattr(minimal_trainer, 'step', step)
+        side_by_side.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"sidebyside_{initial_step}_ref_{novel_sample['reference_frame_idx']}.png"))
+
+        repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0)
         novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
-        print(f"Repaired image shape: {novel_sample['rendered_rgb'].shape}")
-
         append_novel_sample_to_training_dataset(dataset, novel_sample)
+        del minimal_trainer
+        del dataset
+        gc.collect()
+        torch.cuda.empty_cache()
 
+        # --- Full trainer for training ---
+        dataset = build_dataset(cfg.data)
+        render_keys = setup_render_keys(cfg, dataset)
+        trainer = build_trainer(dataset, cfg, args)
+        trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
         trainer.num_train_images = len(dataset.train_image_set)
-        trainer.step = step + 1
-        trainer.num_iters = step + num_iterations_refine
-        logger.info(
-            f"Starting refinement training with updated dataset for {num_iterations_refine} iterations "
-            f"(from step {trainer.step} to {trainer.num_iters})"
-        )
-        step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+        step = trainer.step
+        splitting_disabled = False
+        disable_splitting_steps = 2000
+        while True:
+            trainer.num_iters = trainer.step + 250
+            step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+            eval_sample = render_single_offset_novel_view(
+                dataset=dataset,
+                trainer=trainer,
+                lateral_offset_m=-current_lateral_offset,
+            )
+            eval_rgb = eval_sample["rendered_rgb"]
+            eval_loss = torch.nn.functional.mse_loss(eval_rgb, repaired_tensor).item()
+            print(f"-----> Novel view loss at step {step}: {eval_loss}. Will continue training until loss < {loss_threshold} <-----")
 
-    # Perform final evaluation (no return value) and optionally start the viewer for inspection
+            # Save side-by-side comparison every 1000 steps
+            if step % 1000 == 0:
+                eval_raw_image = tensor_to_image(eval_rgb)
+                side_by_side_final = Image.new('RGB', (eval_raw_image.width + repaired_image.width, eval_raw_image.height))
+                side_by_side_final.paste(eval_raw_image, (0, 0))
+                side_by_side_final.paste(repaired_image, (eval_raw_image.width, 0))
+                side_by_side_final.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"sidebyside_final_{step}_ref_{novel_sample['reference_frame_idx']}.png"))
+
+            if eval_loss < loss_threshold and not splitting_disabled:
+                set_gaussian_splitting = lambda t, e: None
+                if hasattr(trainer, 'models'):
+                    for model in trainer.models.values():
+                        if hasattr(model, 'ctrl_cfg') and isinstance(model.ctrl_cfg, dict):
+                            model.ctrl_cfg['enable_gaussian_splitting'] = False
+                        elif hasattr(model, 'ctrl_cfg'):
+                            try:
+                                model.ctrl_cfg.enable_gaussian_splitting = False
+                            except Exception:
+                                pass
+                splitting_disabled = True
+                disable_steps = 0
+                print(f"Disabling gaussian splitting for {disable_splitting_steps} steps.")
+                while disable_steps < disable_splitting_steps:
+                    trainer.num_iters = trainer.step + min(250, disable_splitting_steps - disable_steps)
+                    step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+                    disable_steps += min(250, disable_splitting_steps - disable_steps)
+                break
+        trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=False)
+        # Update last_ckpt_path to point to the latest checkpoint for the next round
+        last_ckpt_path = os.path.join(cfg.log_dir, "checkpoint_final.pth")
+        del trainer
+        del dataset
+        gc.collect()
+        torch.cuda.empty_cache()
+    # Final evaluation
+    dataset = build_dataset(cfg.data)
+    render_keys = setup_render_keys(cfg, dataset)
+    trainer = build_trainer(dataset, cfg, args)
+    trainer.resume_from_checkpoint(ckpt_path=last_ckpt_path, load_only_model=True)
     run_evaluation(
         cfg,
         dataset,
@@ -708,9 +681,8 @@ def main(args):
         render_keys,
         step,
         args,
-        max_render_frames=original_num_img_timesteps,
+        max_render_frames=dataset.num_img_timesteps,
     )
-    # Return the last training step (int)
     return step
 # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
