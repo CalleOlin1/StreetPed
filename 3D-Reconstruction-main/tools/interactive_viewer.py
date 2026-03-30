@@ -81,12 +81,22 @@ def main():
 
     num_frames = len(dataset.full_image_set)
     frame_idx = 0
-    # Camera translation offsets
-    offset_step = 0.5  # Amount to move per key press (meters)
+    # Camera translation offsets and momentum
     cam_offset_x = 0.0
     cam_offset_y = 0.0
     cam_offset_z = 0.0
     cam_offset_forward = 0.0
+
+    # Camera velocity for each axis
+    vel_x = 0.0
+    vel_y = 0.0
+    vel_z = 0.0
+    vel_forward = 0.0
+
+    # Momentum parameters
+    max_velocity = 1  # meters per frame
+    acceleration = 0.05  # meters per frame per key press
+    deceleration = 0.02  # meters per frame per tick
 
     def render_frame(idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward):
         split_idx = dataset.full_image_set.split_indices[idx]
@@ -120,37 +130,98 @@ def main():
         rgb_image = np.clip(rgb_image, 0, 1)
         return (rgb_image * 255).astype(np.uint8)
 
+
     rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
 
+    # Key state tracking
+    key_state = {
+        'a': False, 'd': False, 'w': False, 's': False, ' ': False, 'z': False,
+        'left': False, 'right': False
+    }
+
+    # Map key codes to actions
+    key_map = {
+        ord('a'): 'a',
+        ord('d'): 'd',
+        ord('w'): 'w',
+        ord('s'): 's',
+        32: ' ',  # Space
+        ord('z'): 'z',
+        81: 'left',
+        83: 'right',
+    }
+
     while True:
-        cv2.imshow(window_name, rgb_uint8[..., ::-1])  # Convert RGB to BGR for OpenCV
-        key = cv2.waitKey(0)
+        cv2.imshow(window_name, rgb_uint8[..., ::-1])
+        key = cv2.waitKey(10)  # 10 ms delay for smooth updates
+        # Handle frame navigation
         if key == 27 or key == ord('q'):
             break
         elif key == 81:  # Left arrow
             frame_idx = (frame_idx - 1) % num_frames
             rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+            continue
         elif key == 83:  # Right arrow
             frame_idx = (frame_idx + 1) % num_frames
             rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == ord('a'):
-            cam_offset_x -= offset_step
+            continue
+
+        # Update key state for movement keys
+        for code, name in key_map.items():
+            if key == code:
+                key_state[name] = True
+        # Release keys if no key pressed
+        if key == -1:
+            for k in key_state:
+                key_state[k] = False
+
+        # Update velocities based on key state
+        # X axis (left/right)
+        if key_state['a']:
+            vel_x = max(vel_x - acceleration, -max_velocity)
+        elif key_state['d']:
+            vel_x = min(vel_x + acceleration, max_velocity)
+        else:
+            # Decelerate X
+            if vel_x > 0:
+                vel_x = max(vel_x - deceleration, 0)
+            elif vel_x < 0:
+                vel_x = min(vel_x + deceleration, 0)
+
+        # Y axis (up/down)
+        if key_state[' ']:
+            vel_y = max(vel_y - acceleration, -max_velocity)
+        elif key_state['z']:
+            vel_y = min(vel_y + acceleration, max_velocity)
+        else:
+            if vel_y > 0:
+                vel_y = max(vel_y - deceleration, 0)
+            elif vel_y < 0:
+                vel_y = min(vel_y + deceleration, 0)
+
+        # Forward/backward (Z/forward)
+        if key_state['w']:
+            vel_forward = min(vel_forward + acceleration, max_velocity)
+        elif key_state['s']:
+            vel_forward = max(vel_forward - acceleration, -max_velocity)
+        else:
+            if vel_forward > 0:
+                vel_forward = max(vel_forward - deceleration, 0)
+            elif vel_forward < 0:
+                vel_forward = min(vel_forward + deceleration, 0)
+
+        # Optionally, add Z axis (not mapped to keys in original code)
+        # cam_offset_z, vel_z can be used for future extension
+
+        # Update camera offsets
+        cam_offset_x += vel_x
+        cam_offset_y += vel_y
+        cam_offset_forward += vel_forward
+
+        # Only re-render if camera moved
+        if any([vel_x, vel_y, vel_forward]):
             rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == ord('d'):
-            cam_offset_x += offset_step
-            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == ord('w'):
-            cam_offset_forward += offset_step
-            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == ord('s'):
-            cam_offset_forward -= offset_step
-            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == 32:  # Space for up
-            cam_offset_y -= offset_step
-            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
-        elif key == ord('z'):  # Z for down
-            cam_offset_y += offset_step
-            rgb_uint8 = render_frame(frame_idx, cam_offset_x, cam_offset_y, cam_offset_z, cam_offset_forward)
+
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
