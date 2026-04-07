@@ -4,6 +4,7 @@ The goal of this file is to create a structured and memory efficient approach to
 """
 import os
 import argparse
+import io
 import shutil
 import gc
 import subprocess
@@ -13,7 +14,24 @@ import sys
 from PIL import Image
 import numpy as np
 
-from tools.difix_sender_receiver import difix_repair
+from tools.difix_sender_receiver import difix_repair, difix_repair_batch
+
+SEGFORMER_REPO_PATH = "/home/hstromgr/Documents/Github/SegFormer"
+SEGFORMER_CONDA_ENV = "segformer"
+SEGFORMER_CONFIG_PATH = os.path.join(
+    SEGFORMER_REPO_PATH,
+    "local_configs",
+    "segformer",
+    "B5",
+    "segformer.b5.1024x1024.city.160k.py",
+)
+SEGFORMER_CHECKPOINT_PATH = os.path.join(
+    SEGFORMER_REPO_PATH,
+    "pretrained",
+    "segformer.b5.1024x1024.city.160k.pth",
+)
+ROAD_CLASS_ID = 0
+SKY_CLASS_ID = 10
 
 # Utility functions
 def tensor_to_image(tensor):
@@ -106,7 +124,163 @@ def render_novel_sample_list(checkpoint_path, frame_index_list, lateral_offset_l
         result.append((curr_step, novel_sample))
     return result
 
-def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_offset, from_scratch=False):
+def _get_class_masks(
+    images,
+    target_class_id,
+    mask_name,
+    segformer_path=SEGFORMER_REPO_PATH,
+    config=SEGFORMER_CONFIG_PATH,
+    checkpoint=SEGFORMER_CHECKPOINT_PATH,
+    device="cuda:0",
+):
+    """Spawn the mask worker subprocess and return one binary mask per input image.
+
+    Args:
+        images: List of image paths, PIL images, or numpy arrays.
+        segformer_path: Optional path to the SegFormer checkout.
+        config: Optional model config path.
+        checkpoint: Optional checkpoint path.
+        device: Torch device string for the worker process.
+
+    Returns:
+        List of PIL.Image.Image masks in L mode, one per input image.
+    """
+
+    def _to_pil(image):
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        if isinstance(image, (str, os.PathLike)):
+            return Image.open(image).convert("RGB")
+        image_np = np.asarray(image)
+        if image_np.ndim == 2:
+            image_np = np.stack([image_np, image_np, image_np], axis=-1)
+        elif image_np.ndim == 3 and image_np.shape[2] == 4:
+            image_np = image_np[:, :, :3]
+        if image_np.dtype != np.uint8:
+            image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+        return Image.fromarray(image_np).convert("RGB")
+
+    def _serialize_image(image):
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _deserialize_image(img_bytes):
+        image = Image.open(io.BytesIO(img_bytes))
+        image.load()
+        return image
+
+    def _read_exact(pipe, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = pipe.read(n - len(buf))
+            if not chunk:
+                raise EOFError(f"Unexpected EOF while reading {mask_name}-mask subprocess output")
+            buf += chunk
+        return buf
+
+    worker_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "datasets", "tools", "pipe_extract_masks.py"))
+
+    if shutil.which("conda"):
+        cmd = [
+            "conda",
+            "run",
+            "--no-capture-output",
+            "-n",
+            SEGFORMER_CONDA_ENV,
+            "python",
+            "-u",
+            worker_script,
+            "--worker",
+            f"--device={device}",
+            f"--target_class_id={target_class_id}",
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-u",
+            worker_script,
+            "--worker",
+            f"--device={device}",
+            f"--target_class_id={target_class_id}",
+        ]
+    if segformer_path is not None:
+        cmd.append(f"--segformer_path={segformer_path}")
+    if config is not None:
+        cmd.append(f"--config={config}")
+    if checkpoint is not None:
+        cmd.append(f"--checkpoint={checkpoint}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+
+    try:
+        startup_lines = []
+        while True:
+            ready_line = proc.stdout.readline().decode(errors="replace").strip()
+            if ready_line == "READY":
+                break
+            if ready_line == "":
+                raise RuntimeError(
+                    f"{mask_name.title()}-mask worker failed to start before EOF. "
+                    f"Startup output: {startup_lines}"
+                )
+            startup_lines.append(ready_line)
+            print(f"[{mask_name}-mask worker] {ready_line}", file=sys.stderr)
+
+        pil_images = [_to_pil(image) for image in images]
+        img_bytes_list = [_serialize_image(image) for image in pil_images]
+
+        proc.stdin.write(len(img_bytes_list).to_bytes(4, "big"))
+        for img_bytes in img_bytes_list:
+            proc.stdin.write(len(img_bytes).to_bytes(4, "big"))
+            proc.stdin.write(img_bytes)
+        proc.stdin.flush()
+        proc.stdin.close()
+
+        mask_count = int.from_bytes(_read_exact(proc.stdout, 4), "big")
+        masks = []
+        for _ in range(mask_count):
+            mask_len = int.from_bytes(_read_exact(proc.stdout, 4), "big")
+            mask_bytes = _read_exact(proc.stdout, mask_len)
+            masks.append(_deserialize_image(mask_bytes))
+
+        proc.wait()
+        return masks
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def get_sky_masks(images, segformer_path=SEGFORMER_REPO_PATH, config=SEGFORMER_CONFIG_PATH, checkpoint=SEGFORMER_CHECKPOINT_PATH, device="cuda:0"):
+    return _get_class_masks(
+        images,
+        target_class_id=SKY_CLASS_ID,
+        mask_name="sky",
+        segformer_path=segformer_path,
+        config=config,
+        checkpoint=checkpoint,
+        device=device,
+    )
+
+
+def get_road_masks(images, segformer_path=SEGFORMER_REPO_PATH, config=SEGFORMER_CONFIG_PATH, checkpoint=SEGFORMER_CHECKPOINT_PATH, device="cuda:0"):
+    return _get_class_masks(
+        images,
+        target_class_id=ROAD_CLASS_ID,
+        mask_name="road",
+        segformer_path=segformer_path,
+        config=config,
+        checkpoint=checkpoint,
+        device=device,
+    )
+
+def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_offset, from_scratch=False, num_iters=3000):
     # Pickle synthetic_samples to a temp file
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp_in:
         input_path = tmp_in.name
@@ -123,7 +297,7 @@ def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_off
         f"--output_path={output_path}",
         f"--lateral_offset={lateral_offset}",
         f"--ref_frame={frame_index}",
-        f"--split_steps={3000}",
+        f"--split_steps={num_iters}",
         f"--prune_steps={500}",
     ]
 
@@ -145,30 +319,38 @@ def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_off
     return curr_step, novel_sample
 
 def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_lateral_offset, min_frame_index, max_frame_index,
-                  batch_size=10):
+                  batch_size=60):
+
     # Get random unique frame indices for this batch
     frame_indices = np.random.choice(np.arange(min_frame_index, max_frame_index), size=batch_size, replace=False)
     synthetic_samples = []
     # Use render_novel_sample_list to get all samples in one call
-    batch_results = render_novel_sample_list(checkpoint_path, frame_indices.tolist(), [lateral_offset]*batch_size)
-    for i, (curr_step, novel_sample) in enumerate(batch_results):
-        print(f"Starting diffusion process for image {i+1}/{len(batch_results)}")
-        novel_img = tensor_to_image(novel_sample["rendered_rgb"])
-        ref_img   = tensor_to_image(novel_sample["reference_rgb"])
-        # Send novel view image to repair and get novel image back
-        repaired_image = difix_repair(novel_img, ref_img)
-        log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
+    lateral_offsets = np.linspace(0.1, max_lateral_offset, batch_size)
+    batch_results = render_novel_sample_list(checkpoint_path, frame_indices.tolist(), lateral_offsets.tolist())
 
+    # Prepare lists of images for batch repair
+    novel_imgs = [tensor_to_image(novel_sample["rendered_rgb"]) for _, novel_sample in batch_results]
+    ref_imgs   = [tensor_to_image(novel_sample["reference_rgb"]) for _, novel_sample in batch_results]
+
+    # Batch repair
+    repaired_images = difix_repair_batch(novel_imgs, ref_imgs)
+
+    # Sky masks
+    sky_masks = get_sky_masks(repaired_images, segformer_path=SEGFORMER_REPO_PATH)
+
+    # Logging and update samples
+    for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask) in enumerate(zip(batch_results, novel_imgs, repaired_images, sky_masks)):
+        log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
         # Convert repaired_image (PIL) back to numpy array (normalized float32, CHW)
         repaired_array = image_to_array(repaired_image, normalize=True)
         novel_sample["rendered_rgb"] = repaired_array
-
+        novel_sample["sky_masks"] = (np.asarray(sky_mask.convert("L"), dtype=np.uint8) > 0).astype(np.float32)
         # Append the full sample dict (with repaired image) to the list
         synthetic_samples.append(novel_sample)
 
     # Start training with our synthetic images
     # Use the first frame_index from this batch for training (or another policy as needed)
-    train_synthetic(synthetic_samples, checkpoint_path, 154, max_lateral_offset)
+    train_synthetic(synthetic_samples, checkpoint_path, 154, max_lateral_offset, num_iters=3000)
     return synthetic_samples
 
 def run_training_loop(checkpoint_path, min_frame_index, max_frame_index, min_lateral_offset, max_lateral_offset, num_synthetic_samples):
@@ -196,15 +378,27 @@ def create_run_folders(run_path):
         os.makedirs(os.path.join(run_path, folder), exist_ok=True)
 
 def copy_pretrained_checkpoint(pretrained_checkpoint_path, new_checkpoint_path):
-    shutil.copy(pretrained_checkpoint_path, new_checkpoint_path)
-    print(f"Copied pretrained checkpoint from {pretrained_checkpoint_path} to {new_checkpoint_path}")
+    # os.path.samefile requires both paths to exist; guard for fresh run directories.
+    same_file = (
+        os.path.exists(new_checkpoint_path)
+        and os.path.samefile(pretrained_checkpoint_path, new_checkpoint_path)
+    )
+    if not same_file:
+        shutil.copy(pretrained_checkpoint_path, new_checkpoint_path)
+        print(f"Copied pretrained checkpoint from {pretrained_checkpoint_path} to {new_checkpoint_path}")
 
 def copy_config_file(pretrained_checkpoint_path, run_path):
     pretrained_dir = os.path.dirname(pretrained_checkpoint_path)
     pretrained_config_path = os.path.join(pretrained_dir, "config.yaml")
     new_config_path = os.path.join(run_path, "config.yaml")
-    shutil.copy(pretrained_config_path, new_config_path)
-    print(f"Copied config file from {pretrained_config_path} to {new_config_path}")
+    # os.path.samefile requires both paths to exist; guard for fresh run directories.
+    same_file = (
+        os.path.exists(new_config_path)
+        and os.path.samefile(pretrained_config_path, new_config_path)
+    )
+    if not same_file:
+        shutil.copy(pretrained_config_path, new_config_path)
+        print(f"Copied config file from {pretrained_config_path} to {new_config_path}")
 
 def main(
     pretrained_checkpoint_path: str,
@@ -214,8 +408,15 @@ def main(
     create_run_folders(run_path)
     checkpoint_path = os.path.join(run_path, "checkpoint_final.pth")
     if pretrained_checkpoint_path is None:
-        shutil.copy(config_path, os.path.join(run_path, "config.yaml"))
-        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True)
+        new_config_path = os.path.join(run_path, "config.yaml")
+        # os.path.samefile requires both paths to exist; guard for fresh run directories.
+        same_file = (
+            os.path.exists(new_config_path)
+            and os.path.samefile(config_path, new_config_path)
+        )
+        if not same_file:
+            shutil.copy(config_path, os.path.join(run_path, "config.yaml"))
+        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=1000)
         print("Trained initial model from scratch, starting synthetic training loop...")
     else:
         copy_pretrained_checkpoint(pretrained_checkpoint_path, checkpoint_path)
