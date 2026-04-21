@@ -319,13 +319,12 @@ def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_off
     return curr_step, novel_sample
 
 def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_lateral_offset, min_frame_index, max_frame_index,
-                  batch_size=60):
-
+                  batch_size=100):
     # Get random unique frame indices for this batch
     frame_indices = np.random.choice(np.arange(min_frame_index, max_frame_index), size=batch_size, replace=False)
     synthetic_samples = []
-    # Use render_novel_sample_list to get all samples in one call
     lateral_offsets = np.linspace(0.1, max_lateral_offset, batch_size)
+    # lateral_offsets = np.full(frame_indices.shape, lateral_offset)
     batch_results = render_novel_sample_list(checkpoint_path, frame_indices.tolist(), lateral_offsets.tolist())
 
     # Prepare lists of images for batch repair
@@ -335,16 +334,25 @@ def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_latera
     # Batch repair
     repaired_images = difix_repair_batch(novel_imgs, ref_imgs)
 
-    # Sky masks
+    # Sky / road masks
     sky_masks = get_sky_masks(repaired_images, segformer_path=SEGFORMER_REPO_PATH)
+    # road_masks = [novel_sample.get("road_masks") for _, novel_sample in batch_results]
+    # if any(mask is None for mask in road_masks):
+    #     print("road_masks were not correctly generated, using Segformer instead")
+    #     road_masks = get_road_masks(repaired_images, segformer_path=SEGFORMER_REPO_PATH)
+    road_masks = get_road_masks(repaired_images, segformer_path=SEGFORMER_REPO_PATH)
 
     # Logging and update samples
-    for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask) in enumerate(zip(batch_results, novel_imgs, repaired_images, sky_masks)):
+    for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask, road_mask) in enumerate(zip(batch_results, novel_imgs, repaired_images, sky_masks, road_masks)):
         log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
         # Convert repaired_image (PIL) back to numpy array (normalized float32, CHW)
         repaired_array = image_to_array(repaired_image, normalize=True)
         novel_sample["rendered_rgb"] = repaired_array
         novel_sample["sky_masks"] = (np.asarray(sky_mask.convert("L"), dtype=np.uint8) > 0).astype(np.float32)
+        if isinstance(road_mask, Image.Image):
+            novel_sample["road_masks"] = (np.asarray(road_mask.convert("L"), dtype=np.uint8) > 0).astype(np.float32)
+        else:
+            novel_sample["road_masks"] = np.asarray(road_mask, dtype=np.float32)
         # Append the full sample dict (with repaired image) to the list
         synthetic_samples.append(novel_sample)
 
@@ -416,7 +424,9 @@ def main(
         )
         if not same_file:
             shutil.copy(config_path, os.path.join(run_path, "config.yaml"))
-        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=1000)
+        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=12000)
+        # train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=50000)
+        # exit()
         print("Trained initial model from scratch, starting synthetic training loop...")
     else:
         copy_pretrained_checkpoint(pretrained_checkpoint_path, checkpoint_path)

@@ -211,6 +211,7 @@ def extract_sky_masks_via_pipe(
 	config: str | None = None,
 	checkpoint: str | None = None,
 	device: str = "cuda:0",
+	target_class_id: int = SKY_CLASS_ID,
 	python_executable: str | None = None,
 ) -> List[np.ndarray]:
 	"""Launch the pipe worker as a subprocess and return sky masks.
@@ -226,6 +227,7 @@ def extract_sky_masks_via_pipe(
 		script_path,
 		"--worker",
 		f"--device={device}",
+		f"--target_class_id={target_class_id}",
 	]
 	if segformer_path is not None:
 		cmd.append(f"--segformer_path={segformer_path}")
@@ -291,12 +293,13 @@ def _save_masks(masks: Sequence[np.ndarray], save_dir: str, names: Sequence[str]
 
 
 def _worker_main() -> None:
-	parser = argparse.ArgumentParser(description="Pipe worker for sky mask extraction")
+	parser = argparse.ArgumentParser(description="Pipe worker for binary class-mask extraction")
 	parser.add_argument("--worker", action="store_true", help="Run as stdin/stdout worker")
 	parser.add_argument("--segformer_path", type=str, default=None)
 	parser.add_argument("--config", type=str, default=None)
 	parser.add_argument("--checkpoint", type=str, default=None)
 	parser.add_argument("--device", type=str, default="cuda:0")
+	parser.add_argument("--target_class_id", type=int, default=SKY_CLASS_ID)
 	parser.add_argument("--save_dir", type=str, default=None, help="Optional directory to save masks")
 	parser.add_argument(
 		"--image_paths",
@@ -328,7 +331,7 @@ def _worker_main() -> None:
 			print(f"Sky-mask worker: processing {index}/{len(images)}", file=sys.stderr, flush=True)
 			bgr_image = _image_like_to_bgr_ndarray(image)
 			result = inference_segmentor(model, bgr_image)
-			mask = _sky_mask_from_segmentation(result[0].astype(np.uint8))
+			mask = _binary_mask_from_class_ids(result[0].astype(np.uint8), [args.target_class_id])
 			masks.append(Image.fromarray(mask))
 
 		if args.save_dir is not None:

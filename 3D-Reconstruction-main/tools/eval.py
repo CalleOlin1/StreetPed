@@ -109,15 +109,17 @@ def do_evaluation(
     extract_camera_poses: bool = True,  # new parameter
     max_render_frames: Optional[int] = None,
     trajectory_file: Optional[str] = None,
+    output_root: Optional[str] = None,
 ):
     print("Save images is", args.save_images)
     trainer.set_eval()
+    output_root = output_root or cfg.log_dir
     # New: camera pose extraction feature
     if extract_camera_poses:
         logger.info("Extracting camera poses...")
         
         # Extract poses for each dataset
-        pose_save_dir = f"{cfg.log_dir}/camera_poses{post_fix}"
+        pose_save_dir = f"{output_root}/camera_poses{post_fix}"
         os.makedirs(pose_save_dir, exist_ok=True)
         
         # Extract test set poses
@@ -200,16 +202,16 @@ def do_evaluation(
             if args.enable_wandb:
                 wandb.log(eval_dict)
             test_metrics_file = (
-                f"{cfg.log_dir}/metrics{post_fix}/images_test_{current_time}.json"
+                f"{output_root}/metrics{post_fix}/images_test_{current_time}.json"
             )
             with open(test_metrics_file, "w") as f:
                 json.dump(eval_dict, f)
             logger.info(f"Image evaluation metrics saved to {test_metrics_file}")
 
         if args.render_video_postfix is None:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}.mp4"
+            video_output_pth = f"{output_root}/videos{post_fix}/test_set_{step}.mp4"
         else:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/test_set_{step}_{args.render_video_postfix}.mp4"
+            video_output_pth = f"{output_root}/videos{post_fix}/test_set_{step}_{args.render_video_postfix}.mp4"
         num_test_frames = dataset.num_test_timesteps
         vis_frame_dict = save_videos(
             render_results,
@@ -258,16 +260,16 @@ def do_evaluation(
             if args.enable_wandb:
                 wandb.log(eval_dict)
             full_metrics_file = (
-                f"{cfg.log_dir}/metrics{post_fix}/images_full_{current_time}.json"
+                f"{output_root}/metrics{post_fix}/images_full_{current_time}.json"
             )
             with open(full_metrics_file, "w") as f:
                 json.dump(eval_dict, f)
             logger.info(f"Image evaluation metrics saved to {full_metrics_file}")
 
         if args.render_video_postfix is None:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}.mp4"
+            video_output_pth = f"{output_root}/videos{post_fix}/full_set_{step}.mp4"
         else:
-            video_output_pth = f"{cfg.log_dir}/videos{post_fix}/full_set_{step}_{args.render_video_postfix}.mp4"
+            video_output_pth = f"{output_root}/videos{post_fix}/full_set_{step}_{args.render_video_postfix}.mp4"
         num_full_frames = max_render_frames or dataset.num_img_timesteps
         vis_frame_dict = save_videos(
             render_results,
@@ -303,7 +305,7 @@ def do_evaluation(
                 traj_types=render_novel_cfg.traj_types,
                 target_frames=render_novel_cfg.get("frames", dataset.frame_num),
             )
-        video_output_dir = f"{cfg.log_dir}/videos{post_fix}/novel_{step}"
+        video_output_dir = f"{output_root}/videos{post_fix}/novel_{step}"
         if not os.path.exists(video_output_dir):
             os.makedirs(video_output_dir)
 
@@ -332,14 +334,28 @@ def do_evaluation(
 
 
 def main(args):
-    log_dir = os.path.dirname(args.resume_from)
-    cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
+    ckpt_dir = os.path.dirname(args.resume_from)
+    cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(args.opts))
     
     args.enable_wandb = False
     for folder in ["videos_eval", "metrics_eval"]:
-        os.makedirs(os.path.join(log_dir, folder), exist_ok=True)
+        os.makedirs(os.path.join(ckpt_dir, folder), exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    lazy_dataset_mode = args.lazy_dataset or (
+        args.skip_original_render and args.trajectory_file is not None
+    )
+    if lazy_dataset_mode:
+        logger.info("Using lazy dataset mode for eval.")
+        cfg.data.project_lidar_on_images = False
+        cfg.data.pixel_source.load_rgb_images = False
+        cfg.data.pixel_source.load_dynamic_mask = False
+        cfg.data.pixel_source.load_sky_mask = False
+        if cfg.render.render_test:
+            logger.info("Disabling test-set rendering in lazy dataset mode.")
+            cfg.render.render_test = False
+        cfg.render.render_full = False
 
     # build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
@@ -407,6 +423,7 @@ def main(args):
         post_fix="_eval"+args.render_video_postfix,
         max_render_frames=max_render_frames,
         trajectory_file=args.trajectory_file,
+        output_root=ckpt_dir,
     )
 
     if args.enable_viewer:
@@ -459,6 +476,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="path to a .npy/.npz camera trajectory file used for novel-view rendering",
+    )
+    parser.add_argument(
+        "--lazy_dataset",
+        action="store_true",
+        help="skip loading RGB images/masks and image-based lidar projection; best for trajectory-only novel rendering",
     )
 
     # viewer

@@ -1,113 +1,47 @@
-
 import multiprocessing
 from unittest import result
 from venv import logger
-import torch
-import numpy as np
-import os
-from datasets.base.pixel_source import get_rays
-
 import argparse
+import os
 import pickle
+
+import imageio
+import numpy as np
+import torch
+import wandb
 from omegaconf import OmegaConf
-from utils.misc import import_str
+from PIL import Image
+
+from datasets.base.pixel_source import get_rays
 from datasets.driving_dataset import DrivingDataset
 from models.video_utils import render_images, save_videos
-import imageio
-from post_train_difix_loop import tensor_to_image, image_to_array
+from post_train_difix_loop import image_to_array, tensor_to_image
 from standalone_renderer import render_single_offset_novel_view
 from utils.logging import MetricLogger, setup_logging
-from PIL import Image
-import wandb
+from utils.misc import import_str
 
 
-def _to_tensor(value, field_name: str) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
-        return value.detach()
-    if isinstance(value, np.ndarray):
-        return torch.from_numpy(value)
-    raise TypeError(f"Field '{field_name}' expects Tensor/ndarray, got {type(value)}")
+def _append_frame_tensor_via_cpu(base_tensor, ref_idx=None, new_tensor=None):
+    """Append one frame to a frame-major tensor without peak GPU concatenation."""
+    if base_tensor is None:
+        return None
 
+    base_cpu = base_tensor.detach().cpu()
+    if new_tensor is None:
+        if ref_idx is None:
+            raise ValueError("ref_idx is required when new_tensor is not provided")
+        new_cpu = base_cpu[ref_idx : ref_idx + 1].clone()
+    else:
+        if isinstance(new_tensor, np.ndarray):
+            new_tensor = torch.from_numpy(new_tensor)
+        if not isinstance(new_tensor, torch.Tensor):
+            raise TypeError(f"Expected Tensor or ndarray, got {type(new_tensor)}")
+        new_cpu = new_tensor.detach().cpu()
+        if new_cpu.ndim == base_cpu.ndim - 1:
+            new_cpu = new_cpu.unsqueeze(0)
 
-def _normalize_image_like(sample_img: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
-    """Normalize synthetic image tensor to match camera image tensor layout."""
-    if sample_img.ndim == 3 and sample_img.shape != target_shape:
-        if len(target_shape) == 3 and target_shape[2] == 3 and sample_img.shape[0] == 3:
-            sample_img = sample_img.permute(1, 2, 0)
-        elif len(target_shape) == 3 and target_shape[0] == 3 and sample_img.shape[2] == 3:
-            sample_img = sample_img.permute(2, 0, 1)
-    return sample_img
+    return torch.cat([base_cpu, new_cpu], dim=0)
 
-
-def _coerce_to_base_layout(value, base_tensor: torch.Tensor, field_name: str) -> torch.Tensor:
-    tensor = _to_tensor(value, field_name)
-
-    if field_name == "rendered_rgb":
-        tensor = _normalize_image_like(tensor, base_tensor.shape[1:])
-
-    # Handle scalar-to-vector append cases (e.g. unique_img_idx).
-    if tensor.ndim == 0 and base_tensor.ndim == 1:
-        tensor = tensor.unsqueeze(0)
-
-    # Handle alpha masks provided as [H, W] while base is [N, H, W, 1].
-    if (
-        field_name == "alpha_mask"
-        and base_tensor.ndim == 4
-        and tensor.ndim == 2
-        and base_tensor.shape[-1] == 1
-    ):
-        tensor = tensor.unsqueeze(-1)
-
-    if tensor.ndim == base_tensor.ndim - 1:
-        tensor = tensor.unsqueeze(0)
-
-    if tensor.ndim != base_tensor.ndim:
-        raise ValueError(
-            f"Field '{field_name}' rank mismatch: got {tensor.ndim}, expected {base_tensor.ndim}"
-        )
-    if tensor.shape[1:] != base_tensor.shape[1:]:
-        raise ValueError(
-            f"Field '{field_name}' shape mismatch: got {tuple(tensor.shape[1:])}, expected {tuple(base_tensor.shape[1:])}"
-        )
-
-    return tensor.to(device=base_tensor.device, dtype=base_tensor.dtype)
-
-
-def _append_block(base_tensor: torch.Tensor, new_block: torch.Tensor) -> torch.Tensor:
-    if new_block.ndim != base_tensor.ndim:
-        raise ValueError("Cannot append block with different rank")
-    if new_block.shape[1:] != base_tensor.shape[1:]:
-        raise ValueError("Cannot append block with different trailing shape")
-
-    base_len = base_tensor.shape[0]
-    total_len = base_len + new_block.shape[0]
-    out = torch.empty(
-        (total_len, *base_tensor.shape[1:]),
-        dtype=base_tensor.dtype,
-        device=base_tensor.device,
-    )
-    out[:base_len] = base_tensor
-    out[base_len:] = new_block
-    return out
-
-
-def _stack_field_for_samples(
-    base_tensor: torch.Tensor,
-    samples,
-    field_name: str,
-    required: bool,
-):
-    blocks = []
-    for sample in samples:
-        ref_idx = int(sample["reference_frame_idx"])
-        value = sample.get(field_name, None)
-        if value is None:
-            if required:
-                raise KeyError(f"Synthetic sample missing required field '{field_name}'")
-            blocks.append(base_tensor[ref_idx:ref_idx + 1].clone())
-        else:
-            blocks.append(_coerce_to_base_layout(value, base_tensor, field_name))
-    return torch.cat(blocks, dim=0)
 
 def sanitize_broken_models(trainer, reason: str) -> int:
     """Remove partially initialized models that break resume/save flows."""
@@ -132,141 +66,83 @@ def sanitize_broken_models(trainer, reason: str) -> int:
 
     return len(removable)
 
-def integrate_synthetic_samples(dataset, synthetic_samples):
-    if synthetic_samples is None or len(synthetic_samples) == 0:
-        return []
 
+def append_novel_sample_to_training_dataset(dataset, novel_sample):
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
+    ref_idx = novel_sample["reference_frame_idx"]
+    field_devices = {}
 
-    # Validate and normalize reference indices once.
-    for idx, sample in enumerate(synthetic_samples):
-        if "reference_frame_idx" not in sample:
-            raise KeyError(f"Synthetic sample #{idx} missing 'reference_frame_idx'")
-        sample["reference_frame_idx"] = int(sample["reference_frame_idx"])
+    new_frame_idx = len(cam0)
 
-    old_num_frames = len(cam0)
-    num_new = len(synthetic_samples)
-
-    missing_road_masks = sum(1 for sample in synthetic_samples if sample.get("road_masks", None) is None)
-    if missing_road_masks > 0:
-        if getattr(cam0, "road_masks", None) is not None:
-            logger.warning(
-                "road_masks missing for %d/%d synthetic samples; falling back to cloning reference-frame road masks.",
-                missing_road_masks,
-                num_new,
-            )
-        else:
-            logger.warning(
-                "road_masks missing for %d/%d synthetic samples and base dataset has no road_masks tensor; synthetic frames will not carry road_masks.",
-                missing_road_masks,
-                num_new,
-            )
-
-    cam0.cam_to_worlds = _append_block(
+    field_devices["cam_to_worlds"] = cam0.cam_to_worlds.device
+    cam0.cam_to_worlds = _append_frame_tensor_via_cpu(
         cam0.cam_to_worlds,
-        _stack_field_for_samples(
-            cam0.cam_to_worlds,
-            synthetic_samples,
-            field_name="novel_c2w",
-            required=True,
-        ),
+        ref_idx=ref_idx,
+        new_tensor=novel_sample["novel_c2w"],
     )
-    cam0.intrinsics = _append_block(
+    cam0.cam_to_worlds = cam0.cam_to_worlds.to(field_devices["cam_to_worlds"])
+
+    field_devices["intrinsics"] = cam0.intrinsics.device
+    cam0.intrinsics = _append_frame_tensor_via_cpu(
         cam0.intrinsics,
-        _stack_field_for_samples(
-            cam0.intrinsics,
-            synthetic_samples,
-            field_name="intrinsics",
-            required=True,
-        ),
+        ref_idx=ref_idx,
+        new_tensor=novel_sample["intrinsics"],
     )
+    cam0.intrinsics = cam0.intrinsics.to(field_devices["intrinsics"])
 
     if cam0.distortions is not None:
-        cam0.distortions = _append_block(
-            cam0.distortions,
-            _stack_field_for_samples(
-                cam0.distortions,
-                synthetic_samples,
-                field_name="distortions",
-                required=False,
-            ),
-        )
+        field_devices["distortions"] = cam0.distortions.device
+        cam0.distortions = _append_frame_tensor_via_cpu(cam0.distortions, ref_idx=ref_idx)
+        cam0.distortions = cam0.distortions.to(field_devices["distortions"])
 
-    cam0.images = _append_block(
+    field_devices["images"] = cam0.images.device
+    cam0.images = _append_frame_tensor_via_cpu(
         cam0.images,
-        _stack_field_for_samples(
-            cam0.images,
-            synthetic_samples,
-            field_name="rendered_rgb",
-            required=True,
-        ),
+        ref_idx=ref_idx,
+        new_tensor=novel_sample["rendered_rgb"],
     )
-    cam0.alpha_masks = _append_block(
+    cam0.images = cam0.images.to(field_devices["images"])
+
+    field_devices["alpha_masks"] = cam0.alpha_masks.device
+    cam0.alpha_masks = _append_frame_tensor_via_cpu(
         cam0.alpha_masks,
-        _stack_field_for_samples(
-            cam0.alpha_masks,
-            synthetic_samples,
-            field_name="alpha_mask",
-            required=True,
-        ),
+        ref_idx=ref_idx,
+        new_tensor=novel_sample["alpha_mask"],
     )
+    cam0.alpha_masks = cam0.alpha_masks.to(field_devices["alpha_masks"])
 
     if cam0.normalized_time is not None:
-        cam0.normalized_time = _append_block(
-            cam0.normalized_time,
-            _stack_field_for_samples(
-                cam0.normalized_time,
-                synthetic_samples,
-                field_name="normalized_time",
-                required=False,
-            ),
-        )
+        field_devices["normalized_time"] = cam0.normalized_time.device
+        cam0.normalized_time = _append_frame_tensor_via_cpu(cam0.normalized_time, ref_idx=ref_idx)
+        cam0.normalized_time = cam0.normalized_time.to(field_devices["normalized_time"])
 
-    cam0.unique_img_idx = _append_block(
-        cam0.unique_img_idx,
-        _stack_field_for_samples(
-            cam0.unique_img_idx,
-            synthetic_samples,
-            field_name="unique_img_idx",
-            required=False,
-        ),
-    )
+    field_devices["unique_img_idx"] = cam0.unique_img_idx.device
+    cam0.unique_img_idx = _append_frame_tensor_via_cpu(cam0.unique_img_idx, ref_idx=ref_idx)
+    cam0.unique_img_idx = cam0.unique_img_idx.to(field_devices["unique_img_idx"])
 
     for tensor_field in [
         "dynamic_masks",
         "human_masks",
         "vehicle_masks",
         "sky_masks",
-        "road_masks",
         "lidar_depth_maps",
         "image_error_maps",
     ]:
         field_data = getattr(cam0, tensor_field, None)
         if field_data is not None:
-            appended = _append_block(
-                field_data,
-                _stack_field_for_samples(
-                    field_data,
-                    synthetic_samples,
-                    field_name=tensor_field,
-                    required=False,
-                ),
-            )
-            setattr(cam0, tensor_field, appended)
+            field_devices[tensor_field] = field_data.device
+            appended = _append_frame_tensor_via_cpu(field_data, ref_idx=ref_idx)
+            setattr(cam0, tensor_field, appended.to(field_devices[tensor_field]))
 
-    new_img_indices = [
-        int(frame_idx * pixel_source.num_cams + cam0.unique_cam_idx)
-        for frame_idx in range(old_num_frames, old_num_frames + num_new)
-    ]
-    dataset.train_indices.extend(new_img_indices)
+    new_img_idx = new_frame_idx * pixel_source.num_cams + cam0.unique_cam_idx
+    dataset.train_indices.append(int(new_img_idx))
     dataset.train_image_set.split_indices = dataset.train_indices
 
     if pixel_source.image_error_buffer is not None:
         current_len = pixel_source.image_error_buffer.shape[0]
-        max_new_img_idx = max(new_img_indices)
-        if max_new_img_idx >= current_len:
-            pad_len = int(max_new_img_idx + 1 - current_len)
+        if new_img_idx >= current_len:
+            pad_len = int(new_img_idx + 1 - current_len)
             pad_value = pixel_source.image_error_buffer.mean() if current_len > 0 else torch.tensor(1.0, device=pixel_source.device)
             pad_tensor = torch.full(
                 (pad_len,),
@@ -276,13 +152,10 @@ def integrate_synthetic_samples(dataset, synthetic_samples):
             )
             pixel_source.image_error_buffer = torch.cat([pixel_source.image_error_buffer, pad_tensor], dim=0)
 
-    logger.info(
-        "Integrated %d synthetic samples as img indices [%d, %d]",
-        num_new,
-        int(new_img_indices[0]),
-        int(new_img_indices[-1]),
-    )
-    return new_img_indices
+    logger.info(f"Appended novel training sample as synthetic image idx {new_img_idx}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return int(new_img_idx)
 
 def cache_image_errors(cfg, dataset, trainer, step):
     logger.info("Caching image error...")
@@ -329,19 +202,8 @@ def build_trainer(dataset, cfg, args, ckpt_to_load=None):
         device=device,
     )
 
-    logger.info(
-        "Trainer model classes: %s",
-        list(trainer.model_config.keys()),
-    )
-    logger.info(
-        "Trainer gaussian classes: %s",
-        list(trainer.gaussian_classes.keys()),
-    )
-    print(f"Trainer model classes: {list(trainer.model_config.keys())}")
-    print(f"Trainer gaussian classes: {list(trainer.gaussian_classes.keys())}")
-
     # initialize gaussians
-    if not args.from_scratch:
+    if ckpt_to_load is not None:
         trainer.resume_from_checkpoint(ckpt_path=ckpt_to_load, load_only_model=True)
         logger.info(f"Resuming training from {ckpt_to_load}, starting at step {trainer.step}")
     else:
@@ -408,6 +270,7 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
 
         outputs = trainer(image_infos, cam_infos)
         trainer.update_visibility_filter()
+        # loss_dict = trainer.compute_losses(outputs, image_infos, cam_infos)
         loss_dict = trainer.compute_losses(outputs, image_infos, cam_infos)
 
         # check for NaNs/Infs
@@ -462,23 +325,24 @@ def setup_render_keys(cfg, dataset):
     return render_keys
 
 
-def train_from_scratch(cfg, ckpt_path, args):
-    # Build dataset from config
-    dataset = DrivingDataset(cfg.data)
-    render_keys = setup_render_keys(cfg, dataset)
-    trainer = build_trainer(dataset, cfg, args, ckpt_to_load=ckpt_path)
-    trainer.num_train_images = len(dataset.train_image_set)
-    step = trainer.step
-
-    trainer.num_iters = trainer.step + args.split_steps
-    run_training_loop(cfg, dataset, trainer, render_keys, args)
-    # Save checkpoint
-    trainer.save_checkpoint(log_dir=os.path.dirname(ckpt_path), save_only_model=True, is_final=False)
-    with open(args.output_path, "wb") as f:
-        pickle.dump({"status": "done"}, f)
-
-
 def cli_start_training():
+    # Explicitly enable gaussian splitting for all models
+    def enable_gaussian_splitting_and_set_nsplits(trainer, n_split_samples=2):
+        if hasattr(trainer, 'models'):
+            for model in trainer.models.values():
+                # Enable splitting and set parameters
+                if hasattr(model, 'ctrl_cfg') and isinstance(model.ctrl_cfg, dict):
+                    model.ctrl_cfg['enable_gaussian_splitting'] = True
+                    model.ctrl_cfg['n_split_samples'] = n_split_samples
+                    model.ctrl_cfg['stop_split_at'] = int(1e9)
+                elif hasattr(model, 'ctrl_cfg'):
+                    try:
+                        model.ctrl_cfg.enable_gaussian_splitting = True
+                        model.ctrl_cfg.n_split_samples = n_split_samples
+                        model.ctrl_cfg.stop_split_at = int(1e9)
+                    except Exception:
+                        pass
+
     # Print GPU usage statistics
     print("\n=== GPU Usage Statistics (torch.cuda) ===")
     if torch.cuda.is_available():
@@ -492,20 +356,17 @@ def cli_start_training():
             print(f"Could not run nvidia-smi: {e}")
     else:
         print("CUDA is not available.")
-
     parser = argparse.ArgumentParser(description="Train with synthetic samples (GPU isolated)")
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--input_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--lateral_offset", type=float, required=True)
     parser.add_argument("--ref_frame", type=int, required=True)
-    parser.add_argument("--split_steps", type=int, required=True, help="Number of steps to train with splitting enabled")
-    parser.add_argument("--prune_steps", type=int, required=True, help="Number of steps to train with pruning enabled after splitting")
     parser.add_argument("--enable_viewer", action="store_true", help="enable viewer")
     parser.add_argument("--viewer_port", type=int, default=8080, help="viewer port")
     parser.add_argument("--enable_wandb", action="store_true", help="enable wandb logging")
-    parser.add_argument("--novel_view_quality_dir", type=str, default="novel_view_quality", help="Directory to save novel view quality results")
-    parser.add_argument("--from_scratch", action="store_true", help="Train from scratch")
+    disable_splitting_steps = 1000
+    loss_threshold = 0.002
 
     args = parser.parse_args()
 
@@ -517,9 +378,6 @@ def cli_start_training():
     # Ensure log_dir is set to checkpoint directory
     cfg.log_dir = ckpt_dir
 
-    if args.from_scratch:
-        train_from_scratch(cfg, ckpt_path, args)
-        return
     # Load synthetic samples from input_path
     with open(args.input_path, "rb") as f:
         synthetic_samples = pickle.load(f)
@@ -527,70 +385,119 @@ def cli_start_training():
     # Build dataset
     dataset = DrivingDataset(cfg.data)
     render_keys = setup_render_keys(cfg, dataset)
-    # Create fully opaque alpha masks for real frames
-    for cam in dataset.pixel_source.camera_data.values():
+    # Create empty alpha masks for real frames
+    for cam in dataset.pixel_source.camera_data:
         N, H, W, C = cam.images.shape  # assuming NHWC
         if not hasattr(cam, "alpha_masks") or cam.alpha_masks is None:
-            # initialize all ones with shape (N, H, W, 1) to match synthetic alpha masks
-            cam.alpha_masks = torch.ones((N, H, W, 1), device=cam.images.device)
+            # initialize all ones
+            cam.alpha_masks = torch.ones((N, H, W), device=cam.images.device)
 
+    for sample in synthetic_samples:
+        # Move all tensors in prev_sample to the minimal_dataset's device before appending
+        sample_on_device = {k: (v.to(dataset.pixel_source.camera_data[0].images.device) if isinstance(v, torch.Tensor) else v) for k, v in sample.items()}
+        # Convert numpy arrays to torch tensors
+        for k, v in sample_on_device.items():
+            if isinstance(v, np.ndarray):
+                sample_on_device[k] = torch.from_numpy(v)
+        # Ensure rendered_rgb is CHW and matches cam0.images
+        img = sample_on_device.get("rendered_rgb", None)
+        if img is not None and hasattr(dataset.pixel_source.camera_data[0], "images"):
+            cam0 = dataset.pixel_source.camera_data[0]
+            # cam0.images shape: (N, C, H, W) or (N, H, W, C)
+            if cam0.images.ndim == 4:
+                target_shape = cam0.images.shape[1:]
+                if img.shape != target_shape:
+                    # If cam0.images is NHWC and img is CHW, convert to HWC
+                    if len(target_shape) == 3 and target_shape[2] == 3 and img.shape[0] == 3:
+                        sample_on_device["rendered_rgb"] = img.permute(1, 2, 0)
+                    # If cam0.images is NCHW and img is HWC, convert to CHW
+                    elif len(target_shape) == 3 and target_shape[0] == 3 and img.shape[2] == 3:
+                        sample_on_device["rendered_rgb"] = img.permute(2, 0, 1)
+                    else:
+                        raise ValueError(f"Image shape mismatch: {img.shape} vs {target_shape}")
+        append_novel_sample_to_training_dataset(dataset, sample_on_device)
+        # Free unused VRAM after each sample
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # Integrate synthetic samples in one shot to avoid repeated tensor reallocation/copy.
-    integrate_synthetic_samples(dataset, synthetic_samples)
+    # Fallback for synthetic images that dont have alpha masks
+    for cam in dataset.pixel_source.camera_data:
+        N, H, W, C = cam.images.shape  # assuming NHWC
+        if not hasattr(cam, "alpha_masks") or cam.alpha_masks is None:
+            # initialize all ones
+            cam.alpha_masks = torch.ones((N, H, W), device=cam.images.device)
 
-    # Train on both synthetic and ground truth images for split_steps
     trainer = build_trainer(dataset, cfg, args, ckpt_to_load=ckpt_path)
+    enable_gaussian_splitting_and_set_nsplits(trainer, n_split_samples=2)
     trainer.num_train_images = len(dataset.train_image_set)
-    trainer.num_iters = trainer.step + args.split_steps
-    print(f"Training on synthetic + ground truth images for {args.split_steps} steps...")
-    run_training_loop(cfg, dataset, trainer, render_keys, args)
+    step = trainer.step
+    splitting_disabled = False
+    # Ensure repaired_tensor is a torch.Tensor
+    last_sample = synthetic_samples[-1]
+    rendered_rgb = last_sample["rendered_rgb"]
+    if not isinstance(rendered_rgb, torch.Tensor):
+        repaired_tensor = torch.from_numpy(rendered_rgb).to(trainer.device)
+    else:
+        repaired_tensor = rendered_rgb.to(trainer.device)
+    repaired_image = tensor_to_image(repaired_tensor.cpu())
 
-    # 4. Save checkpoint
+    # Start a training loop here
+    last_image_save_step = None
+    while True:
+        trainer.num_iters = trainer.step + 250
+        step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+
+        eval_sample = render_single_offset_novel_view(
+            dataset=dataset,
+            trainer=trainer,
+            lateral_offset_m=-args.lateral_offset,
+        )
+        eval_rgb = eval_sample["rendered_rgb"]
+        # Ensure both tensors are CHW for loss calculation
+        if eval_rgb.shape != repaired_tensor.shape:
+            # If eval_rgb is HWC and repaired_tensor is CHW, permute eval_rgb
+            if eval_rgb.shape[-1] == 3 and repaired_tensor.shape[0] == 3:
+                eval_rgb = eval_rgb.permute(2, 0, 1)
+            # If eval_rgb is CHW and repaired_tensor is HWC, permute repaired_tensor
+            elif eval_rgb.shape[0] == 3 and repaired_tensor.shape[-1] == 3:
+                repaired_tensor = repaired_tensor.permute(1, 2, 0)
+        # Ensure both tensors are on the same device
+        eval_rgb = eval_rgb.to(trainer.device)
+        repaired_tensor = repaired_tensor.to(trainer.device)
+        eval_loss = torch.nn.functional.mse_loss(eval_rgb, repaired_tensor).item()
+        print(f"-----> Novel view loss at step {step}: {eval_loss}. Will continue training until loss < {loss_threshold} <-----")
+
+        # Save side-by-side comparison every 1000 steps, even if not aligned
+        if last_image_save_step is None or (step - last_image_save_step) >= 1000:
+            eval_raw_image = tensor_to_image(eval_rgb.cpu())
+            side_by_side_final = Image.new('RGB', (eval_raw_image.width + repaired_image.width, eval_raw_image.height))
+            side_by_side_final.paste(eval_raw_image, (0, 0))
+            side_by_side_final.paste(repaired_image, (eval_raw_image.width, 0))
+            side_by_side_final.save(os.path.join(ckpt_dir, "synthetic_image_samples", f"sidebyside_final_{step}_ref_{eval_sample['reference_frame_idx']}.png"))
+            last_image_save_step = step
+
+        if eval_loss < loss_threshold and not splitting_disabled:
+            set_gaussian_splitting = lambda t, e: None
+            if hasattr(trainer, 'models'):
+                for model in trainer.models.values():
+                    if hasattr(model, 'ctrl_cfg') and isinstance(model.ctrl_cfg, dict):
+                        model.ctrl_cfg['enable_gaussian_splitting'] = False
+                        model.ctrl_cfg['stop_split_at'] = 0
+                    elif hasattr(model, 'ctrl_cfg'):
+                        try:
+                            model.ctrl_cfg.enable_gaussian_splitting = False
+                            model.ctrl_cfg.stop_split_at = 0
+                        except Exception:
+                            pass
+            splitting_disabled = True
+            disable_steps = 0
+            print(f"Disabling gaussian splitting for {disable_splitting_steps} steps.")
+            while disable_steps < disable_splitting_steps:
+                trainer.num_iters = trainer.step + min(250, disable_splitting_steps - disable_steps)
+                step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+                disable_steps += min(250, disable_splitting_steps - disable_steps)
+            break
     trainer.save_checkpoint(log_dir=ckpt_dir, save_only_model=True, is_final=False)
-
-    # 5. Evaluate and save quality in novel_view_quality folder
-    eval_sample = render_single_offset_novel_view(
-        dataset=dataset,
-        trainer=trainer,
-        frame_index=args.ref_frame,
-        lateral_offset_m=-args.lateral_offset,
-    )
-    eval_rgb = eval_sample["rendered_rgb"]
-    # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
-    os.makedirs(quality_dir, exist_ok=True)
-    eval_raw_image = tensor_to_image(eval_rgb.cpu())
-    novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{args.lateral_offset}_step{trainer.step}.png")
-    eval_raw_image.save(novel_view_img_path)
-
-    eval_sample = render_single_offset_novel_view(
-        dataset=dataset,
-        trainer=trainer,
-        frame_index=args.ref_frame,
-        lateral_offset_m=args.lateral_offset,
-    )
-    eval_rgb = eval_sample["rendered_rgb"]
-    # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
-    os.makedirs(quality_dir, exist_ok=True)
-    eval_raw_image = tensor_to_image(eval_rgb.cpu())
-    novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{-args.lateral_offset}_step{trainer.step}.png")
-    eval_raw_image.save(novel_view_img_path)
-
-    eval_sample = render_single_offset_novel_view(
-        dataset=dataset,
-        trainer=trainer,
-        frame_index=args.ref_frame,
-        lateral_offset_m=-args.lateral_offset/2,
-    )
-    eval_rgb = eval_sample["rendered_rgb"]
-    # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
-    os.makedirs(quality_dir, exist_ok=True)
-    eval_raw_image = tensor_to_image(eval_rgb.cpu())
-    novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{args.lateral_offset/2}_step{trainer.step}.png")
-    eval_raw_image.save(novel_view_img_path)
-
 
     # Write a dummy result to output_path to signal completion
     with open(args.output_path, "wb") as f:

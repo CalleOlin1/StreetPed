@@ -11,12 +11,24 @@ from omegaconf import OmegaConf
 from utils.misc import import_str
 from datasets.driving_dataset import DrivingDataset
 
+
+_ROAD_MASK_WARNING_EMITTED = False
+
+
+def _to_binary_mask(opacity_tensor: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    """Convert an opacity map to a float32 binary mask in {0, 1}."""
+    mask = opacity_tensor
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    return (mask > threshold).float()
+
 def render_single_offset_novel_view(
     dataset,
     trainer,
     frame_index: int,
     lateral_offset_m: float,
 ):
+    global _ROAD_MASK_WARNING_EMITTED
     # This code should shift the camera left by lateral_offset_m meters.
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
@@ -68,6 +80,9 @@ def render_single_offset_novel_view(
     }
     with torch.no_grad():
         trainer.set_eval()
+        if hasattr(trainer, "render_each_class"):
+            trainer.render_each_class = True
+        has_road_class = bool(getattr(trainer, "gaussian_classes", None)) and "Road" in trainer.gaussian_classes
         for k, v in novel_image_infos.items():
             if isinstance(v, torch.Tensor):
                 novel_image_infos[k] = v.cuda(non_blocking=True)
@@ -76,6 +91,19 @@ def render_single_offset_novel_view(
                 novel_cam_infos[k] = v.cuda(non_blocking=True)
         novel_outputs = trainer(novel_image_infos, novel_cam_infos, novel_view=True)
         rendered_rgb = novel_outputs["rgb"].detach().cpu()
+        road_mask = None
+        if "Road_opacity" in novel_outputs:
+            road_mask = _to_binary_mask(novel_outputs["Road_opacity"]).detach().cpu()
+        elif not _ROAD_MASK_WARNING_EMITTED:
+            if has_road_class:
+                logger.warning(
+                    "Requested road mask from Road class, but the trainer did not return Road_opacity; road_masks will be None."
+                )
+            else:
+                logger.warning(
+                    "Requested road mask from Road class, but this checkpoint/config has no Road gaussian class; road_masks will be None."
+                )
+            _ROAD_MASK_WARNING_EMITTED = True
 
     logger.info(
         f"Rendered one novel view from cam0 reference frame {reference_frame_idx} "
@@ -86,6 +114,7 @@ def render_single_offset_novel_view(
         "rendered_rgb": rendered_rgb.cpu(),
         "reference_rgb": ref_image_infos["pixels"].detach().cpu(),
         "alpha_mask": novel_outputs["opacity"].detach().cpu(),
+        "road_masks": road_mask,
         "novel_c2w": novel_c2w.detach().cpu(),
         "intrinsics": intrinsics.detach().cpu(),
     }

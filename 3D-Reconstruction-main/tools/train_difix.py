@@ -7,6 +7,7 @@ import random
 import imageio
 import logging
 import argparse
+import math
 
 import torch
 from tools.eval import do_evaluation, apply_render_frame_limit
@@ -152,6 +153,30 @@ def build_dataset(data):
     return dataset
 
 
+def sanitize_broken_models(trainer, reason: str) -> int:
+    """Remove partially initialized models that break resume/save flows."""
+    removable = []
+    for class_name, model in list(trainer.models.items()):
+        try:
+            model.get_param_groups()
+            model.state_dict()
+        except Exception as model_err:
+            logger.warning(
+                "Removing model '%s' during %s due to invalid state: %s",
+                class_name,
+                reason,
+                model_err,
+            )
+            removable.append(class_name)
+
+    for class_name in removable:
+        trainer.models.pop(class_name, None)
+        if class_name in trainer.gaussian_classes:
+            trainer.gaussian_classes.pop(class_name, None)
+
+    return len(removable)
+
+
 def build_trainer(dataset, cfg, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # setup trainer
@@ -167,17 +192,29 @@ def build_trainer(dataset, cfg, args):
     )
 
     # initialize gaussians
-    if args.resume_from is not None:
-        trainer.resume_from_checkpoint(ckpt_path=args.resume_from, load_only_model=True)
-        logger.info(f"Resuming training from {args.resume_from}, starting at step {trainer.step}")
+    resume_ckpt_path = args.resume_workflow_from if args.resume_workflow_from is not None else args.resume_from
+    if resume_ckpt_path is not None:
+        trainer.resume_from_checkpoint(ckpt_path=resume_ckpt_path, load_only_model=True)
+        logger.info(f"Resuming training from {resume_ckpt_path}, starting at step {trainer.step}")
     else:
         trainer.init_gaussians_from_dataset(dataset=dataset)
         logger.info(f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}")
 
     if args.enable_viewer:
         trainer.init_viewer(port=args.viewer_port)
-        
-    trainer.initialize_optimizer()
+
+    try:
+        trainer.initialize_optimizer()
+    except AttributeError as e:
+        # Resume checkpoints can omit dynamic node tensors when those nodes were removed.
+        # In that case, drop invalid models and retry optimizer setup.
+        logger.warning(f"Optimizer init failed on first attempt: {e}")
+        removed = sanitize_broken_models(trainer, reason="optimizer init")
+
+        if removed == 0:
+            raise
+
+        trainer.initialize_optimizer()
     return trainer
 
 def setup_render_keys(cfg, dataset):
@@ -314,9 +351,17 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
             wandb.log({k:v.avg for k,v in metric_logger.meters.items()})
 
         # saving
-        do_save = step>0 and ((step%cfg.logging.saveckpt_freq==0) or step==trainer.num_iters) and args.resume_from is None
+        do_save = step > 0 and ((step % cfg.logging.saveckpt_freq == 0) or step == trainer.num_iters)
         if do_save:
-            trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
+            try:
+                trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
+            except AttributeError as e:
+                logger.warning(f"Checkpoint save failed due to model state issue: {e}")
+                removed = sanitize_broken_models(trainer, reason="checkpoint save")
+                if removed == 0:
+                    raise
+                logger.warning("Retrying checkpoint save after removing %d broken models", removed)
+                trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
 
         # cache image errors
         if step>0 and trainer.optim_general.cache_buffer_freq>0 and step%trainer.optim_general.cache_buffer_freq==0:
@@ -346,21 +391,135 @@ def run_evaluation(cfg, dataset, trainer, render_keys, step, args, max_render_fr
         time.sleep(1000000)
 
 
-def render_single_offset_novel_view(dataset, trainer, lateral_offset_m: float):
+def render_single_offset_novel_view(
+    dataset,
+    trainer,
+    lateral_offset_m: float,
+    collision_radius_m: float = 1.0,
+    max_reference_search_tries: int = 32,
+    gaussian_radius_sigma: float = 2.0,
+    gaussian_opacity_threshold: float = 0.01,    max_gaussian_radius: float = 3.0,    min_reference_frame: int = 40,
+):
     # This code should shift the camera left by lateral_offset_m meters.
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
 
-    reference_frame_idx = random.randint(0, len(cam0) - 1)
-    ref_image_infos, ref_cam_infos = cam0.get_image(reference_frame_idx)
+    def _build_novel_camera_from_reference(frame_idx: int):
+        ref_image_infos_local, ref_cam_infos_local = cam0.get_image(frame_idx)
+        ref_c2w_local = cam0.cam_to_worlds[frame_idx].clone()
+        lateral_axis_local = ref_c2w_local[:3, 0]
+        lateral_axis_local = lateral_axis_local / (torch.linalg.norm(lateral_axis_local) + 1e-8)
+        novel_c2w_local = ref_c2w_local.clone()
+        novel_c2w_local[:3, 3] = ref_c2w_local[:3, 3] + lateral_offset_m * lateral_axis_local
 
-    ref_c2w = cam0.cam_to_worlds[reference_frame_idx].clone()
-    lateral_axis = ref_c2w[:3, 0]
-    lateral_axis = lateral_axis / (torch.linalg.norm(lateral_axis) + 1e-8)
-    novel_c2w = ref_c2w.clone()
-    novel_c2w[:3, 3] = ref_c2w[:3, 3] + lateral_offset_m * lateral_axis
+        intrinsics_local = cam0.intrinsics[frame_idx].clone()
+        novel_cam_infos_local = {
+            "cam_id": ref_cam_infos_local["cam_id"],
+            "cam_name": ref_cam_infos_local["cam_name"],
+            "camera_to_world": novel_c2w_local,
+            "height": ref_cam_infos_local["height"],
+            "width": ref_cam_infos_local["width"],
+            "intrinsics": intrinsics_local,
+        }
+        return ref_image_infos_local, ref_cam_infos_local, intrinsics_local, novel_c2w_local, novel_cam_infos_local
 
-    intrinsics = cam0.intrinsics[reference_frame_idx].clone()
+    def _camera_intersects_gaussians(ref_image_infos_local, novel_cam_infos_local, radius_m: float):
+        with torch.no_grad():
+            cam_infos_device = {}
+            for k, v in novel_cam_infos_local.items():
+                if isinstance(v, torch.Tensor):
+                    cam_infos_device[k] = v.to(trainer.device)
+                else:
+                    cam_infos_device[k] = v
+
+            image_ids = ref_image_infos_local["img_idx"]
+            if isinstance(image_ids, torch.Tensor):
+                image_ids = image_ids.to(trainer.device)
+            else:
+                image_ids = torch.tensor(image_ids, device=trainer.device)
+
+            cam_dict = trainer.process_camera(
+                camera_infos=cam_infos_device,
+                image_ids=image_ids,
+                novel_view=True,
+            )
+            gaussians = trainer.collect_gaussians(cam=cam_dict, image_ids=image_ids)
+
+            if gaussians.means.numel() == 0:
+                return False, float("inf")
+
+            camera_center = cam_dict.camtoworlds[:3, 3]
+            if cam_dict.camtoworlds.ndim == 3:
+                camera_center = cam_dict.camtoworlds[0, :3, 3]
+
+            scales = gaussians.scales
+            if scales.ndim == 1:
+                scales = scales[:, None]
+            gaussian_radii = (gaussian_radius_sigma * scales.max(dim=-1).values).clamp(max=max_gaussian_radius)
+
+            opacities = gaussians.opacities
+            if opacities.ndim > 1:
+                opacities = opacities.squeeze(-1)
+            valid_mask = opacities > gaussian_opacity_threshold
+
+            if valid_mask.any():
+                means = gaussians.means[valid_mask]
+                gaussian_radii = gaussian_radii[valid_mask]
+            else:
+                means = gaussians.means
+
+            dists = torch.linalg.norm(means - camera_center[None, :], dim=-1)
+            if gaussian_radii.shape[0] == dists.shape[0]:
+                signed_dists = dists - gaussian_radii
+            else:
+                signed_dists = dists
+
+            min_signed_dist = signed_dists.min().item()
+            return min_signed_dist <= radius_m, min_signed_dist
+
+    total_frames = len(cam0)
+    original_frame_count = int(getattr(dataset, "num_img_timesteps", total_frames))
+    selectable_end = max(1, min(total_frames, original_frame_count))
+    selectable_start = min(min_reference_frame, selectable_end - 1)
+    selectable_pool = list(range(selectable_start, selectable_end))
+    candidate_count = min(max_reference_search_tries, len(selectable_pool))
+    candidate_indices = random.sample(selectable_pool, k=candidate_count)
+
+    selected_candidate = None
+    best_candidate = None
+    best_min_dist = -float("inf")
+    for candidate_idx in candidate_indices:
+        candidate = _build_novel_camera_from_reference(candidate_idx)
+        is_intersecting, min_dist = _camera_intersects_gaussians(
+            ref_image_infos_local=candidate[0],
+            novel_cam_infos_local=candidate[4],
+            radius_m=collision_radius_m,
+        )
+
+        if min_dist > best_min_dist:
+            best_min_dist = min_dist
+            best_candidate = (candidate_idx, candidate)
+
+        if not is_intersecting:
+            selected_candidate = (candidate_idx, candidate)
+            break
+        logger.warning(f"Intersecting candidate frame {candidate_idx} with nearest-gaussian distance {min_dist:.3f}m")
+
+    if selected_candidate is None:
+        selected_candidate = best_candidate
+        logger.warning(
+            "All %d candidate reference frames intersected gaussians within radius %.3fm; "
+            "falling back to frame %d with nearest-gaussian distance %.3fm",
+            candidate_count,
+            collision_radius_m,
+            selected_candidate[0],
+            best_min_dist,
+        )
+
+    selected_candidate = (100, _build_novel_camera_from_reference(100)) # TODO This code is a temporary override, to try a simpler diffusion algorithm
+    reference_frame_idx = selected_candidate[0]
+    ref_image_infos, ref_cam_infos, intrinsics, novel_c2w, novel_cam_infos = selected_candidate[1]
+
     H, W = cam0.HEIGHT, cam0.WIDTH
     x, y = torch.meshgrid(
         torch.arange(W, device=cam0.device),
@@ -382,15 +541,6 @@ def render_single_offset_novel_view(dataset, trainer, lateral_offset_m: float):
         "img_idx": ref_image_infos["img_idx"],
         "frame_idx": ref_image_infos["frame_idx"],
     }
-    novel_cam_infos = {
-        "cam_id": ref_cam_infos["cam_id"],
-        "cam_name": ref_cam_infos["cam_name"],
-        "camera_to_world": novel_c2w,
-        "height": ref_cam_infos["height"],
-        "width": ref_cam_infos["width"],
-        "intrinsics": intrinsics,
-    }
-
     with torch.no_grad():
         trainer.set_eval()
         for k, v in novel_image_infos.items():
@@ -403,7 +553,9 @@ def render_single_offset_novel_view(dataset, trainer, lateral_offset_m: float):
         rendered_rgb = novel_outputs["rgb"].detach().cpu()
 
     logger.info(
-        f"Rendered one novel view from cam0 reference frame {reference_frame_idx} with lateral offset {lateral_offset_m:.3f}m"
+        f"Rendered one novel view from cam0 reference frame {reference_frame_idx} "
+        f"with lateral offset {lateral_offset_m:.3f}m and collision radius {collision_radius_m:.3f}m "
+        f"(gaussian_sigma={gaussian_radius_sigma:.2f}, max_gaussian_radius={max_gaussian_radius:.2f}m, opacity_thresh={gaussian_opacity_threshold:.3f})"
     )
     return {
         "reference_frame_idx": reference_frame_idx,
@@ -481,29 +633,57 @@ def main(args):
     trainer = build_trainer(dataset, cfg, args)
     # Prepare the list of keys (list of strings) that will be rendered/visualized during training
     render_keys = setup_render_keys(cfg, dataset)
-    # Run the main training loop: forward/backward passes, logging, saving, and optional visualization
-    # Returns the last training step (int)
-    step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+    # Run the base training stage unless checkpoint step already passed it.
+    base_training_iters = int(cfg.trainer.optim.num_iters)
+    if trainer.step < base_training_iters:
+        trainer.num_iters = base_training_iters
+        step = run_training_loop(cfg, dataset, trainer, render_keys, args)
+    else:
+        step = trainer.step
+        logger.info(
+            "Skipping base training loop because checkpoint step %d already reached/passed base target %d",
+            step,
+            base_training_iters,
+        )
 
-    lateral_offset_m = 5
-    lateral_offset_max = 7 # We will iterate towards this value
-    num_iterations_refine = 750
+    lateral_offset_m = 0.5
+    lateral_offset_max = 3 # We will iterate towards this value
+    num_iterations_refine = 1000
     synthetic_images = 100
     lateral_offset_incremenet = (lateral_offset_max - lateral_offset_m) / max(synthetic_images - 1, 1)
 
-    for _ in range(synthetic_images):
+    start_synth_round = 0
+    if step > base_training_iters:
+        synth_progress = step - base_training_iters
+        start_synth_round = min(synthetic_images, math.ceil(synth_progress / num_iterations_refine))
+        if synth_progress % num_iterations_refine != 0:
+            logger.warning(
+                "Checkpoint step %d is mid-refinement stage; resuming from synthetic round %d using step as reference",
+                step,
+                start_synth_round,
+            )
+        else:
+            logger.info(
+                "Recovered workflow progress from checkpoint step %d: starting at synthetic round %d/%d",
+                step,
+                start_synth_round,
+                synthetic_images,
+            )
+
+    for synth_round in range(start_synth_round, synthetic_images):
+        current_lateral_offset = lateral_offset_m + synth_round * lateral_offset_incremenet
         novel_sample = render_single_offset_novel_view(
             dataset=dataset,
             trainer=trainer,
-            lateral_offset_m=-lateral_offset_m,
+            lateral_offset_m=-current_lateral_offset,
         )
         novel_rgb = novel_sample["rendered_rgb"]
         reference_rgb = novel_sample["reference_rgb"]
         print(f"Novel RGB shape: {novel_rgb.shape}, Reference RGB shape: {reference_rgb.shape}")
         repaired_image = difix_repair(tensor_to_image(novel_rgb), tensor_to_image(reference_rgb))
-        if step % 500 == 0:
+        if True:
             # Save repaied image for inspection
-            repaired_image.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"repaired_{step}.png"))
+            repaired_image.save(os.path.join(cfg.log_dir, "synthetic_image_samples", f"repaired_{step}_ref_{novel_sample['reference_frame_idx']}.png"))
 
         repaired_tensor = image_to_tensor(repaired_image).permute(1,2,0) # H, W, C
         novel_sample["rendered_rgb"] = repaired_tensor.to(novel_rgb.device)
@@ -519,7 +699,6 @@ def main(args):
             f"(from step {trainer.step} to {trainer.num_iters})"
         )
         step = run_training_loop(cfg, dataset, trainer, render_keys, args)
-        lateral_offset_m += lateral_offset_incremenet
 
     # Perform final evaluation (no return value) and optionally start the viewer for inspection
     run_evaluation(
@@ -549,6 +728,12 @@ if __name__ == "__main__":
         "--resume_from",
         default=None,
         help="path to checkpoint to resume from",
+        type=str,
+    )
+    parser.add_argument(
+        "--resume_workflow_from",
+        default=None,
+        help="path to checkpoint to resume full DiFix workflow progress from checkpoint step",
         type=str,
     )
     parser.add_argument(
