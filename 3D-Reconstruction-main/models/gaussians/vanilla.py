@@ -59,6 +59,7 @@ class VanillaGaussians(nn.Module):
         self._opacities = torch.zeros(1, 1, device=self.device)
         self._features_dc = torch.zeros(1, 3, device=self.device)
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)
+        self.surface_normal_lock = None
         
     @property
     def sh_degree(self):
@@ -135,6 +136,38 @@ class VanillaGaussians(nn.Module):
     
     def quat_act(self, x: torch.Tensor) -> torch.Tensor:
         return x / x.norm(dim=-1, keepdim=True)
+
+    def set_surface_normal_lock(self, normal: torch.Tensor) -> None:
+        if normal is None:
+            self.surface_normal_lock = None
+            return
+        normal = normal.to(self.device).float()
+        self.surface_normal_lock = normal / normal.norm().clamp_min(1e-8)
+
+    def _apply_surface_normal_lock(self, quats: torch.Tensor) -> torch.Tensor:
+        if self.surface_normal_lock is None:
+            return quats
+
+        n = self.surface_normal_lock[None, :].expand(quats.shape[0], -1)
+        rots = quat_to_rotmat(quats)
+
+        x_axis = rots[..., :, 0]
+        x_proj = x_axis - (x_axis * n).sum(dim=-1, keepdim=True) * n
+
+        y_axis = rots[..., :, 1]
+        y_proj = y_axis - (y_axis * n).sum(dim=-1, keepdim=True) * n
+
+        x_proj_norm = x_proj.norm(dim=-1, keepdim=True)
+        y_proj_norm = y_proj.norm(dim=-1, keepdim=True)
+        use_y = (x_proj_norm.squeeze(-1) < 1e-6) & (y_proj_norm.squeeze(-1) > 1e-6)
+        x_proj = torch.where(use_y[:, None], y_proj, x_proj)
+
+        x_proj = x_proj / x_proj.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        y_new = torch.cross(n, x_proj, dim=-1)
+        y_new = y_new / y_new.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        locked_rots = torch.stack([x_proj, y_new, n], dim=-1)
+        return matrix_to_quaternion(locked_rots)
     
     def preprocess_per_train_step(self, step: int):
         self.step = step
@@ -374,6 +407,7 @@ class VanillaGaussians(nn.Module):
         activated_opacities = self.get_opacity
         activated_scales = self.get_scaling
         activated_rotations = self.get_quats
+        activated_rotations = self._apply_surface_normal_lock(activated_rotations)
         actovated_colors = rgbs
         
         # collect gaussians information

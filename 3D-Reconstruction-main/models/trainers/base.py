@@ -22,9 +22,10 @@ logger = logging.getLogger()
 
 class GSModelType(IntEnum):
     Background = 0
-    RigidNodes = 1
-    SMPLNodes = 2
-    DeformableNodes = 3
+    Road = 1
+    RigidNodes = 2
+    SMPLNodes = 3
+    DeformableNodes = 4
 
 def lr_scheduler_fn(
     cfg: OmegaConf,
@@ -105,6 +106,9 @@ class BasicTrainer(nn.Module):
         self._init_models()
         self.pts_labels = None # will be overwritten in forward
         self.render_dynamic_mask = False
+        self.gaussian_count_log_interval = int(
+            self.optim_general.get("gaussian_count_log_interval", 500)
+        )
         
         # init losses fn
         self._init_losses()
@@ -269,6 +273,13 @@ class BasicTrainer(nn.Module):
         for class_name in self.gaussian_classes.keys():
             self.models[class_name].preprocess_per_train_step(step)
 
+        if self.gaussian_count_log_interval > 0 and (
+            step == 0
+            or step % self.gaussian_count_log_interval == 0
+            or step == self.num_iters
+        ):
+            self.log_gaussian_count(prefix=f"Gaussian counts @ step {step}")
+
         # viewer
         if self.viewer is not None:
             while self.viewer.state.status == "paused":
@@ -368,7 +379,10 @@ class BasicTrainer(nn.Module):
         # get the class labels
         self.pts_labels = gs_dict.pop("class_labels")
         if self.render_dynamic_mask:
-            self.dynamic_pts_mask = (self.pts_labels != 0).float()
+            static_mask = self.pts_labels == self.gaussian_classes["Background"]
+            if "Road" in self.gaussian_classes:
+                static_mask = static_mask | (self.pts_labels == self.gaussian_classes["Road"])
+            self.dynamic_pts_mask = (~static_mask).float()
 
         gaussians = dataclass_gs(
             _means=gs_dict["_means"],
@@ -529,11 +543,21 @@ class BasicTrainer(nn.Module):
             valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()
         else:
             valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
+
+        # if "alpha_mask" in image_infos:
+        #     alpha = image_infos["alpha_mask"]
+        #     if alpha.ndim == 3 and alpha.shape[-1] == 1:
+        #         alpha = alpha.squeeze(-1)
+        #     alpha_mask_thresh = (alpha >= 0.5).float() # Ignore pixels with alpha < 0.5
+        #     valid_loss_mask = valid_loss_mask * alpha_mask_thresh
             
         gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
         predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
         
-        gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask
+        gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float()
+        if "road_masks" in image_infos:
+            gt_occupied_mask = gt_occupied_mask - image_infos["road_masks"].float()
+        gt_occupied_mask = gt_occupied_mask.clamp(min=0.0, max=1.0) * valid_loss_mask
         pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
         
         # rgb loss
@@ -543,6 +567,18 @@ class BasicTrainer(nn.Module):
             "rgb_loss": self.losses_dict.rgb.w * Ll1,
             "ssim_loss": self.losses_dict.ssim.w * simloss,
         })
+
+        # road-specific loss
+        road_region_weighted_losses = self.losses_dict.get("road_region", None)
+        if road_region_weighted_losses is not None and "road_masks" in image_infos and "Road_rgb" in outputs:
+            road_valid_mask = image_infos["road_masks"].float() * valid_loss_mask
+            if road_valid_mask.sum() > 0:
+                road_gt_rgb = image_infos["pixels"] * road_valid_mask[..., None]
+                road_pred_rgb = outputs["Road_rgb"] * road_valid_mask[..., None]
+                road_l1 = torch.abs(road_gt_rgb - road_pred_rgb).sum() / (road_valid_mask.sum() * 3.0)
+                loss_dict.update({
+                    "road_region_rgb_loss": road_region_weighted_losses.w * road_l1,
+                })
         
         # mask loss
         if self.sky_opacity_loss_fn is not None:
@@ -632,8 +668,16 @@ class BasicTrainer(nn.Module):
     def get_gaussian_count(self):
         num_dict = {}
         for class_name in self.gaussian_classes.keys():
-            num_dict[class_name] = self.models[class_name].num_points
+            num_dict[class_name] = int(self.models[class_name].num_points)
         return num_dict
+
+    def log_gaussian_count(self, prefix: str = "Gaussian counts") -> None:
+        num_dict = self.get_gaussian_count()
+        if len(num_dict) == 0:
+            logger.info(f"{prefix}: no gaussian classes")
+            return
+        counts_str = ", ".join(f"{k}={v}" for k, v in num_dict.items())
+        logger.info(f"{prefix}: {counts_str}")
     
     def state_dict(self, only_model: bool = True):
         state_dict = super().state_dict()
@@ -684,6 +728,7 @@ class BasicTrainer(nn.Module):
             logger.info(f"{class_name}: {msg}")
         msg = super().load_state_dict(state_dict, strict)
         logger.info(f"BasicTrainer: {msg}")
+        self.log_gaussian_count(prefix=f"Gaussian counts after checkpoint load @ step {self.step}")
         
     def resume_from_checkpoint(
         self,
