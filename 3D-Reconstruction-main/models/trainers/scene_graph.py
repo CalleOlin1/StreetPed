@@ -138,6 +138,7 @@ class MultiTrainer(BasicTrainer):
             if class_name in ("Background", "Road"):
                 # ------ initialize gaussians ------
                 init_cfg = model_cfg.pop("init")
+                strict_mask_only = bool(init_cfg.get("strict_mask_only", class_name == "Road"))
                 # sample points from the lidar point clouds
                 if init_cfg.get("from_lidar", None) is not None:
                     candidate_indices = None
@@ -184,14 +185,34 @@ class MultiTrainer(BasicTrainer):
                         return_color=True,
                         device=self.device,
                     )
-                    if road_mask_pts.shape[0] >= 3:
-                        sampled_pts = road_mask_pts
-                        sampled_color = road_mask_colors
-                    else:
+                    sampled_pts = road_mask_pts
+                    sampled_color = road_mask_colors
+                    if strict_mask_only:
+                        logger.info(
+                            "Road strict_mask_only enabled: using only road-mask LiDAR seeds (%d pts)",
+                            int(road_mask_pts.shape[0]),
+                        )
+                    elif road_mask_pts.shape[0] < 3 and init_cfg.get("from_lidar", None) is not None:
                         logger.warning(
                             "Road mask LiDAR seed is too small (%d pts), falling back to generic LiDAR seeds",
                             int(road_mask_pts.shape[0]),
                         )
+                        sampled_pts, sampled_color, _ = dataset.get_lidar_samples(
+                            **init_cfg.from_lidar,
+                            candidate_indices=None,
+                            device=self.device,
+                        )
+                    elif road_mask_pts.shape[0] < 3:
+                        logger.warning(
+                            "Road mask LiDAR seed is too small (%d pts) and no from_lidar fallback is configured",
+                            int(road_mask_pts.shape[0]),
+                        )
+
+                    # Gaussian init needs >=3 points for nearest-neighbor scale estimation.
+                    if sampled_pts.shape[0] > 0 and sampled_pts.shape[0] < 3:
+                        repeat_count = 3 - sampled_pts.shape[0]
+                        sampled_pts = torch.cat([sampled_pts, sampled_pts[:1].repeat(repeat_count, 1)], dim=0)
+                        sampled_color = torch.cat([sampled_color, sampled_color[:1].repeat(repeat_count, 1)], dim=0)
 
                 road_lidar_pts = sampled_pts if class_name == "Road" else None
 
@@ -213,7 +234,9 @@ class MultiTrainer(BasicTrainer):
                         uniform_sample_sphere(num_far_pts, self.device, inverse=True)
                     )
 
-                if num_near_pts + num_far_pts > 0:
+                if class_name == "Road" and strict_mask_only and (num_near_pts + num_far_pts > 0):
+                    logger.info("Road strict_mask_only enabled: skipping near/far random seed points")
+                elif num_near_pts + num_far_pts > 0:
                     random_pts = torch.cat(random_pts, dim=0)
                     random_pts = random_pts * self.scene_radius + self.scene_origin
                     visible_mask = dataset.check_pts_visibility(random_pts)
@@ -235,6 +258,15 @@ class MultiTrainer(BasicTrainer):
                     seed_colors=sampled_color,
                     valid_instances_dict=allnode_pts_dict,
                 )
+
+                if processed_init_pts["pts"].shape[0] < 3:
+                    empty = True
+                    logger.warning(
+                        "%s init has too few points after filtering (%d), skipping class",
+                        class_name,
+                        int(processed_init_pts["pts"].shape[0]),
+                    )
+                    continue
 
                 model.create_from_pcd(
                     init_means=processed_init_pts["pts"],
@@ -358,6 +390,13 @@ class MultiTrainer(BasicTrainer):
             outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]),
             image_infos,
         )
+
+        if self.training and "Background" in self.gaussian_classes and "sky_masks" in image_infos:
+            gaussian_mask = self.pts_labels == self.gaussian_classes["Background"]
+            bg_rgb, bg_depth, bg_opacity = render_fn(gaussian_mask)
+            outputs["Background_rgb"] = self.affine_transformation(bg_rgb, image_infos)
+            outputs["Background_opacity"] = bg_opacity
+            outputs["Background_depth"] = bg_depth
 
         if self.training and "Road" in self.gaussian_classes and "road_masks" in image_infos:
             gaussian_mask = self.pts_labels == self.gaussian_classes["Road"]
