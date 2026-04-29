@@ -96,6 +96,165 @@ class MultiTrainer(BasicTrainer):
         if abs(normal[2].item()) > 1e-6 and normal[2] < 0:
             normal = -normal
         return normal
+        
+    def reinit_road_gaussians_from_dataset(self, dataset: DrivingDataset) -> None:
+        """
+        Reinitialise ONLY the Road Gaussians from scratch using the same logic
+        as init_gaussians_from_dataset (Road branch).
+        """
+
+        if "Road" not in self.gaussian_classes:
+            logger.warning("Road class not found in gaussian_classes; skipping reinit.")
+            return
+
+        model_cfg = self.model_config["Road"]
+        model = self.models["Road"]
+
+        # Optional: fully reset model state if supported
+        if hasattr(model, "reset"):
+            model.reset()
+
+        init_cfg = model_cfg["init"]
+        strict_mask_only = bool(init_cfg.get("strict_mask_only", True))
+
+        # ---------------- lidar sampling ----------------
+        candidate_indices = None
+        sampled_pts, sampled_color, sampled_time = (
+            torch.empty(0, 3).to(self.device),
+            torch.empty(0, 3).to(self.device),
+            None,
+        )
+
+        if init_cfg.get("from_lidar", None) is not None:
+            sampled_pts, sampled_color, sampled_time = dataset.get_lidar_samples(
+                **init_cfg.from_lidar,
+                candidate_indices=candidate_indices,
+                device=self.device,
+            )
+
+        # ---------------- road mask sampling ----------------
+        requested_num_samples = sampled_pts.shape[0]
+        if init_cfg.get("from_lidar", None) is not None:
+            requested_num_samples = int(init_cfg.from_lidar.get(
+                "num_samples", requested_num_samples
+            ))
+
+        road_mask_pts, road_mask_colors = dataset.get_lidar_points_from_mask_region(
+            mask_attr="road_masks",
+            num_samples=requested_num_samples,
+            return_color=True,
+            device=self.device,
+        )
+
+        sampled_pts = road_mask_pts
+        sampled_color = road_mask_colors
+
+        if strict_mask_only:
+            logger.info(
+                "Road strict_mask_only enabled: using only road-mask LiDAR seeds (%d pts)",
+                int(road_mask_pts.shape[0]),
+            )
+        elif road_mask_pts.shape[0] < 3 and init_cfg.get("from_lidar", None) is not None:
+            logger.warning(
+                "Road mask LiDAR seed too small (%d pts), falling back to generic LiDAR seeds",
+                int(road_mask_pts.shape[0]),
+            )
+            sampled_pts, sampled_color, _ = dataset.get_lidar_samples(
+                **init_cfg.from_lidar,
+                candidate_indices=None,
+                device=self.device,
+            )
+
+        # ensure >= 3 points for scale estimation
+        if sampled_pts.shape[0] > 0 and sampled_pts.shape[0] < 3:
+            repeat_count = 3 - sampled_pts.shape[0]
+            sampled_pts = torch.cat(
+                [sampled_pts, sampled_pts[:1].repeat(repeat_count, 1)], dim=0
+            )
+            sampled_color = torch.cat(
+                [sampled_color, sampled_color[:1].repeat(repeat_count, 1)], dim=0
+            )
+
+        road_lidar_pts = sampled_pts
+
+        # ---------------- random sampling ----------------
+        random_pts = []
+        num_near_pts = init_cfg.get("near_randoms", 0)
+        if num_near_pts > 0:
+            num_near_pts *= 3
+            random_pts.append(uniform_sample_sphere(num_near_pts, self.device))
+
+        num_far_pts = init_cfg.get("far_randoms", 0)
+        if num_far_pts > 0:
+            num_far_pts *= 3
+            random_pts.append(
+                uniform_sample_sphere(num_far_pts, self.device, inverse=True)
+            )
+
+        if len(random_pts) > 0:
+            random_pts = torch.cat(random_pts, dim=0)
+            random_pts = random_pts * self.scene_radius + self.scene_origin
+
+            visible_mask = dataset.check_pts_visibility(random_pts)
+            valid_pts = random_pts[visible_mask]
+
+            sampled_pts = torch.cat([sampled_pts, valid_pts], dim=0)
+            sampled_color = torch.cat(
+                [
+                    sampled_color,
+                    torch.rand(valid_pts.shape).to(self.device),
+                ],
+                dim=0,
+            )
+
+        # ---------------- filtering ----------------
+        processed_init_pts = dataset.filter_pts_in_boxes(
+            seed_pts=sampled_pts,
+            seed_colors=sampled_color,
+            valid_instances_dict={},  # Road has no instance filtering
+        )
+
+        if processed_init_pts["pts"].shape[0] < 3:
+            logger.warning(
+                "Road reinit has too few points (%d), aborting",
+                int(processed_init_pts["pts"].shape[0]),
+            )
+            return
+
+        # ---------------- create gaussians ----------------
+        model.create_from_pcd(
+            init_means=processed_init_pts["pts"],
+            init_colors=processed_init_pts["colors"],
+        )
+
+        # ---------------- surface normal lock ----------------
+        if hasattr(model, "set_surface_normal_lock"):
+            requested_num_samples = 200000
+            if init_cfg.get("from_lidar", None) is not None:
+                requested_num_samples = int(
+                    init_cfg.from_lidar.get("num_samples", requested_num_samples)
+                )
+
+            road_normal_pts = dataset.get_lidar_points_from_mask_region(
+                mask_attr="road_masks",
+                num_samples=min(requested_num_samples, 200000),
+                device=self.device,
+            )
+
+            if road_normal_pts is None or road_normal_pts.shape[0] < 3:
+                road_normal_pts = road_lidar_pts
+
+            road_normal = self._estimate_ground_normal_from_lidar(road_normal_pts)
+
+            if road_normal is not None:
+                model.set_surface_normal_lock(road_normal)
+                logger.info(
+                    "Reinitialised Road surface-normal lock from %d points: %s",
+                    int(road_normal_pts.shape[0]) if road_normal_pts is not None else 0,
+                    road_normal.detach().cpu().tolist(),
+                )
+
+        logger.info("Reinitialised Road gaussians from dataset")
 
     def init_gaussians_from_dataset(
         self,
@@ -137,7 +296,7 @@ class MultiTrainer(BasicTrainer):
             empty = False
             if class_name in ("Background", "Road"):
                 # ------ initialize gaussians ------
-                init_cfg = model_cfg.pop("init")
+                init_cfg = model_cfg.get("init")
                 strict_mask_only = bool(init_cfg.get("strict_mask_only", class_name == "Road"))
                 # sample points from the lidar point clouds
                 if init_cfg.get("from_lidar", None) is not None:

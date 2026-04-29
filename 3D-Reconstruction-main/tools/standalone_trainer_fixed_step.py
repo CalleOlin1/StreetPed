@@ -391,6 +391,7 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
     metrics_file = os.path.join(cfg.log_dir, "metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     all_iters = np.arange(trainer.step, trainer.num_iters + 1)
+    road_preview_freq = 3000
 
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
         # training step
@@ -425,7 +426,7 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
         metric_logger.update(**{"train_stats/gaussian_num_"+k:v for k,v in trainer.get_gaussian_count().items()})
         metric_logger.update(**{"losses/"+k:v.item() for k,v in loss_dict.items()})
         metric_logger.update(**{"train_stats/lr_"+group["name"]:group["lr"] for group in trainer.optimizer.param_groups})
-
+ 
         if args.enable_wandb:
             wandb.log({k:v.avg for k,v in metric_logger.meters.items()})
 
@@ -441,6 +442,9 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
                     raise
                 logger.warning("Retrying checkpoint save after removing %d broken models", removed)
                 trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
+
+        if step > 0 and step % road_preview_freq == 0:
+            save_road_reference_preview(dataset, trainer, cfg.log_dir, args)
 
         # cache image errors
         if step>0 and trainer.optim_general.cache_buffer_freq>0 and step%trainer.optim_general.cache_buffer_freq==0:
@@ -462,6 +466,69 @@ def setup_render_keys(cfg, dataset):
     return render_keys
 
 
+def get_novel_view_quality_dir(ckpt_dir, args):
+    return os.path.join(ckpt_dir, args.novel_view_quality_dir)
+
+
+def save_road_reference_preview(dataset, trainer, ckpt_dir, args):
+    quality_dir = get_novel_view_quality_dir(ckpt_dir, args)
+    os.makedirs(quality_dir, exist_ok=True)
+
+    # Render the reference road class from the same viewpoint as the other images.
+    road_sample = render_single_offset_novel_view(
+        dataset=dataset,
+        trainer=trainer,
+        frame_index=args.ref_frame,
+        lateral_offset_m=0.0,
+    )
+
+    def _save_image_if_present(tensor, filename):
+        if isinstance(tensor, torch.Tensor):
+            img = tensor_to_image(tensor.cpu())
+            img.save(os.path.join(quality_dir, filename))
+
+    _save_image_if_present(
+        road_sample.get("background_rgb", None),
+        f"background_reference_frame{args.ref_frame}_step{trainer.step}.png",
+    )
+    _save_image_if_present(
+        road_sample.get("sky_rgb", None),
+        f"sky_reference_frame{args.ref_frame}_step{trainer.step}.png",
+    )
+    road_rgb = road_sample.get("road_rgb", None)
+    if isinstance(road_rgb, torch.Tensor):
+        road_img = tensor_to_image(road_rgb.cpu())
+        road_img_path = os.path.join(
+            quality_dir,
+            f"road_reference_frame{args.ref_frame}_step{trainer.step}.png",
+        )
+        road_img.save(road_img_path)
+
+    road_model = getattr(trainer, "models", {}).get("Road", None)
+    if road_model is not None:
+        road_points = getattr(road_model, "means", None)
+        road_colors = getattr(road_model, "colors", None)
+        if road_points is None and hasattr(road_model, "_means"):
+            road_points = road_model._means.detach()
+        if road_colors is None and hasattr(road_model, "_features_dc"):
+            try:
+                road_colors = road_model.colors
+            except Exception:
+                road_colors = None
+
+        if isinstance(road_points, torch.Tensor):
+            road_npz_path = os.path.join(
+                quality_dir,
+                f"road_reference_frame{args.ref_frame}_step{trainer.step}.npz",
+            )
+            road_npz = {
+                "points": road_points.detach().cpu().numpy(),
+            }
+            if isinstance(road_colors, torch.Tensor):
+                road_npz["colors"] = road_colors.detach().cpu().numpy()
+            np.savez_compressed(road_npz_path, **road_npz)
+
+
 def train_from_scratch(cfg, ckpt_path, args):
     # Build dataset from config
     dataset = DrivingDataset(cfg.data)
@@ -470,12 +537,17 @@ def train_from_scratch(cfg, ckpt_path, args):
     trainer.num_train_images = len(dataset.train_image_set)
     step = trainer.step
 
+    save_road_reference_preview(dataset, trainer, os.path.dirname(ckpt_path), args)
+
     trainer.num_iters = trainer.step + args.split_steps
     run_training_loop(cfg, dataset, trainer, render_keys, args)
     # Save checkpoint
+    # trainer.reinit_road_gaussians_from_dataset(dataset=dataset) # Reset before saving (might improve performance)
     trainer.save_checkpoint(log_dir=os.path.dirname(ckpt_path), save_only_model=True, is_final=False)
     with open(args.output_path, "wb") as f:
         pickle.dump({"status": "done"}, f)
+        
+    save_road_reference_preview(dataset, trainer, os.path.dirname(ckpt_path), args)
 
 
 def cli_start_training():
@@ -543,6 +615,9 @@ def cli_start_training():
     trainer.num_train_images = len(dataset.train_image_set)
     trainer.num_iters = trainer.step + args.split_steps
     print(f"Training on synthetic + ground truth images for {args.split_steps} steps...")
+
+    save_road_reference_preview(dataset, trainer, ckpt_dir, args)
+
     run_training_loop(cfg, dataset, trainer, render_keys, args)
 
     # 4. Save checkpoint
@@ -557,7 +632,7 @@ def cli_start_training():
     )
     eval_rgb = eval_sample["rendered_rgb"]
     # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
+    quality_dir = get_novel_view_quality_dir(ckpt_dir, args)
     os.makedirs(quality_dir, exist_ok=True)
     eval_raw_image = tensor_to_image(eval_rgb.cpu())
     novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{args.lateral_offset}_step{trainer.step}.png")
@@ -571,7 +646,7 @@ def cli_start_training():
     )
     eval_rgb = eval_sample["rendered_rgb"]
     # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
+    quality_dir = get_novel_view_quality_dir(ckpt_dir, args)
     os.makedirs(quality_dir, exist_ok=True)
     eval_raw_image = tensor_to_image(eval_rgb.cpu())
     novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{-args.lateral_offset}_step{trainer.step}.png")
@@ -585,7 +660,7 @@ def cli_start_training():
     )
     eval_rgb = eval_sample["rendered_rgb"]
     # Save only the rendered novel view image
-    quality_dir = os.path.join(ckpt_dir, "novel_view_quality")
+    quality_dir = get_novel_view_quality_dir(ckpt_dir, args)
     os.makedirs(quality_dir, exist_ok=True)
     eval_raw_image = tensor_to_image(eval_rgb.cpu())
     novel_view_img_path = os.path.join(quality_dir, f"novelview_frame{args.ref_frame}_offset{args.lateral_offset/2}_step{trainer.step}.png")

@@ -344,7 +344,8 @@ def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_latera
 
     # Logging and update samples
     for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask, road_mask) in enumerate(zip(batch_results, novel_imgs, repaired_images, sky_masks, road_masks)):
-        log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
+        if i % 10 == 0:
+            log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
         # Convert repaired_image (PIL) back to numpy array (normalized float32, CHW)
         repaired_array = image_to_array(repaired_image, normalize=True)
         novel_sample["rendered_rgb"] = repaired_array

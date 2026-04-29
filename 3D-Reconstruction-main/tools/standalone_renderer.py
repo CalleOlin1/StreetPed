@@ -91,6 +91,11 @@ def render_single_offset_novel_view(
                 novel_cam_infos[k] = v.cuda(non_blocking=True)
         novel_outputs = trainer(novel_image_infos, novel_cam_infos, novel_view=True)
         rendered_rgb = novel_outputs["rgb"].detach().cpu()
+        background_rgb = novel_outputs.get("Background_rgb", None)
+        sky_rgb = novel_outputs.get("rgb_sky", None)
+        road_rgb = novel_outputs.get("Road_rgb", None)
+        road_depth = novel_outputs.get("Road_depth", None)
+        road_opacity = novel_outputs.get("Road_opacity", None)
         road_mask = None
         if "Road_opacity" in novel_outputs:
             road_mask = _to_binary_mask(novel_outputs["Road_opacity"]).detach().cpu()
@@ -112,6 +117,11 @@ def render_single_offset_novel_view(
     return {
         "reference_frame_idx": reference_frame_idx,
         "rendered_rgb": rendered_rgb.cpu(),
+        "background_rgb": background_rgb.detach().cpu() if isinstance(background_rgb, torch.Tensor) else None,
+        "sky_rgb": sky_rgb.detach().cpu() if isinstance(sky_rgb, torch.Tensor) else None,
+        "road_rgb": road_rgb.detach().cpu() if isinstance(road_rgb, torch.Tensor) else None,
+        "road_depth": road_depth.detach().cpu() if isinstance(road_depth, torch.Tensor) else None,
+        "road_opacity": road_opacity.detach().cpu() if isinstance(road_opacity, torch.Tensor) else None,
         "reference_rgb": ref_image_infos["pixels"].detach().cpu(),
         "alpha_mask": novel_outputs["opacity"].detach().cpu(),
         "road_masks": road_mask,

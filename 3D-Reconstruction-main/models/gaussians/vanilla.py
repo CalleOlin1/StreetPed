@@ -168,6 +168,22 @@ class VanillaGaussians(nn.Module):
 
         locked_rots = torch.stack([x_proj, y_new, n], dim=-1)
         return matrix_to_quaternion(locked_rots)
+
+    def enforce_surface_normal_lock_(self) -> None:
+        """Project stored quaternions to the surface-normal lock manifold in place.
+
+        This keeps parameters consistent with the locked forward model while preserving
+        yaw (rotation around the locked normal) encoded in the current quaternion.
+        """
+        if self.surface_normal_lock is None:
+            return
+        with torch.no_grad():
+            normalized_quats = self.quat_act(self._quats.detach())
+            locked_quats = self._apply_surface_normal_lock(normalized_quats)
+            self._quats.data.copy_(locked_quats)
+
+    def enforce_scale_limits_(self) -> None:
+        pass
     
     def preprocess_per_train_step(self, step: int):
         self.step = step
