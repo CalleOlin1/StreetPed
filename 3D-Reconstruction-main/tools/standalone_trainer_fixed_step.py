@@ -96,6 +96,7 @@ def _stack_field_for_samples(
     samples,
     field_name: str,
     required: bool,
+    is_synthetic_mask: bool = False,
 ):
     blocks = []
     for sample in samples:
@@ -104,7 +105,13 @@ def _stack_field_for_samples(
         if value is None:
             if required:
                 raise KeyError(f"Synthetic sample missing required field '{field_name}'")
-            blocks.append(base_tensor[ref_idx:ref_idx + 1].clone())
+            if is_synthetic_mask:
+                # For synthetic samples, do NOT clone misaligned reference-frame masks.
+                # Novel-view pixels don't correspond to reference-frame class masks.
+                # Use zeros instead to avoid incorrect supervision.
+                blocks.append(torch.zeros_like(base_tensor[ref_idx:ref_idx + 1]))
+            else:
+                blocks.append(base_tensor[ref_idx:ref_idx + 1].clone())
         else:
             blocks.append(_coerce_to_base_layout(value, base_tensor, field_name))
     return torch.cat(blocks, dim=0)
@@ -132,12 +139,60 @@ def sanitize_broken_models(trainer, reason: str) -> int:
 
     return len(removable)
 
-def integrate_synthetic_samples(dataset, synthetic_samples):
+
+def freeze_trainer_to_selected_object(trainer, object_type: str, object_id: int) -> None:
+    if object_type != "rigid":
+        raise NotImplementedError("train_vehicles only supports rigid objects.")
+
+    frozen_classes = [class_name for class_name in trainer.models.keys() if class_name != "RigidNodes"]
+    if hasattr(trainer, "set_frozen_model_classes"):
+        trainer.set_frozen_model_classes(frozen_classes)
+    else:
+        for class_name, model in trainer.models.items():
+            is_frozen = class_name in frozen_classes
+            for param in model.parameters():
+                param.requires_grad_(not is_frozen)
+            if is_frozen:
+                model.eval()
+
+    rigid_model = trainer.models.get("RigidNodes", None)
+    if rigid_model is None:
+        raise ValueError("RigidNodes model is required to train a selected rigid object.")
+    if not hasattr(rigid_model, "freeze_to_instance"):
+        raise AttributeError("RigidNodes model does not support instance freezing.")
+
+    rigid_model.freeze_to_instance(object_id)
+
+    if hasattr(rigid_model, "ctrl_cfg") and rigid_model.ctrl_cfg is not None:
+        rigid_model.ctrl_cfg.warmup_steps = int(1e12)
+
+def integrate_synthetic_samples(dataset, synthetic_samples, synthetic_ratio: float = 1.0):
+    """
+    Integrate synthetic samples into the dataset.
+    
+    Args:
+        dataset: DrivingDataset instance
+        synthetic_samples: List of synthetic sample dicts
+        synthetic_ratio: Fraction of synthetic samples to keep (0.0 to 1.0).
+                        If < 1.0, randomly samples that fraction.
+    """
     if synthetic_samples is None or len(synthetic_samples) == 0:
         return []
 
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
+
+    # If synthetic_ratio < 1.0, randomly sample the specified fraction
+    if synthetic_ratio < 1.0:
+        num_to_keep = max(1, int(len(synthetic_samples) * synthetic_ratio))
+        sample_indices = torch.randperm(len(synthetic_samples))[:num_to_keep].tolist()
+        synthetic_samples = [synthetic_samples[i] for i in sorted(sample_indices)]
+        logger.info(
+            "Sampling %d/%d synthetic samples (ratio %.2f) for ~70%% real / ~30%% synthetic split",
+            len(synthetic_samples),
+            len(synthetic_samples) + len(cam0),
+            synthetic_ratio,
+        )
 
     # Validate and normalize reference indices once.
     for idx, sample in enumerate(synthetic_samples):
@@ -244,6 +299,8 @@ def integrate_synthetic_samples(dataset, synthetic_samples):
     ]:
         field_data = getattr(cam0, tensor_field, None)
         if field_data is not None:
+            # For mask fields, use is_synthetic_mask=True to avoid misaligned reference-frame masks on novel views
+            is_mask_field = tensor_field in ["dynamic_masks", "human_masks", "vehicle_masks", "sky_masks", "road_masks"]
             appended = _append_block(
                 field_data,
                 _stack_field_for_samples(
@@ -251,6 +308,7 @@ def integrate_synthetic_samples(dataset, synthetic_samples):
                     synthetic_samples,
                     field_name=tensor_field,
                     required=False,
+                    is_synthetic_mask=is_mask_field,
                 ),
             )
             setattr(cam0, tensor_field, appended)
@@ -347,6 +405,13 @@ def build_trainer(dataset, cfg, args, ckpt_to_load=None):
     else:
         trainer.init_gaussians_from_dataset(dataset=dataset)
         logger.info(f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}")
+
+    if getattr(args, "selected_object_id", None) is not None:
+        freeze_trainer_to_selected_object(
+            trainer=trainer,
+            object_type=args.selected_object_type,
+            object_id=args.selected_object_id,
+        )
 
     if args.enable_viewer:
         trainer.init_viewer(port=args.viewer_port)
@@ -578,6 +643,9 @@ def cli_start_training():
     parser.add_argument("--enable_wandb", action="store_true", help="enable wandb logging")
     parser.add_argument("--novel_view_quality_dir", type=str, default="novel_view_quality", help="Directory to save novel view quality results")
     parser.add_argument("--from_scratch", action="store_true", help="Train from scratch")
+    parser.add_argument("--selected_object_type", type=str, default="rigid", choices=["rigid"], help="Type of object to keep trainable")
+    parser.add_argument("--selected_object_id", type=int, default=None, help="Selected object id to keep trainable")
+    parser.add_argument("--synthetic_ratio", type=float, default=1.0, help="Fraction of synthetic samples to use (0.0-1.0). Use ~0.3 for 70%% real / 30%% synthetic split.")
 
     args = parser.parse_args()
 
@@ -608,7 +676,7 @@ def cli_start_training():
 
 
     # Integrate synthetic samples in one shot to avoid repeated tensor reallocation/copy.
-    integrate_synthetic_samples(dataset, synthetic_samples)
+    integrate_synthetic_samples(dataset, synthetic_samples, synthetic_ratio=args.synthetic_ratio)
 
     # Train on both synthetic and ground truth images for split_steps
     trainer = build_trainer(dataset, cfg, args, ckpt_to_load=ckpt_path)

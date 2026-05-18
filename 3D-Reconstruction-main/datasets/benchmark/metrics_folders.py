@@ -20,9 +20,7 @@ import torch
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(

@@ -60,6 +60,8 @@ class VanillaGaussians(nn.Module):
         self._features_dc = torch.zeros(1, 3, device=self.device)
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)
         self.surface_normal_lock = None
+        self._trainable_point_mask = None
+        self._trainable_point_mask_hooks = []
         
     @property
     def sh_degree(self):
@@ -144,6 +146,43 @@ class VanillaGaussians(nn.Module):
         normal = normal.to(self.device).float()
         self.surface_normal_lock = normal / normal.norm().clamp_min(1e-8)
 
+    def _clear_trainable_point_mask_hooks(self) -> None:
+        for handle in self._trainable_point_mask_hooks:
+            handle.remove()
+        self._trainable_point_mask_hooks = []
+
+    def _apply_trainable_point_mask_hooks(self) -> None:
+        self._clear_trainable_point_mask_hooks()
+        if self._trainable_point_mask is None:
+            return
+
+        if self._trainable_point_mask.shape[0] != self.num_points:
+            raise ValueError(
+                f"Trainable point mask has length {self._trainable_point_mask.shape[0]}, expected {self.num_points}"
+            )
+
+        def _mask_grad(grad):
+            if grad is None:
+                return None
+            view = self._trainable_point_mask.to(device=grad.device, dtype=grad.dtype)
+            while view.ndim < grad.ndim:
+                view = view.unsqueeze(-1)
+            return grad * view
+
+        for attr_name in ["_means", "_features_dc", "_features_rest", "_opacities", "_scales", "_quats"]:
+            param = getattr(self, attr_name, None)
+            if isinstance(param, Parameter):
+                self._trainable_point_mask_hooks.append(param.register_hook(_mask_grad))
+
+    def set_trainable_point_mask(self, trainable_mask) -> None:
+        if trainable_mask is None:
+            self._trainable_point_mask = None
+            self._clear_trainable_point_mask_hooks()
+            return
+
+        self._trainable_point_mask = trainable_mask.to(device=self.device, dtype=torch.bool)
+        self._apply_trainable_point_mask_hooks()
+
     def _apply_surface_normal_lock(self, quats: torch.Tensor) -> torch.Tensor:
         if self.surface_normal_lock is None:
             return quats
@@ -183,6 +222,9 @@ class VanillaGaussians(nn.Module):
             self._quats.data.copy_(locked_quats)
 
     def enforce_scale_limits_(self) -> None:
+        pass
+
+    def set_spherical_harmonics_(self, degree=0):
         pass
     
     def preprocess_per_train_step(self, step: int):
