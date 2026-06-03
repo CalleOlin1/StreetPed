@@ -222,7 +222,18 @@ class VanillaGaussians(nn.Module):
             self._quats.data.copy_(locked_quats)
 
     def enforce_scale_limits_(self) -> None:
-        pass
+        if self.surface_normal_lock is None:
+            return
+        if self.ball_gaussians or self._scales.shape[-1] < 3:
+            return
+
+        locked_vertical_scale = float(self.ctrl_cfg.get("locked_vertical_scale", 0.05))
+        locked_vertical_scale = max(locked_vertical_scale, 1e-4)
+
+        with torch.no_grad():
+            self._scales.data[..., 2] = torch.log(
+                torch.full_like(self._scales.data[..., 2], locked_vertical_scale)
+            )
 
     def set_spherical_harmonics_(self, degree=0):
         pass

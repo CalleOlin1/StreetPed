@@ -222,37 +222,15 @@ class MultiTrainer(BasicTrainer):
             return
 
         # ---------------- create gaussians ----------------
+        road_surface_normal = self._estimate_ground_normal_from_lidar(processed_init_pts["pts"])
+        if road_surface_normal is None:
+            road_surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        model.road_surface_normal = road_surface_normal
+
         model.create_from_pcd(
             init_means=processed_init_pts["pts"],
             init_colors=processed_init_pts["colors"],
         )
-
-        # ---------------- surface normal lock ----------------
-        if hasattr(model, "set_surface_normal_lock"):
-            requested_num_samples = 200000
-            if init_cfg.get("from_lidar", None) is not None:
-                requested_num_samples = int(
-                    init_cfg.from_lidar.get("num_samples", requested_num_samples)
-                )
-
-            road_normal_pts = dataset.get_lidar_points_from_mask_region(
-                mask_attr="road_masks",
-                num_samples=min(requested_num_samples, 200000),
-                device=self.device,
-            )
-
-            if road_normal_pts is None or road_normal_pts.shape[0] < 3:
-                road_normal_pts = road_lidar_pts
-
-            road_normal = self._estimate_ground_normal_from_lidar(road_normal_pts)
-
-            if road_normal is not None:
-                model.set_surface_normal_lock(road_normal)
-                logger.info(
-                    "Reinitialised Road surface-normal lock from %d points: %s",
-                    int(road_normal_pts.shape[0]) if road_normal_pts is not None else 0,
-                    road_normal.detach().cpu().tolist(),
-                )
 
         logger.info("Reinitialised Road gaussians from dataset")
 
@@ -427,30 +405,16 @@ class MultiTrainer(BasicTrainer):
                     )
                     continue
 
+                if class_name == "Road":
+                    road_surface_normal = self._estimate_ground_normal_from_lidar(processed_init_pts["pts"])
+                    if road_surface_normal is None:
+                        road_surface_normal = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+                    model.road_surface_normal = road_surface_normal
+
                 model.create_from_pcd(
                     init_means=processed_init_pts["pts"],
                     init_colors=processed_init_pts["colors"],
                 )
-
-                if class_name == "Road" and hasattr(model, "set_surface_normal_lock"):
-                    requested_num_samples = 200000
-                    if init_cfg.get("from_lidar", None) is not None:
-                        requested_num_samples = int(init_cfg.from_lidar.get("num_samples", requested_num_samples))
-                    road_normal_pts = dataset.get_lidar_points_from_mask_region(
-                        mask_attr="road_masks",
-                        num_samples=min(requested_num_samples, 200000),
-                        device=self.device,
-                    )
-                    if road_normal_pts is None or road_normal_pts.shape[0] < 3:
-                        road_normal_pts = road_lidar_pts
-                    road_normal = self._estimate_ground_normal_from_lidar(road_normal_pts)
-                    if road_normal is not None:
-                        model.set_surface_normal_lock(road_normal)
-                        logger.info(
-                            "Applied Road surface-normal lock from %d road-mask LiDAR points: %s",
-                            int(road_normal_pts.shape[0]) if road_normal_pts is not None else 0,
-                            road_normal.detach().cpu().tolist(),
-                        )
 
             if class_name == "RigidNodes":
                 empty = self.safe_init_models(

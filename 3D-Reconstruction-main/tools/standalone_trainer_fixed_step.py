@@ -17,8 +17,10 @@ import imageio
 from post_train_difix_loop import tensor_to_image, image_to_array
 from standalone_renderer import render_single_offset_novel_view
 from utils.logging import MetricLogger, setup_logging
-from PIL import Image
+from PIL import Image, ImageDraw
 import wandb
+from utils.geometry import quat_to_rotmat
+import math
 
 
 def _to_tensor(value, field_name: str) -> torch.Tensor:
@@ -89,6 +91,59 @@ def _append_block(base_tensor: torch.Tensor, new_block: torch.Tensor) -> torch.T
     out[:base_len] = base_tensor
     out[base_len:] = new_block
     return out
+
+
+def _project_world_point(point_world: torch.Tensor, cam_c2w: torch.Tensor, intrinsics: torch.Tensor):
+    cam_w2c = torch.linalg.inv(cam_c2w)
+    point_h = torch.cat([point_world, torch.ones(1, device=point_world.device, dtype=point_world.dtype)])
+    point_cam = cam_w2c @ point_h
+    z = float(point_cam[2].item())
+    if z <= 1e-6:
+        return None
+    fx = float(intrinsics[0, 0].item())
+    fy = float(intrinsics[1, 1].item())
+    cx = float(intrinsics[0, 2].item())
+    cy = float(intrinsics[1, 2].item())
+    x = float(point_cam[0].item())
+    y = float(point_cam[1].item())
+    u = fx * (x / z) + cx
+    v = fy * (y / z) + cy
+    return (u, v)
+
+
+def _overlay_normal_segment(image: Image.Image, novel_c2w: torch.Tensor, intrinsics: torch.Tensor, road_normal: torch.Tensor, segment_length_m: float = 3.0) -> Image.Image:
+    if road_normal is None:
+        return image
+
+    road_normal = road_normal.detach().cpu().float()
+    road_normal = road_normal / road_normal.norm().clamp_min(1e-8)
+    cam_c2w = novel_c2w.detach().cpu().float()
+    intrinsics = intrinsics.detach().cpu().float()
+
+    # Place the segment in front of the camera so it remains visible in the frame.
+    cam_forward = cam_c2w[:3, 2]
+    cam_forward = cam_forward / cam_forward.norm().clamp_min(1e-8)
+    anchor_world = cam_c2w[:3, 3] + 8.0 * cam_forward
+
+    half_len = 0.5 * segment_length_m * road_normal
+    p0 = anchor_world - half_len
+    p1 = anchor_world + half_len
+    uv0 = _project_world_point(p0, cam_c2w, intrinsics)
+    uv1 = _project_world_point(p1, cam_c2w, intrinsics)
+    if uv0 is None or uv1 is None:
+        return image
+
+    draw = ImageDraw.Draw(image)
+    color = (255, 64, 64)
+    width = max(2, image.width // 160)
+    draw.line([uv0, uv1], fill=color, width=width)
+
+    # Add a small center marker so the target normal is easy to find.
+    center_u = 0.5 * (uv0[0] + uv1[0])
+    center_v = 0.5 * (uv0[1] + uv1[1])
+    r = max(3, image.width // 120)
+    draw.ellipse((center_u - r, center_v - r, center_u + r, center_v + r), outline=color, width=width)
+    return image
 
 
 def _stack_field_for_samples(
@@ -202,6 +257,7 @@ def integrate_synthetic_samples(dataset, synthetic_samples, synthetic_ratio: flo
 
     old_num_frames = len(cam0)
     num_new = len(synthetic_samples)
+    sky_supervision_samples = [sample for sample in synthetic_samples if sample.get("sky_supervision", False)]
 
     missing_road_masks = sum(1 for sample in synthetic_samples if sample.get("road_masks", None) is None)
     if missing_road_masks > 0:
@@ -319,6 +375,28 @@ def integrate_synthetic_samples(dataset, synthetic_samples, synthetic_ratio: flo
     ]
     dataset.train_indices.extend(new_img_indices)
     dataset.train_image_set.split_indices = dataset.train_indices
+
+    if len(sky_supervision_samples) > 0:
+        training_sample_weights = getattr(pixel_source, "training_sample_weights", None)
+        max_new_img_idx = max(new_img_indices)
+        required_len = max_new_img_idx + 1
+        if not isinstance(training_sample_weights, torch.Tensor):
+            pixel_source.training_sample_weights = torch.ones(required_len, device=pixel_source.device, dtype=torch.float32)
+        else:
+            current_weights = training_sample_weights.to(device=pixel_source.device, dtype=torch.float32)
+            if current_weights.shape[0] < required_len:
+                padded_weights = torch.ones(required_len, device=pixel_source.device, dtype=torch.float32)
+                padded_weights[:current_weights.shape[0]] = current_weights
+                current_weights = padded_weights
+            pixel_source.training_sample_weights = current_weights
+
+        sky_indices = [new_img_indices[idx] for idx, sample in enumerate(synthetic_samples) if sample.get("sky_supervision", False)]
+        num_sky = len(sky_indices)
+        num_other = max(0, len(dataset.train_indices) - num_sky)
+        sky_weight = float(num_other) / float(9 * num_sky) if num_sky > 0 and num_other > 0 else 1.0
+        pixel_source.training_sample_weights[:] = 1.0
+        for sky_idx in sky_indices:
+            pixel_source.training_sample_weights[sky_idx] = sky_weight
 
     if pixel_source.image_error_buffer is not None:
         current_len = pixel_source.image_error_buffer.shape[0]
@@ -539,59 +617,144 @@ def save_road_reference_preview(dataset, trainer, ckpt_dir, args):
     quality_dir = get_novel_view_quality_dir(ckpt_dir, args)
     os.makedirs(quality_dir, exist_ok=True)
 
-    # Render the reference road class from the same viewpoint as the other images.
-    road_sample = render_single_offset_novel_view(
-        dataset=dataset,
-        trainer=trainer,
-        frame_index=args.ref_frame,
-        lateral_offset_m=0.0,
-    )
+    # Render and save novel views used during synthetic training.
+    # Save only PNG images (no .npz exports).
+    offsets = [0.0]
+    # Use args.lateral_offset when available, otherwise default to 0.0
+    lateral = getattr(args, "lateral_offset", 0.0)
+    if lateral is not None and lateral != 0.0:
+        offsets.extend([-lateral, lateral, -lateral / 2.0, lateral / 2.0])
 
-    def _save_image_if_present(tensor, filename):
-        if isinstance(tensor, torch.Tensor):
-            img = tensor_to_image(tensor.cpu())
-            img.save(os.path.join(quality_dir, filename))
+    def _save_image_if_present(image_or_tensor, filename):
+        if image_or_tensor is None:
+            return
+        if isinstance(image_or_tensor, torch.Tensor):
+            image_or_tensor = tensor_to_image(image_or_tensor.cpu())
+        image_or_tensor.save(os.path.join(quality_dir, filename))
 
-    _save_image_if_present(
-        road_sample.get("background_rgb", None),
-        f"background_reference_frame{args.ref_frame}_step{trainer.step}.png",
-    )
-    _save_image_if_present(
-        road_sample.get("sky_rgb", None),
-        f"sky_reference_frame{args.ref_frame}_step{trainer.step}.png",
-    )
-    road_rgb = road_sample.get("road_rgb", None)
-    if isinstance(road_rgb, torch.Tensor):
-        road_img = tensor_to_image(road_rgb.cpu())
-        road_img_path = os.path.join(
-            quality_dir,
-            f"road_reference_frame{args.ref_frame}_step{trainer.step}.png",
+    for off in offsets:
+        sample = render_single_offset_novel_view(
+            dataset=dataset,
+            trainer=trainer,
+            frame_index=args.ref_frame,
+            lateral_offset_m=off,
         )
-        road_img.save(road_img_path)
 
+        road_model = getattr(trainer, "models", {}).get("Road", None)
+        road_normal = getattr(road_model, "road_surface_normal", None) if road_model is not None else None
+
+        _save_image_if_present(
+            _overlay_normal_segment(
+                tensor_to_image(sample["background_rgb"].cpu()) if isinstance(sample.get("background_rgb", None), torch.Tensor) else sample.get("background_rgb", None),
+                sample["novel_c2w"],
+                sample["intrinsics"],
+                road_normal,
+            ) if sample.get("background_rgb", None) is not None else None,
+            f"background_reference_frame{args.ref_frame}_offset{off}_step{trainer.step}.png",
+        )
+        _save_image_if_present(
+            _overlay_normal_segment(
+                tensor_to_image(sample["sky_rgb"].cpu()) if isinstance(sample.get("sky_rgb", None), torch.Tensor) else sample.get("sky_rgb", None),
+                sample["novel_c2w"],
+                sample["intrinsics"],
+                road_normal,
+            ) if sample.get("sky_rgb", None) is not None else None,
+            f"sky_reference_frame{args.ref_frame}_offset{off}_step{trainer.step}.png",
+        )
+        road_rgb = sample.get("road_rgb", None)
+        if isinstance(road_rgb, torch.Tensor):
+            road_img = _overlay_normal_segment(
+                tensor_to_image(road_rgb.cpu()),
+                sample["novel_c2w"],
+                sample["intrinsics"],
+                road_normal,
+            )
+            road_img_path = os.path.join(
+                quality_dir,
+                f"road_reference_frame{args.ref_frame}_offset{off}_step{trainer.step}.png",
+            )
+            road_img.save(road_img_path)
+        # Also save the composite rendered novel view (if present)
+        rendered_rgb = sample.get("rendered_rgb", None)
+        if isinstance(rendered_rgb, torch.Tensor):
+            comp_img = _overlay_normal_segment(
+                tensor_to_image(rendered_rgb.cpu()),
+                sample["novel_c2w"],
+                sample["intrinsics"],
+                road_normal,
+            )
+            comp_path = os.path.join(
+                quality_dir,
+                f"composite_reference_frame{args.ref_frame}_offset{off}_step{trainer.step}.png",
+            )
+            comp_img.save(comp_path)
+    # --- Gaussian alignment metrics: average roll, pitch, vertical scale, normal alignment ---
     road_model = getattr(trainer, "models", {}).get("Road", None)
     if road_model is not None:
-        road_points = getattr(road_model, "means", None)
-        road_colors = getattr(road_model, "colors", None)
-        if road_points is None and hasattr(road_model, "_means"):
-            road_points = road_model._means.detach()
-        if road_colors is None and hasattr(road_model, "_features_dc"):
-            try:
-                road_colors = road_model.colors
-            except Exception:
-                road_colors = None
+        quats = getattr(road_model, "get_quats", None)
+        scales = getattr(road_model, "get_scaling", None)
+        try:
+            if quats is None or quats.numel() == 0:
+                gauss_count = 0
+                avg_abs_roll = avg_abs_pitch = avg_vertical_scale = mean_dot = mean_angle_deg = float("nan")
+                avg_principal_axis_dot = avg_principal_axis_angle_deg = float("nan")
+            else:
+                rots = quat_to_rotmat(quats)
+                roll = torch.atan2(rots[..., 2, 1], rots[..., 2, 2])
+                pitch = torch.atan2(
+                    -rots[..., 2, 0],
+                    torch.sqrt(rots[..., 2, 1] ** 2 + rots[..., 2, 2] ** 2).clamp_min(1e-8),
+                )
+                if scales is not None and scales.shape[-1] >= 3:
+                    vertical_scale = torch.abs(scales[..., 2])
+                else:
+                    vertical_scale = torch.zeros_like(roll)
 
-        if isinstance(road_points, torch.Tensor):
-            road_npz_path = os.path.join(
-                quality_dir,
-                f"road_reference_frame{args.ref_frame}_step{trainer.step}.npz",
+                avg_abs_roll = float(torch.abs(roll).mean().item())
+                avg_abs_pitch = float(torch.abs(pitch).mean().item())
+                avg_vertical_scale = float(vertical_scale.mean().item())
+                # normal is third column of rotation matrix
+                normals = rots[..., :, 2]
+                dot_with_up = normals[..., 2].clamp(-1.0, 1.0)
+                mean_dot = float(dot_with_up.mean().item())
+                mean_angle_deg = float((torch.acos(dot_with_up).mean().item() * 180.0 / math.pi))
+
+                # More robust flatness metric: align the smallest principal axis with world-up.
+                # This is closer to the intended road-flatness constraint than Euler angles.
+                if scales is not None and scales.ndim >= 2 and scales.shape[-1] >= 3:
+                    principal_axis_idx = torch.argmin(scales[..., :3], dim=-1)
+                    batch_idx = torch.arange(rots.shape[0], device=rots.device)
+                    principal_axes = rots[batch_idx, :, principal_axis_idx]
+                    principal_axes = principal_axes / principal_axes.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                    principal_axis_dot = principal_axes[..., 2].abs().clamp(0.0, 1.0)
+                    avg_principal_axis_dot = float(principal_axis_dot.mean().item())
+                    avg_principal_axis_angle_deg = float(
+                        torch.acos(principal_axis_dot).mean().item() * 180.0 / math.pi
+                    )
+                else:
+                    avg_principal_axis_dot = float("nan")
+                    avg_principal_axis_angle_deg = float("nan")
+
+                gauss_count = int(quats.shape[0])
+        except Exception:
+            gauss_count = 0
+            avg_abs_roll = avg_abs_pitch = avg_vertical_scale = mean_dot = mean_angle_deg = float("nan")
+            avg_principal_axis_dot = avg_principal_axis_angle_deg = float("nan")
+
+        csv_path = os.path.join(quality_dir, "gaussian_alignment.csv")
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a") as csvf:
+            if write_header:
+                csvf.write(
+                    "step,count,avg_abs_roll,avg_abs_pitch,avg_vertical_scale,"
+                    "mean_normal_dot,mean_normal_angle_deg,"
+                    "avg_principal_axis_dot,avg_principal_axis_angle_deg\n"
+                )
+            csvf.write(
+                f"{trainer.step},{gauss_count},{avg_abs_roll:.6f},{avg_abs_pitch:.6f},"
+                f"{avg_vertical_scale:.6f},{mean_dot:.6f},{mean_angle_deg:.3f},"
+                f"{avg_principal_axis_dot:.6f},{avg_principal_axis_angle_deg:.3f}\n"
             )
-            road_npz = {
-                "points": road_points.detach().cpu().numpy(),
-            }
-            if isinstance(road_colors, torch.Tensor):
-                road_npz["colors"] = road_colors.detach().cpu().numpy()
-            np.savez_compressed(road_npz_path, **road_npz)
 
 
 def train_from_scratch(cfg, ckpt_path, args):

@@ -124,6 +124,33 @@ def render_novel_sample_list(checkpoint_path, frame_index_list, lateral_offset_l
         result.append((curr_step, novel_sample))
     return result
 
+
+def render_sky_supervision_sample(checkpoint_path, frame_index, lateral_offset, vertical_offset=10.0):
+    """Render the dedicated sky-supervision novel view."""
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+        output_path = tmp.name
+
+    cmd = [
+        sys.executable, "-u", os.path.join(os.path.dirname(__file__), "standalone_renderer.py"),
+        "render_sky_supervision_sample",
+        f"--checkpoint_path={checkpoint_path}",
+        f"--frame_index={frame_index}",
+        f"--lateral_offset={lateral_offset}",
+        f"--vertical_offset={vertical_offset}",
+        f"--output_path={output_path}"
+    ]
+    result = subprocess.run(cmd, capture_output=False, text=False)
+    if result.returncode != 0:
+        print("Error in render_sky_supervision_sample subprocess:", result.stderr)
+        raise RuntimeError("render_sky_supervision_sample subprocess failed")
+
+    with open(output_path, "rb") as f:
+        data = pickle.load(f)
+    os.remove(output_path)
+    curr_step = data.get("reference_frame_idx", None)
+    novel_sample = data
+    return curr_step, novel_sample
+
 def _get_class_masks(
     images,
     target_class_id,
@@ -215,9 +242,9 @@ def _get_class_masks(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=None,
+        stderr=subprocess.PIPE,
     )
-    assert proc.stdin is not None and proc.stdout is not None
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
     try:
         startup_lines = []
@@ -226,9 +253,11 @@ def _get_class_masks(
             if ready_line == "READY":
                 break
             if ready_line == "":
+                stderr_output = proc.stderr.read().decode(errors="replace")
                 raise RuntimeError(
                     f"{mask_name.title()}-mask worker failed to start before EOF. "
-                    f"Startup output: {startup_lines}"
+                    f"Startup output: {startup_lines}\n"
+                    f"Worker stderr:\n{stderr_output}"
                 )
             startup_lines.append(ready_line)
             print(f"[{mask_name}-mask worker] {ready_line}", file=sys.stderr)
@@ -319,7 +348,7 @@ def train_synthetic(synthetic_samples, checkpoint_path, frame_index, lateral_off
     return curr_step, novel_sample
 
 def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_lateral_offset, min_frame_index, max_frame_index,
-                  batch_size=100):
+                  batch_size=100, sky_supervision=False):
     # Get random unique frame indices for this batch
     frame_indices = np.random.choice(np.arange(min_frame_index, max_frame_index), size=batch_size, replace=False)
     synthetic_samples = []
@@ -357,17 +386,47 @@ def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_latera
         # Append the full sample dict (with repaired image) to the list
         synthetic_samples.append(novel_sample)
 
+    if sky_supervision:
+        sky_frame_index = int(np.random.choice(np.arange(min_frame_index, max_frame_index)))
+        _, sky_sample = render_sky_supervision_sample(
+            checkpoint_path,
+            sky_frame_index,
+            lateral_offset / 2.0,
+            vertical_offset=10.0,
+        )
+        sky_novel_img = tensor_to_image(sky_sample["rendered_rgb"])
+        sky_ref_img = tensor_to_image(sky_sample["reference_rgb"])
+        sky_repaired_image = difix_repair(sky_novel_img, sky_ref_img)
+        log_synthetic_image(sky_novel_img, sky_repaired_image, run_path, len(synthetic_samples))
+        sky_sample["rendered_rgb"] = image_to_array(sky_repaired_image, normalize=True)
+        sky_sample["sky_masks"] = (np.asarray(get_sky_masks([sky_repaired_image], segformer_path=SEGFORMER_REPO_PATH)[0].convert("L"), dtype=np.uint8) > 0).astype(np.float32)
+        sky_road_mask = get_road_masks([sky_repaired_image], segformer_path=SEGFORMER_REPO_PATH)[0]
+        if isinstance(sky_road_mask, Image.Image):
+            sky_sample["road_masks"] = (np.asarray(sky_road_mask.convert("L"), dtype=np.uint8) > 0).astype(np.float32)
+        else:
+            sky_sample["road_masks"] = np.asarray(sky_road_mask, dtype=np.float32)
+        sky_sample["sky_supervision"] = True
+        synthetic_samples.append(sky_sample)
+
     # Start training with our synthetic images
     # Use the first frame_index from this batch for training (or another policy as needed)
     train_synthetic(synthetic_samples, checkpoint_path, 154, max_lateral_offset, num_iters=3000)
     return synthetic_samples
 
-def run_training_loop(checkpoint_path, min_frame_index, max_frame_index, min_lateral_offset, max_lateral_offset, num_synthetic_samples):
+def run_training_loop(checkpoint_path, min_frame_index, max_frame_index, min_lateral_offset, max_lateral_offset, num_synthetic_samples, sky_supervision=False):
     lateral_offset = min_lateral_offset
     delta_offset = (max_lateral_offset - min_lateral_offset) / num_synthetic_samples
     synthetic_samples = []
     for synth_i in range(num_synthetic_samples):
-        synthetic_samples = one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_lateral_offset, min_frame_index, max_frame_index)
+        synthetic_samples = one_iteration(
+            synthetic_samples,
+            checkpoint_path,
+            lateral_offset,
+            max_lateral_offset,
+            min_frame_index,
+            max_frame_index,
+            sky_supervision=sky_supervision,
+        )
         lateral_offset += delta_offset
         print(f"Completed iteration {synth_i+1}/{num_synthetic_samples}, next lateral offset: {lateral_offset:.2f}m")
 
@@ -413,6 +472,7 @@ def main(
     pretrained_checkpoint_path: str,
     run_path: str,
     config_path: str = None,
+    sky_supervision: bool = False,
 ):
     create_run_folders(run_path)
     checkpoint_path = os.path.join(run_path, "checkpoint_final.pth")
@@ -425,9 +485,9 @@ def main(
         )
         if not same_file:
             shutil.copy(config_path, os.path.join(run_path, "config.yaml"))
-        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=12000)
-        # train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=50000)
-        # exit()
+        # train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=12000)
+        train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=30000)
+        exit()
         print("Trained initial model from scratch, starting synthetic training loop...")
     else:
         copy_pretrained_checkpoint(pretrained_checkpoint_path, checkpoint_path)
@@ -437,7 +497,8 @@ def main(
         checkpoint_path=checkpoint_path,
         min_frame_index=20, max_frame_index=280,
         min_lateral_offset=0.8, max_lateral_offset=3.5,
-        num_synthetic_samples=10
+        num_synthetic_samples=10,
+        sky_supervision=sky_supervision,
     )
 
 
@@ -473,8 +534,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_iters", type=int, help="number of training iterations (overrides value specified in config file) [OPTIONAL]", default=None
     )
+    parser.add_argument(
+        "--sky_supervision",
+        action="store_true",
+        help="Add a dedicated sky-facing synthetic sample per iteration and upweight it during training.",
+    )
     args = parser.parse_args()
     # Parse arguments
     pretrained_checkpoint_path = args.resume_from
     run_path = os.path.join(args.output_root, args.project, args.run_name)
-    main(pretrained_checkpoint_path, run_path, config_path=args.config_file)
+    main(pretrained_checkpoint_path, run_path, config_path=args.config_file, sky_supervision=args.sky_supervision)

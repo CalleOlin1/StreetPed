@@ -1031,28 +1031,37 @@ class ScenePixelSource(abc.ABC):
         self,
         candidate_indices: Tensor = None,
     ) -> Dict[str, Tensor]:
-        if random.random() < self.buffer_ratio and self.image_error_buffered:
-            # sample according to the image error buffer
-            image_mean_error = self.image_error_buffer[candidate_indices]
-            start_enhance_weight = self.data_cfg.sampler.get('start_enhance_weight', 1)
-            if start_enhance_weight > 1:
-                # increase the error of the first 10% frames
-                frame_num = int(self.num_imgs / self.num_cams)
-                error_weight = torch.cat((
-                    torch.linspace(start_enhance_weight, 1, int(frame_num * 0.1)),
-                    torch.ones(frame_num - int(frame_num * 0.1))
-                ))
-                error_weight = error_weight[..., None].repeat(1, self.num_cams).reshape(-1)
-                error_weight = error_weight[candidate_indices].to(self.device)
-                
-                image_mean_error = image_mean_error * error_weight
-            idx = torch.multinomial(
-                image_mean_error, 1, replacement=False
-            ).item()
-            img_idx = candidate_indices[idx]
+        candidate_indices = torch.as_tensor(candidate_indices, device=self.device, dtype=torch.long)
+        training_sample_weights = getattr(self, "training_sample_weights", None)
+        if isinstance(training_sample_weights, torch.Tensor) and training_sample_weights.numel() >= self.num_imgs:
+            image_weights = training_sample_weights[candidate_indices].to(device=self.device, dtype=torch.float32)
+            if torch.sum(image_weights) <= 0:
+                image_weights = torch.ones_like(image_weights)
+            idx = torch.multinomial(image_weights, 1, replacement=False).item()
+            img_idx = int(candidate_indices[idx].item())
         else:
-            # random sample one from candidate_indices
-            img_idx = random.choice(candidate_indices)
+            if random.random() < self.buffer_ratio and self.image_error_buffered:
+                # sample according to the image error buffer
+                image_mean_error = self.image_error_buffer[candidate_indices]
+                start_enhance_weight = self.data_cfg.sampler.get('start_enhance_weight', 1)
+                if start_enhance_weight > 1:
+                    # increase the error of the first 10% frames
+                    frame_num = int(self.num_imgs / self.num_cams)
+                    error_weight = torch.cat((
+                        torch.linspace(start_enhance_weight, 1, int(frame_num * 0.1), device=self.device),
+                        torch.ones(frame_num - int(frame_num * 0.1), device=self.device)
+                    ))
+                    error_weight = error_weight[..., None].repeat(1, self.num_cams).reshape(-1)
+                    error_weight = error_weight[candidate_indices].to(self.device)
+                    
+                    image_mean_error = image_mean_error * error_weight
+                idx = torch.multinomial(
+                    image_mean_error, 1, replacement=False
+                ).item()
+                img_idx = candidate_indices[idx]
+            else:
+                # random sample one from candidate_indices
+                img_idx = random.choice(candidate_indices.tolist())
             
         return img_idx
         

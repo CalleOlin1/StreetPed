@@ -597,14 +597,34 @@ def train_synthetic(
     if from_scratch:
         cmd.append("--from_scratch")
 
-    result = subprocess.run(cmd, capture_output=False, text=False)
-    if result.returncode != 0:
-        raise RuntimeError("train_synthetic subprocess failed")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
 
-    with open(output_path, "rb") as f:
-        _ = pickle.load(f)
-    os.remove(output_path)
-    os.remove(input_path)
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+        returncode = process.wait()
+        if returncode != 0:
+            raise RuntimeError(f"train_synthetic subprocess failed (rc={returncode})")
+
+        # Read the output path to confirm completion
+        with open(output_path, "rb") as f:
+            out = pickle.load(f)
+        return out
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        if os.path.exists(input_path):
+            os.remove(input_path)
 
 
 def create_run_folders(run_path: str) -> None:
@@ -734,7 +754,8 @@ def main(args: argparse.Namespace) -> None:
                 round_synthetic_samples.extend(mirrored_view_samples)
                 print(f"Added {len(mirrored_view_samples)} mirrored views to training set")
 
-        train_synthetic(
+        print("Starting synthetic training subprocess...")
+        train_out = train_synthetic(
             synthetic_samples=round_synthetic_samples,
             checkpoint_path=current_ckpt,
             frame_index=resolved_frames[0],
@@ -746,12 +767,20 @@ def main(args: argparse.Namespace) -> None:
             selected_object_id=key[1],
             synthetic_ratio=args.synthetic_ratio,
         )
+        print("train_synthetic result:", repr(train_out))
+
+        # Debug: list checkpoint files in run_path after training
+        ckpt_files = [f for f in os.listdir(run_path) if f.startswith("checkpoint_") and f.endswith(".pth")]
+        print(f"Checkpoint files in {run_path}: {ckpt_files}")
 
         latest_ckpt = find_latest_checkpoint(run_path)
         if latest_ckpt:
+            print(f"Using latest checkpoint for next round: {latest_ckpt}")
             current_ckpt = latest_ckpt
             if not os.path.samefile(latest_ckpt, checkpoint_path):
                 shutil.copy(latest_ckpt, checkpoint_path)
+        else:
+            print(f"No numbered checkpoint found; continuing with current checkpoint: {current_ckpt}")
 
         del trainer, dataset
         gc.collect()
@@ -810,7 +839,7 @@ if __name__ == "__main__":
     parser.add_argument("--frame_stride", type=int, default=1, help="Stride when using multiple frames")
     parser.add_argument("--max_frames", type=int, default=0, help="Cap number of frames (0 = no cap)")
     parser.add_argument("--no_true_id_map", action="store_true", help="Do not map object_id through instances_true_id")
-    parser.add_argument("--num_views", default=12, type=int, help="Number of orbit views to render")
+    parser.add_argument("--num_views", default=14, type=int, help="Number of orbit views to render")
     parser.add_argument("--elevation_deg", default=18.0, type=float, help="Orbit elevation in degrees")
     parser.add_argument("--radius_scale", default=3.0, type=float, help="Radius multiplier based on object extent")
     parser.add_argument("--min_radius", default=4.0, type=float, help="Minimum orbit radius in meters")

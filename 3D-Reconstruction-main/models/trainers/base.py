@@ -90,7 +90,11 @@ class BasicTrainer(nn.Module):
         self.step = 0
         self.device = device
         # self.road_lock_steps = self.optim_general.get("road_lock_steps", 12000) # Make this more explicit
-        self.road_lock_steps = self.optim_general.get("road_lock_steps", 6000) # Make this more explicit
+        self.road_lock_steps = self.optim_general.get("road_lock_steps", 0) # Make this more explicit
+        # Soft road geometry regularization weights (kept fixed by default).
+        self.road_geometry_constraint_w = 1.00
+        self.road_normal_alignment_w = 5.0
+        self.road_vertical_scale_constraint_w = 5.0
 
         # dataset infos
         self.num_train_images = num_train_images
@@ -280,6 +284,41 @@ class BasicTrainer(nn.Module):
                 use_inverse_depth=depth_loss_cfg.inverse_depth,
             )
         self.depth_loss_fn = depth_loss_fn
+
+    def _compute_road_geometry_constraint(self) -> torch.Tensor:
+        if "Road" not in self.models:
+            return None
+
+        road_model = self.models["Road"]
+        if not hasattr(road_model, "get_quats") or not hasattr(road_model, "get_scaling"):
+            return None
+
+        quats = road_model.get_quats
+        if quats is None or quats.numel() == 0:
+            return None
+
+        rotmats = quat_to_rotmat(quats)
+        road_normal = getattr(road_model, "road_surface_normal", None)
+        if road_normal is None:
+            road_normal = torch.tensor([0.0, 0.0, 1.0], device=quats.device, dtype=quats.dtype)
+        else:
+            road_normal = road_normal.to(device=quats.device, dtype=quats.dtype)
+        road_normal = road_normal / road_normal.norm().clamp_min(1e-8)
+
+        road_normal = road_normal[None, :].expand(rotmats.shape[0], -1)
+        local_surface_normal = rotmats[..., :, 2]
+        normal_alignment = 1.0 - torch.abs((local_surface_normal * road_normal).sum(dim=-1)).clamp(0.0, 1.0)
+
+        scales = road_model.get_scaling
+        if scales is not None and scales.shape[-1] >= 3:
+            vertical_scale = torch.abs(scales[..., 2])
+        else:
+            vertical_scale = torch.zeros_like(normal_alignment)
+
+        return (
+            self.road_normal_alignment_w * normal_alignment
+            + self.road_vertical_scale_constraint_w * vertical_scale
+        ).mean()
     
     def optimizer_zero_grad(self) -> None:
         self.optimizer.zero_grad()
@@ -307,6 +346,8 @@ class BasicTrainer(nn.Module):
             if self._is_model_frozen(class_name):
                 continue
             if class_name == "Road" and self.step < self.road_lock_steps:
+                continue
+            if class_name == "Road":
                 continue
             model = self.models.get(class_name, None)
             if model is not None and hasattr(model, "enforce_surface_normal_lock_"):
@@ -958,6 +999,12 @@ class BasicTrainer(nn.Module):
 
             loss_dict.update({
                 "road_opacity_loss": road_opacity_loss
+            })
+
+        road_geometry_constraint = self._compute_road_geometry_constraint()
+        if road_geometry_constraint is not None:
+            loss_dict.update({
+                "road_geometry_constraint_loss": self.road_geometry_constraint_w * road_geometry_constraint
             })
 
         # ------------------------
