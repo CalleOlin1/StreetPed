@@ -90,7 +90,7 @@ class BasicTrainer(nn.Module):
         self.step = 0
         self.device = device
         # self.road_lock_steps = self.optim_general.get("road_lock_steps", 12000) # Make this more explicit
-        self.road_lock_steps = self.optim_general.get("road_lock_steps", 6000) # Make this more explicit
+        self.road_lock_steps = self.optim_general.get("road_lock_steps", 12000) # Make this more explicit
 
         # dataset infos
         self.num_train_images = num_train_images

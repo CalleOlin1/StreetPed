@@ -5,6 +5,7 @@ The goal of this file is to create a structured and memory efficient approach to
 import os
 import argparse
 import io
+import re
 import shutil
 import gc
 import subprocess
@@ -396,7 +397,31 @@ def copy_pretrained_checkpoint(pretrained_checkpoint_path, new_checkpoint_path):
         shutil.copy(pretrained_checkpoint_path, new_checkpoint_path)
         print(f"Copied pretrained checkpoint from {pretrained_checkpoint_path} to {new_checkpoint_path}")
 
-def copy_config_file(pretrained_checkpoint_path, run_path):
+def override_scene_idx_in_config(config_path, scene_idx):
+    if scene_idx is None:
+        return
+
+    with open(config_path, "r") as f:
+        config_text = f.read()
+
+    updated_text, replacement_count = re.subn(
+        r"(^\s*scene_idx:\s*).*$",
+        rf"\g<1>{scene_idx}",
+        config_text,
+        flags=re.MULTILINE,
+    )
+
+    if replacement_count == 0:
+        print(f"Warning: no scene_idx entry found in {config_path}; leaving config unchanged")
+        return
+
+    with open(config_path, "w") as f:
+        f.write(updated_text)
+
+    print(f"Overrode scene_idx in {config_path} with {scene_idx}")
+
+
+def copy_config_file(pretrained_checkpoint_path, run_path, scene_idx=None):
     pretrained_dir = os.path.dirname(pretrained_checkpoint_path)
     pretrained_config_path = os.path.join(pretrained_dir, "config.yaml")
     new_config_path = os.path.join(run_path, "config.yaml")
@@ -408,11 +433,13 @@ def copy_config_file(pretrained_checkpoint_path, run_path):
     if not same_file:
         shutil.copy(pretrained_config_path, new_config_path)
         print(f"Copied config file from {pretrained_config_path} to {new_config_path}")
+    override_scene_idx_in_config(new_config_path, scene_idx)
 
 def main(
     pretrained_checkpoint_path: str,
     run_path: str,
     config_path: str = None,
+    scene_idx: str = None,
 ):
     create_run_folders(run_path)
     checkpoint_path = os.path.join(run_path, "checkpoint_final.pth")
@@ -425,13 +452,14 @@ def main(
         )
         if not same_file:
             shutil.copy(config_path, os.path.join(run_path, "config.yaml"))
+        override_scene_idx_in_config(new_config_path, scene_idx)
         train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=12000)
         # train_synthetic([], checkpoint_path, frame_index=154, lateral_offset=3, from_scratch=True, num_iters=50000)
         # exit()
         print("Trained initial model from scratch, starting synthetic training loop...")
     else:
         copy_pretrained_checkpoint(pretrained_checkpoint_path, checkpoint_path)
-        copy_config_file(pretrained_checkpoint_path, run_path)
+        copy_config_file(pretrained_checkpoint_path, run_path, scene_idx=scene_idx)
 
     run_training_loop(
         checkpoint_path=checkpoint_path,
@@ -471,10 +499,16 @@ if __name__ == "__main__":
         help="wandb run name, also used to enhance log_dir",
     )
     parser.add_argument(
+        "--scene_idx",
+        default=None,
+        type=str,
+        help="optional scene identifier to override scene_idx in the saved config",
+    )
+    parser.add_argument(
         "--num_iters", type=int, help="number of training iterations (overrides value specified in config file) [OPTIONAL]", default=None
     )
     args = parser.parse_args()
     # Parse arguments
     pretrained_checkpoint_path = args.resume_from
     run_path = os.path.join(args.output_root, args.project, args.run_name)
-    main(pretrained_checkpoint_path, run_path, config_path=args.config_file)
+    main(pretrained_checkpoint_path, run_path, config_path=args.config_file, scene_idx=args.scene_idx)
