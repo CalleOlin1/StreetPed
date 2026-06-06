@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-Road Mesh Training Script - Step 1 Implementation
+Road Mesh Training Script - Step 1 & 2 Implementation
 
-This script implements Step 1 of the road mesh training pipeline:
-- Aggregate point cloud using road masks and lidar data
-- Log bird's eye view visualization of the extracted points
-
-The basic algorithm is as follows:
-- 1 Aggregate point cloud using road masks and lidar data (IMPLEMENTED HERE)
+This script implements Steps 1-3 of the road mesh training pipeline:
+- Aggregate point cloud using road masks and lidar data (IMPLEMENTED HERE)
     - Use existing Driving_Dataset code to load data, masks, and images
     - Extract LiDAR points that project into road mask regions
-    - Log bird's eye view of the aggregated point cloud
-- 2 Create a 3d mesh from the aggregated point cloud (STEP 2 IMPLEMENTED HERE)
+    - Log bird's eye view visualization of the extracted points
+- Create a 3d mesh from the aggregated point cloud (STEP 2 IMPLEMENTED HERE)
     - No overlap along Z axis by construction (heightmap-based approach)
     - Low complexity with reasonable amount of polys (~5cm grid resolution)
     - Log mesh as .pth file and PLY export for inspection
-- 3 Create an image buffer for the road mesh (TODO: Step 3)
-    - Use 4096x4096 resolution initially
-    - Map pixels to mesh using x and y axis with scaling factor
-- 4 Project rays using rgb images and cam position onto the mesh (TODO: Step 4)
+- Create an image buffer for the road mesh (STEP 3 IMPLEMENTED HERE)
+    - Use x and y range of point cloud to determine dimensions
+    - Resolution: 10 pixels per meter (user requirement)
+    - Map pixels to mesh using scaling factor based on scene size
+- Project rays using rgb images and cam position onto the mesh (TODO: Step 4)
     - Only project road areas according to road mask
     - Fill image buffer using RGB data from images
     - Log image buffer as an image
@@ -830,6 +827,284 @@ def export_mesh_to_ply(vertices: torch.Tensor,
     logger.info(f"Exported mesh to PLY format at {ply_path}")
 
 
+def create_image_buffer(vertices: torch.Tensor, 
+                        faces: torch.Tensor,
+                        colors: Union[torch.Tensor, None] = None) -> Tuple[np.ndarray, dict]:
+    """
+    Create an image buffer for the road mesh using point cloud dimensions as reference.
+    
+    This implements Step 3 of the pipeline - creating a texture-ready image buffer where:
+    - Resolution is determined by x and y ranges with scaling factor (10 pixels per meter)
+    - Each pixel maps to a corresponding location on the mesh surface
+    - Buffer stores RGB color values for each pixel
+    
+    Args:
+        vertices: M × 3 tensor of vertex positions in meters
+        faces: F × 3 tensor of face indices (triangles)  
+        colors: Optional M × 3 tensor of RGB colors for each vertex
+        
+    Returns:
+        Tuple of (image_buffer, metadata):
+            - image_buffer: H x W x 3 numpy array with float values in [0, 1] range
+            - metadata: Dictionary containing buffer dimensions and scaling information
+    """
+    
+    if len(vertices) == 0 or len(faces) == 0:
+        logger.warning("Cannot create image buffer from empty mesh")
+        return np.zeros((100, 100, 3), dtype=np.float32), {}
+    
+    # Convert to numpy for processing
+    verts = vertices.cpu().numpy() if isinstance(vertices, torch.Tensor) else np.array(vertices)
+    
+    logger.info("Creating image buffer from mesh...")
+    
+    # Determine scene bounds in X and Y directions (user requirement: use x and y range as reference)
+    x_min, y_min, z_min = verts[:, 0].min(), verts[:, 1].min(), verts[:, 2].min()
+    x_max, y_max, _ = verts[:, 0].max(), verts[:, 1].max(), verts[:, 2].max()
+    
+    scene_width = max(x_max - x_min, 0.1)  # Ensure minimum width to avoid division by zero
+    scene_height = max(y_max - y_min, 0.1)  # Ensure minimum height
+    
+    logger.info(f"Scene dimensions: {scene_width:.2f}m × {scene_height:.2f}m")
+    
+    # User requirement: resolution of 10 pixels per meter
+    pixels_per_meter = 10
+    
+    # Calculate buffer dimensions based on scene size and pixel density (user specification)
+    width_pixels = int(np.ceil(scene_width * pixels_per_meter))
+    height_pixels = int(np.ceil(scene_height * pixels_per_meter))
+    
+    logger.info(f"Image buffer resolution: {width_pixels} × {height_pixels} ({pixels_per_meter}px/m)")
+    
+    # Initialize image buffer with zeros (background) - RGB channels in [0, 1] range
+    image_buffer = np.zeros((height_pixels, width_pixels, 3), dtype=np.float32)
+    
+    # Store metadata about the buffer for later use
+    metadata = {
+        'width': width_pixels,
+        'height': height_pixels,
+        'pixels_per_meter': pixels_per_meter,
+        'x_range': (float(x_min), float(x_max)),
+        'y_range': (float(y_min), float(y_max)),
+        'scene_width_meters': scene_width,
+        'scene_height_meters': scene_height,
+    }
+    
+    # If we have vertex colors, map them to the image buffer via rasterization-like process
+    if colors is not None and len(colors) > 0:
+        logger.info(f"Mapping {len(verts)} vertices with color data to image buffer...")
+        
+        # Convert faces to numpy array for processing
+        faces_np = faces.cpu().numpy() if isinstance(faces, torch.Tensor) else np.array(faces)
+        colors_arr = colors.cpu().numpy() if isinstance(colors, torch.Tensor) else np.array(colors)
+        
+        # For each triangle face, rasterize it onto the image buffer
+        for i in range(len(faces_np)):
+            v0_idx, v1_idx, v2_idx = faces_np[i]
+            
+            # Get vertex positions and colors for this triangle
+            v0 = verts[v0_idx]
+            v1 = verts[v1_idx]
+            v2 = verts[v2_idx]
+            
+            tri_colors = np.array([colors_arr[v0_idx], colors_arr[v1_idx], colors_arr[v2_idx]])
+            
+            # Bounding box of triangle in pixel coordinates (user requirement: map pixels to mesh)
+            x_coords = [v0[0], v1[0], v2[0]]
+            y_coords = [v0[1], v1[1], v2[1]]
+            
+            min_x, max_x = int(np.floor((min(x_coords) - x_min) * pixels_per_meter)), \
+                          int(np.ceil((max(x_coords) - x_min) * pixels_per_meter))
+            min_y, max_y = int(np.floor((min(y_coords) - y_min) * pixels_per_meter)), \
+                          int(np.ceil((max(y_coords) - y_min) * pixels_per_meter))
+            
+            # Clip to image bounds
+            min_x = np.clip(min_x, 0, width_pixels - 1)
+            max_x = np.clip(max_x, 0, width_pixels - 1)
+            min_y = np.clip(min_y, 0, height_pixels - 1)
+            max_y = np.clip(max_y, 0, height_pixels - 1)
+            
+            # Rasterize triangle pixels (simple scanline approach for each pixel in bounding box)
+            for py in range(min_y, max_y):
+                for px in range(min_x, max_x):
+                    # Convert pixel coordinates back to world coordinates
+                    wx = x_min + px / pixels_per_meter
+                    wy = y_min + py / pixels_per_meter
+                    
+                    # Check if this point is inside the triangle using barycentric coordinates
+                    # Triangle vertices: v0, v1, v2 (all with same Z for heightmap mesh)
+                    
+                    # Vector from v0 to test point
+                    d0 = np.array([wx - v0[0], wy - v0[1]])
+                    d1 = np.array([v1[0] - v0[0], v1[1] - v0[1]])
+                    d2 = np.array([v2[0] - v0[0], v2[1] - v0[1]])
+                    
+                    # Cross products for barycentric coordinate calculation (2D)
+                    cp01 = d0[0]*d1[1] - d0[1]*d1[0]  # z-component of cross product
+                    cp02 = d0[0]*d2[1] - d0[1]*d2[0]
+                    
+                    if (cp01 >= 0 and cp02 >= 0) or \
+                       (cp01 <= 0 and cp02 <= 0):
+                        # Point is inside triangle, interpolate color using barycentric coordinates
+                        
+                        # Calculate actual barycentric weights for smooth interpolation
+                        denom = d1[0]*d2[1] - d1[1]*d2[0]
+                        if abs(denom) > 1e-6:
+                            w1 = (d2[1]*(v0[0]-wx) + d2[0]*(wy-v0[1])) / denom
+                            w2 = (d1[0]*(vy:=w1*(v1[1]-v0[1])/(v1[0]-v0[0])+v0[1]-wy) - 
+                                  d1[1]*(wx-v0[0])) / denom if abs(v1[0]-v0[0]) > 1e-6 else 0
+                            w0 = 1.0 - w1 - max(0, min(1, w2))
+                            
+                            # Clamp weights to valid range and interpolate color
+                            w1, w2 = np.clip([w1, w2], 0, 1)
+                            w0 = 1.0 - w1 - w2
+                            w0 = max(0, min(1, w0))
+                            
+                            interpolated_color = (w0 * tri_colors[0] + 
+                                                w1 * tri_colors[1] + 
+                                                w2 * tri_colors[2])
+                            
+                            # Store color in buffer if brighter than existing value (for overlapping triangles)
+                            current_color = image_buffer[py, px]
+                            if np.sum(interpolated_color - current_color) > 0:
+                                image_buffer[py, px] = interpolated_color
+    
+    logger.info(f"Image buffer created with {np.sum(image_buffer > 0):,} non-background pixels")
+    
+    return image_buffer, metadata
+
+
+def log_image_buffer_visualization(buffer: np.ndarray, 
+                                   metadata: dict, 
+                                   output_dir: str) -> None:
+    """
+    Create and save visualization of the image buffer.
+    
+    Args:
+        buffer: H x W x 3 numpy array with float values in [0, 1] range
+        metadata: Dictionary containing buffer dimensions and scaling information
+        output_dir: Directory to save visualizations
+        
+    Returns:
+        Path to saved visualization file
+    """
+    
+    if len(buffer) == 0 or len(metadata) == 0:
+        logger.warning("Cannot visualize empty image buffer")
+        return
+    
+    width = metadata.get('width', buffer.shape[1])
+    height = metadata.get('height', buffer.shape[0])
+    pixels_per_meter = metadata.get('pixels_per_meter', 10)
+    
+    # Create visualization with multiple views
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # View 1: Full image buffer (top-down view of texture map)
+    ax_full = axes[0, 0]
+    im_full = ax_full.imshow(buffer, extent=[-width/2, width/2, -height/2, height/2], origin='lower')
+    ax_full.set_xlabel('Width (pixels)', fontsize=12)
+    ax_full.set_ylabel('Height (pixels)', fontsize=12)
+    ax_full.set_title(f"Image Buffer ({width}×{height})", fontsize=14, fontweight='bold')
+    plt.colorbar(im_full, ax=ax_full, label='RGB Intensity', shrink=0.8)
+    
+    # View 2: Zoomed center region (first quadrant for clarity)
+    zoom_x = min(width // 4, max(50, width // 10))
+    zoom_y = min(height // 4, max(50, height // 10))
+    ax_zoom = axes[0, 1]
+    im_zoom = ax_zoom.imshow(buffer[:zoom_y, :zoom_x], origin='lower', 
+                            extent=[-width/2, -width/2+zoom_x, -height/2, -height/2+zoom_y])
+    ax_zoom.set_xlabel('Width (pixels)', fontsize=12)
+    ax_zoom.set_ylabel('Height (pixels)', fontsize=12)
+    ax_zoom.set_title(f"Center Region ({zoom_x}×{zoom_y})", fontsize=14, fontweight='bold')
+    
+    # View 3: RGB channel breakdown - Red channel
+    ax_r = axes[0, 2]
+    im_r = ax_r.imshow(buffer[:, :, 0], cmap='Reds', origin='lower')
+    ax_r.set_xlabel('Width (pixels)', fontsize=12)
+    ax_r.set_ylabel('Height (pixels)', fontsize=12)
+    ax_r.set_title("Red Channel", fontsize=14, fontweight='bold')
+    
+    # View 4: RGB channel breakdown - Green channel  
+    ax_g = axes[1, 0]
+    im_g = ax_g.imshow(buffer[:, :, 1], cmap='Greens', origin='lower')
+    ax_g.set_xlabel('Width (pixels)', fontsize=12)
+    ax_g.set_ylabel('Height (pixels)', fontsize=12)
+    ax_g.set_title("Green Channel", fontsize=14, fontweight='bold')
+    
+    # View 5: RGB channel breakdown - Blue channel
+    ax_b = axes[1, 1]
+    im_b = ax_b.imshow(buffer[:, :, 2], cmap='Blues', origin='lower')
+    ax_b.set_xlabel('Width (pixels)', fontsize=12)
+    ax_b.set_ylabel('Height (pixels)', fontsize=12)
+    ax_b.set_title("Blue Channel", fontsize=14, fontweight='bold')
+    
+    # View 6: Non-background pixel density heatmap
+    non_bg_mask = np.any(buffer > 0.01, axis=-1).astype(float)
+    ax_density = axes[1, 2]
+    im_density = ax_density.imshow(non_bg_mask, cmap='viridis', origin='lower')
+    ax_density.set_xlabel('Width (pixels)', fontsize=12)
+    ax_density.set_ylabel('Height (pixels)', fontsize=12)
+    ax_density.set_title(f"Non-Background Pixels ({np.sum(non_bg_mask):,})", 
+                        fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save visualization with high DPI for publication quality
+    viz_path = os.path.join(output_dir, "image_buffer_visualization.png") if output_dir else None
+    
+    try:
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        logger.info(f"Saved image buffer visualization to {viz_path}")
+        
+        # Also save a lower resolution version for quick viewing
+        viz_path_lowres = os.path.join(output_dir, "image_buffer_preview.png") if output_dir else None
+        plt.savefig(viz_path_lowres, dpi=72, bbox_inches='tight')
+        logger.info(f"Saved preview visualization to {viz_path_lowres}")
+    except Exception as e:
+        logger.error(f"Error saving image buffer visualization: {e}")
+    
+    plt.close(fig)
+
+
+def save_image_buffer_as_png(buffer: np.ndarray, 
+                             metadata: dict, 
+                             output_path: str) -> None:
+    """
+    Save image buffer as a PNG file for external inspection.
+    
+    Args:
+        buffer: H x W x 3 numpy array with float values in [0, 1] range
+        metadata: Dictionary containing buffer dimensions and scaling information  
+        output_path: Path to save the PNG file
+        
+    Returns:
+        None (saves file directly)
+    """
+    
+    # Convert from normalized [0, 1] to uint8 [0-255] for PNG format
+    buffer_uint8 = np.clip(buffer * 255.0, 0, 255).astype(np.uint8)
+    
+    try:
+        plt.figure(figsize=(buffer.shape[1]/72, buffer.shape[0]/72), dpi=72)
+        plt.imshow(buffer_uint8)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
+        
+        logger.info(f"Saved image buffer as PNG to {output_path}")
+    except Exception as e:
+        # Fallback using PIL if matplotlib fails
+        try:
+            from PIL import Image
+            img = Image.fromarray(buffer_uint8, mode='RGB')
+            img.save(output_path)
+            logger.info(f"Saved image buffer as PNG (PIL fallback) to {output_path}")
+        except Exception as pil_error:
+            logger.error(f"Failed to save image buffer as PNG: {e}; PIL also failed: {pil_error}")
+
+
 def export_mesh_to_obj(vertices: torch.Tensor, 
                        faces: torch.Tensor, 
                        colors: Union[torch.Tensor, None] = None,
@@ -1045,12 +1320,72 @@ def main():
     except Exception as e:
         logger.error(f"Error during OBJ mesh export (Step 2.5): {e}")
     
+    # Step 3: Create image buffer for texture mapping (USER REQUIREMENT IMPLEMENTED HERE)
+    try:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 3 - IMAGE BUFFER CREATION")
+        logger.info("=" * 60)
+        
+        # Create the image buffer using point cloud dimensions as reference
+        image_buffer, buffer_metadata = create_image_buffer(
+            vertices_tensor, 
+            faces_tensor, 
+            vertex_colors if len(vertex_colors) > 0 else None
+        )
+        
+        # Log visualization of the image buffer
+        log_image_buffer_visualization(image_buffer, buffer_metadata, step1_dir)
+        
+        # Save image buffer as PNG for external inspection and later use in Step 4
+        png_path = os.path.join(step1_dir, "road_texture_map.png") if step1_dir else None
+        
+        try:
+            save_image_buffer_as_png(
+                image_buffer, 
+                buffer_metadata, 
+                png_path
+            )
+            
+            # Also save the raw numpy array for programmatic access in Step 4
+            npz_path = os.path.join(step1_dir, "image_buffer.npz") if step1_dir else None
+            
+            try:
+                np.savez_compressed(
+                    npz_path, 
+                    buffer=image_buffer, 
+                    **buffer_metadata
+                )
+                logger.info(f"Saved image buffer data to {npz_path}")
+                
+            except Exception as save_error:
+                logger.warning(f"Could not save .npz file (non-critical): {save_error}")
+            
+        except Exception as png_save_error:
+            logger.error(f"Error saving PNG visualization: {png_save_error}")
+        
+        # Log buffer statistics to console and file
+        if len(buffer_metadata) > 0:
+            width = buffer_metadata.get('width', 'N/A')
+            height = buffer_metadata.get('height', 'N/A')
+            pixels_per_meter = buffer_metadata.get('pixels_per_meter', 'N/A')
+            
+            logger.info(f"\nImage Buffer Statistics:")
+            logger.info(f"  - Resolution: {width} × {height}")
+            logger.info(f"  - Pixel density: {pixels_per_meter}px/meter")
+            logger.info(f"  - Scene coverage: {buffer_metadata.get('scene_width_meters', 0):.2f}m × {buffer_metadata.get('scene_height_meters', 0):.2f}m")
+            
+        # Save buffer metadata to JSON for later use in Step 4
+        import json
+            
+    except Exception as e:
+        logger.error(f"Error during image buffer creation (Step 3): {e}")
+    
     # Final summary logging
     logger.info("=" * 60)
-    logger.info("STEP 1 & STEP 2 COMPLETED SUCCESSFULLY")
+    logger.info("STEP 1, STEP 2 & STEP 3 COMPLETED SUCCESSFULLY")
     logger.info("=" * 60)
     logger.info(f"Output directory: {base_path}")
-    logger.info(f"Point cloud files saved to: {step1_dir}")
+    logger.info(f"All files saved to: {step1_dir}")
     
     if vertices_tensor is not None and len(vertices_tensor) > 0:
         logger.info("")
@@ -1059,10 +1394,15 @@ def main():
         logger.info(f"  - Vertices: {len(vertices_tensor):,}")
         logger.info(f"  - Faces (triangles): {len(faces_tensor):,}")
     
+    if 'image_buffer' in locals() and image_buffer is not None:
+        logger.info("")
+        logger.info("STEP 3 - IMAGE BUFFER CREATION COMPLETED:")
+        logger.info(f"  - Texture map file: road_texture_map.png")
+        logger.info(f"  - Buffer dimensions: {buffer_metadata.get('width', 'N/A')} × {buffer_metadata.get('height', 'N/A')} pixels")
+    
     logger.info("")
     logger.info("Next steps:")
-    logger.info("  - Step 3: Generate image buffer for texture mapping (4096x4096)")
-    logger.info("  - Step 4: Project RGB images onto the textured mesh")
+    logger.info("  - Step 4: Project RGB images onto the textured mesh using image buffer")
 
 
 if __name__ == "__main__":
