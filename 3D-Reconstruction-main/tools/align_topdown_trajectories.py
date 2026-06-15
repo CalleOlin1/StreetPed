@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
 def _pick_latest_npz(run_dir: Path) -> Path:
@@ -310,6 +311,45 @@ def _estimate_rigid_3d(src_xyz: np.ndarray, dst_xyz: np.ndarray) -> Tuple[np.nda
     return r, t
 
 
+def _rotation_from_roll_pitch_yaw(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Build rotation matrix as Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    rx = np.asarray([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+    ry = np.asarray([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+    rz = np.asarray([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def _estimate_roll_pitch_match_transform_from_reference_poses(
+    pose_a_ref: np.ndarray,
+    pose_b_ref: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return world-space transform (R, t) to apply to B so ref-pose B adopts ref-pose A roll/pitch.
+    Keeps B ref yaw unchanged and keeps B ref position fixed.
+    """
+    pose_a_ref = np.asarray(pose_a_ref, dtype=np.float64)
+    pose_b_ref = np.asarray(pose_b_ref, dtype=np.float64)
+
+    roll_a, pitch_a, _ = _rotation_to_euler_xyz_deg(pose_a_ref[:3, :3])
+    _, _, yaw_b = _rotation_to_euler_xyz_deg(pose_b_ref[:3, :3])
+
+    r_target = _rotation_from_roll_pitch_yaw(
+        np.radians(roll_a),
+        np.radians(pitch_a),
+        np.radians(yaw_b),
+    )
+    r_src = pose_b_ref[:3, :3]
+    r = r_target @ r_src.T
+
+    p_ref = pose_b_ref[:3, 3]
+    t = p_ref - (r @ p_ref)
+    return r, t
+
+
 def _mean_nn_distance(src_xyz: np.ndarray, dst_xyz: np.ndarray, chunk_size: int = 1024) -> float:
     if len(src_xyz) == 0 or len(dst_xyz) == 0:
         return float("nan")
@@ -327,7 +367,44 @@ def _mean_nn_distance(src_xyz: np.ndarray, dst_xyz: np.ndarray, chunk_size: int 
     return total / max(1, count)
 
 
-def _estimate_rigid_from_pointclouds_3d(
+def _estimate_yaw_translation_from_correspondences(
+    src_xyz: np.ndarray,
+    dst_xyz: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate yaw-only rotation and full translation from paired correspondences."""
+    if len(src_xyz) != len(dst_xyz):
+        raise ValueError("src_xyz and dst_xyz must have same length")
+    if len(src_xyz) < 2:
+        raise ValueError("Need at least 2 points to estimate yaw+translation")
+
+    src = np.asarray(src_xyz, dtype=np.float64)
+    dst = np.asarray(dst_xyz, dtype=np.float64)
+
+    src_xy = src[:, :2]
+    dst_xy = dst[:, :2]
+    src_xy_c = src_xy.mean(axis=0)
+    dst_xy_c = dst_xy.mean(axis=0)
+
+    src_xy_0 = src_xy - src_xy_c
+    dst_xy_0 = dst_xy - dst_xy_c
+
+    h = src_xy_0.T @ dst_xy_0
+    u, _, vt = np.linalg.svd(h)
+    r2 = vt.T @ u.T
+    if np.linalg.det(r2) < 0:
+        vt[-1, :] *= -1
+        r2 = vt.T @ u.T
+
+    r3 = np.eye(3, dtype=np.float64)
+    r3[:2, :2] = r2
+
+    t_xy = dst_xy_c - (r2 @ src_xy_c)
+    t_z = float(dst[:, 2].mean() - src[:, 2].mean())
+    t3 = np.asarray([t_xy[0], t_xy[1], t_z], dtype=np.float64)
+    return r3, t3
+
+
+def _estimate_yaw_translation_from_pointclouds(
     src_xyz: np.ndarray,
     dst_xyz: np.ndarray,
     max_iters: int = 20,
@@ -335,8 +412,7 @@ def _estimate_rigid_from_pointclouds_3d(
     tol: float = 1e-6,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
-    Estimate rigid transform (R, t) for src -> dst using 3D point-cloud ICP.
-    No scaling is used.
+    Estimate yaw-only rotation + translation transform (R, t) for src -> dst using ICP.
     """
     if len(src_xyz) == 0 or len(dst_xyz) == 0:
         return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64), float("nan"), float("nan")
@@ -361,7 +437,7 @@ def _estimate_rigid_from_pointclouds_3d(
             matched.append(dst[nn_idx])
         dst_match = np.concatenate(matched, axis=0)
 
-        r_delta, t_delta = _estimate_rigid_3d(moved, dst_match)
+        r_delta, t_delta = _estimate_yaw_translation_from_correspondences(moved, dst_match)
         r_total = r_delta @ r_total
         t_total = (r_delta @ t_total) + t_delta
 
@@ -467,6 +543,88 @@ def _set_axis_to_point_percentile(
     ax.set_ylim(y_mid - 0.5 * y_span, y_mid + 0.5 * y_span)
 
 
+def _rotation_to_euler_xyz_deg(r: np.ndarray) -> Tuple[float, float, float]:
+    """Return Euler XYZ angles (roll, pitch, yaw) in degrees."""
+    r = np.asarray(r, dtype=np.float64)
+    pitch = np.degrees(np.arcsin(np.clip(-r[2, 0], -1.0, 1.0)))
+    roll = np.degrees(np.arctan2(r[2, 1], r[2, 2]))
+    yaw = np.degrees(np.arctan2(r[1, 0], r[0, 0]))
+    return float(roll), float(pitch), float(yaw)
+
+
+def _plot_middle_pose_rectangles_3d(
+    ax,
+    pose_a: np.ndarray,
+    pose_b: np.ndarray,
+    label_b: str,
+    rect_w: float = 1.2,
+    rect_h: float = 0.7,
+) -> None:
+    """Plot camera-local XY rectangles in world space for two 3D c2w camera poses."""
+
+    def _corners_world(c2w: np.ndarray) -> np.ndarray:
+        # Rectangle in camera local XY plane centered at origin.
+        local = np.asarray(
+            [
+                [-0.5 * rect_w, -0.5 * rect_h, 0.0],
+                [0.5 * rect_w, -0.5 * rect_h, 0.0],
+                [0.5 * rect_w, 0.5 * rect_h, 0.0],
+                [-0.5 * rect_w, 0.5 * rect_h, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        rot = c2w[:3, :3]
+        pos = c2w[:3, 3]
+        return (rot @ local.T).T + pos[None, :]
+
+    pose_a = np.asarray(pose_a, dtype=np.float64)
+    pose_b = np.asarray(pose_b, dtype=np.float64)
+    ca = _corners_world(pose_a)
+    cb = _corners_world(pose_b)
+    pa = pose_a[:3, 3]
+    pb = pose_b[:3, 3]
+
+    poly_a = Poly3DCollection([ca], alpha=0.25, facecolor="tab:blue", edgecolor="navy", linewidth=1.5)
+    poly_b = Poly3DCollection([cb], alpha=0.25, facecolor="tab:orange", edgecolor="darkorange", linewidth=1.5)
+    ax.add_collection3d(poly_a)
+    ax.add_collection3d(poly_b)
+
+    # Outline and centers.
+    ca_closed = np.vstack([ca, ca[0]])
+    cb_closed = np.vstack([cb, cb[0]])
+    ax.plot(ca_closed[:, 0], ca_closed[:, 1], ca_closed[:, 2], c="navy", linewidth=1.5, label="Mid Pose A")
+    ax.plot(cb_closed[:, 0], cb_closed[:, 1], cb_closed[:, 2], c="darkorange", linewidth=1.5, label=f"Mid Pose {label_b}")
+    ax.scatter([pa[0], pb[0]], [pa[1], pb[1]], [pa[2], pb[2]], c=["navy", "darkorange"], s=40)
+
+    # Draw local +Z direction to emphasize pitch/roll orientation.
+    va = pose_a[:3, 2]
+    vb = pose_b[:3, 2]
+    ax.quiver(pa[0], pa[1], pa[2], va[0], va[1], va[2], length=0.9, color="navy")
+    ax.quiver(pb[0], pb[1], pb[2], vb[0], vb[1], vb[2], length=0.9, color="darkorange")
+
+    roll_a, pitch_a, _ = _rotation_to_euler_xyz_deg(pose_a[:3, :3])
+    roll_b, pitch_b, _ = _rotation_to_euler_xyz_deg(pose_b[:3, :3])
+    ax.set_title(
+        f"Middle 3D Camera Pose Rectangles\n"
+        f"A roll/pitch={roll_a:.2f}/{pitch_a:.2f} deg | {label_b} roll/pitch={roll_b:.2f}/{pitch_b:.2f} deg"
+    )
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.grid(True, alpha=0.25)
+    ax.view_init(elev=24, azim=-62)
+
+    pts = np.concatenate([ca, cb, pa[None, :], pb[None, :]], axis=0)
+    pmin = pts.min(axis=0)
+    pmax = pts.max(axis=0)
+    span = np.maximum(pmax - pmin, 0.6)
+    center = 0.5 * (pmin + pmax)
+    half = 0.65 * float(np.max(span))
+    ax.set_xlim(center[0] - half, center[0] + half)
+    ax.set_ylim(center[1] - half, center[1] + half)
+    ax.set_zlim(center[2] - half, center[2] + half)
+
+
 def _save_shifted_trajectory_npz(
     out_path: Path,
     shifted_positions: np.ndarray,
@@ -569,6 +727,81 @@ def _print_camera_comparison(
     pprint(summary, sort_dicts=False)
 
 
+def _print_cross_run_camera_comparison(
+    poses_a: np.ndarray,
+    poses_b_aligned: np.ndarray,
+    positions_a: np.ndarray,
+    positions_b_aligned: np.ndarray,
+    frame_indices_a: np.ndarray,
+    frame_indices_b: np.ndarray,
+) -> None:
+    """Debug print comparing camera A to aligned camera B on shared frames."""
+    poses_a = np.asarray(poses_a, dtype=np.float64)
+    poses_b = np.asarray(poses_b_aligned, dtype=np.float64)
+    pos_a = np.asarray(positions_a, dtype=np.float64)
+    pos_b = np.asarray(positions_b_aligned, dtype=np.float64)
+    fi_a = np.asarray(frame_indices_a, dtype=np.int64)
+    fi_b = np.asarray(frame_indices_b, dtype=np.int64)
+
+    if len(poses_a) == 0 or len(poses_b) == 0:
+        pprint({"cross_run_camera_comparison": "empty pose arrays"})
+        return
+
+    common = np.intersect1d(fi_a, fi_b)
+    if len(common) == 0:
+        n = min(len(poses_a), len(poses_b), len(pos_a), len(pos_b))
+        if n == 0:
+            pprint({"cross_run_camera_comparison": "no overlapping frames and no fallback samples"})
+            return
+        idx_a = np.arange(n)
+        idx_b = np.arange(n)
+        frame_label = "index_aligned_fallback"
+    else:
+        map_a = {int(f): i for i, f in enumerate(fi_a.tolist())}
+        map_b = {int(f): i for i, f in enumerate(fi_b.tolist())}
+        idx_a = np.asarray([map_a[int(f)] for f in common], dtype=np.int64)
+        idx_b = np.asarray([map_b[int(f)] for f in common], dtype=np.int64)
+        frame_label = "shared_frame_indices"
+
+    pa = poses_a[idx_a]
+    pb = poses_b[idx_b]
+    xa = pos_a[idx_a]
+    xb = pos_b[idx_b]
+
+    pos_delta = xb - xa
+    delta_norm = np.linalg.norm(pos_delta, axis=1)
+
+    # Relative rotation: R_rel = R_a^T * R_b. Report Euler xyz in degrees as a compact tilt indicator.
+    r_rel = np.einsum("nij,njk->nik", np.transpose(pa[:, :3, :3], (0, 2, 1)), pb[:, :3, :3])
+    pitch = np.degrees(np.arcsin(np.clip(-r_rel[:, 2, 0], -1.0, 1.0)))
+    roll = np.degrees(np.arctan2(r_rel[:, 2, 1], r_rel[:, 2, 2]))
+    yaw = np.degrees(np.arctan2(r_rel[:, 1, 0], r_rel[:, 0, 0]))
+
+    summary = {
+        "cross_run_camera_comparison": {
+            "num_compared": int(len(idx_a)),
+            "frame_mode": frame_label,
+            "position_delta_mean_xyz": pos_delta.mean(axis=0).round(6).tolist(),
+            "position_delta_std_xyz": pos_delta.std(axis=0).round(6).tolist(),
+            "position_delta_l2_mean": float(delta_norm.mean()),
+            "position_delta_l2_max": float(delta_norm.max()),
+            "relative_euler_deg_mean_xyz": [
+                float(np.mean(roll)),
+                float(np.mean(pitch)),
+                float(np.mean(yaw)),
+            ],
+            "relative_euler_deg_std_xyz": [
+                float(np.std(roll)),
+                float(np.std(pitch)),
+                float(np.std(yaw)),
+            ],
+            "relative_pitch_deg_abs_mean": float(np.mean(np.abs(pitch))),
+            "relative_roll_deg_abs_mean": float(np.mean(np.abs(roll))),
+        }
+    }
+    pprint(summary, sort_dicts=False)
+
+
 def _transform_camera_poses_3d(camera_poses: np.ndarray, r3: np.ndarray, t3: np.ndarray) -> np.ndarray:
     """Apply world-space 3D rigid transform (rotation + translation) to c2w camera poses."""
     poses = np.asarray(camera_poses, dtype=np.float64)
@@ -593,8 +826,8 @@ def main() -> None:
 
     parser.add_argument("--max-pc-points", type=int, default=15000, help="Max sampled points per cloud for plotting")
     parser.add_argument("--pc-alpha", type=float, default=0.15, help="Point cloud alpha in plot")
-    parser.add_argument("--pc-align-samples", type=int, default=1000, help="Sample size per cloud for point-cloud 3D rigid alignment")
-    parser.add_argument("--pc-align-iters", type=int, default=100, help="ICP iterations for point-cloud 3D rigid alignment")
+    parser.add_argument("--pc-align-samples", type=int, default=20000, help="Sample size per cloud for point-cloud yaw+translation alignment")
+    parser.add_argument("--pc-align-iters", type=int, default=200, help="ICP iterations for point-cloud yaw+translation alignment")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for point cloud subsampling")
     parser.add_argument("--no-auto-align", action="store_true", help="Skip automatic alignment and only plot raw overlay")
     parser.add_argument("--save-shifted-traj-b", type=Path, default=None, help="Optional output .npz path for shifted trajectory B")
@@ -643,13 +876,24 @@ def main() -> None:
     print(f"PointCloud B points (plotting): {len(pc_b_plot)} / {len(pc_b)}")
 
     if args.no_auto_align:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 9))
+        fig = plt.figure(figsize=(18, 8))
+        ax = fig.add_subplot(1, 2, 1)
         _plot_overlay(ax, traj_a, traj_b, pc_a_plot, pc_b_plot, "Raw Overlay", args.pc_alpha)
         _set_axis_to_point_percentile(
             ax,
             [pc_a_plot, pc_b_plot, traj_a, traj_b],
             keep_fraction=0.8,
         )
+        ax_pose = fig.add_subplot(1, 2, 2, projection="3d")
+        mid_a = len(traj_bundle_a["camera_poses"]) // 2
+        mid_b = len(traj_bundle_b["camera_poses"]) // 2
+        _plot_middle_pose_rectangles_3d(
+            ax_pose,
+            traj_bundle_a["camera_poses"][mid_a],
+            traj_bundle_b["camera_poses"][mid_b],
+            label_b="B (raw)",
+        )
+        ax_pose.legend(loc="best")
         handles, labels = ax.get_legend_handles_labels()
         uniq = dict(zip(labels, handles))
         ax.legend(uniq.values(), uniq.keys(), loc="best")
@@ -678,28 +922,115 @@ def main() -> None:
             )
             print("Note: --no-auto-align enabled, so saved trajectory B is unshifted.")
     else:
-        # Point-cloud-only alignment: estimate 3D rigid transform (rotation + translation).
+
+        # Estimate the rigid transform from point cloud B to A using SGD
         pc_a_fit = _subsample(pc_a, args.pc_align_samples, args.seed + 10)
         pc_b_fit = _subsample(pc_b, args.pc_align_samples, args.seed + 11)
 
-        r_pc3, t_pc3, before_refine, after_refine = _estimate_rigid_from_pointclouds_3d(
-            pc_b_fit[:, :3],
-            pc_a_fit[:, :3],
-            max_iters=args.pc_align_iters,
+
+        def icp_rigid_align(src, dst, max_translation=10.0, max_rotation_deg=10.0, n_iter=30):
+            # src, dst: [N,3] arrays
+            src = src.copy()
+            dst = dst.copy()
+            R_total = np.eye(3)
+            t_total = np.zeros(3)
+            msd_history = []
+            for it in range(n_iter):
+                # Find nearest neighbors
+                diff = src[:, None, :] - dst[None, :, :]
+                d2 = np.sum(diff**2, axis=2)
+                nn_idx = np.argmin(d2, axis=1)
+                dst_corr = dst[nn_idx]
+                # Compute optimal rigid transform (Kabsch)
+                src_cent = src.mean(axis=0)
+                dst_cent = dst_corr.mean(axis=0)
+                src_c = src - src_cent
+                dst_c = dst_corr - dst_cent
+                H = src_c.T @ dst_c
+                U, S, Vt = np.linalg.svd(H)
+                R = Vt.T @ U.T
+                if np.linalg.det(R) < 0:
+                    Vt[-1, :] *= -1
+                    R = Vt.T @ U.T
+                # Clamp rotation angle
+                rot_trace = np.clip(np.trace(R), -1.0, 3.0)
+                rot_angle = np.arccos((rot_trace - 1) / 2)
+                if np.degrees(rot_angle) > max_rotation_deg:
+                    theta = np.radians(max_rotation_deg)
+                    axis = np.array([
+                        R[2,1] - R[1,2],
+                        R[0,2] - R[2,0],
+                        R[1,0] - R[0,1]
+                    ])
+                    axis_norm = np.linalg.norm(axis)
+                    if axis_norm < 1e-8:
+                        axis = np.array([1.0, 0.0, 0.0])
+                    else:
+                        axis = axis / axis_norm
+                    K = np.array([
+                        [0, -axis[2], axis[1]],
+                        [axis[2], 0, -axis[0]],
+                        [-axis[1], axis[0], 0]
+                    ])
+                    R = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+                t = dst_cent - R @ src_cent
+                # Clamp translation
+                t_norm = np.linalg.norm(t)
+                if t_norm > max_translation:
+                    t = t * (max_translation / t_norm)
+                # Apply transform
+                src = (R @ src.T).T + t
+                # Accumulate
+                R_total = R @ R_total
+                t_total = R @ t_total + t
+                # MSD
+                msd = np.mean(np.sum((src - dst_corr) ** 2, axis=1))
+                msd_history.append(msd)
+                print(f"ICP Iter {it+1:2d}: MSD = {msd:.6f}")
+            return R_total, t_total, msd_history
+
+        r_3d, t_3d, msd_history = icp_rigid_align(pc_b_fit[:, :3], pc_a_fit[:, :3], max_translation=10.0, max_rotation_deg=10.0, n_iter=30)
+
+        # Plot MSD over iterations
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.plot(msd_history)
+        plt.xlabel('Iteration')
+        plt.ylabel('Mean Squared Distance')
+        plt.title('ICP Alignment MSD over Iterations')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        # Apply this transform to B's point cloud and camera poses (to express them in A's world space)
+        traj_b_in_a = _apply_transform_xyz(traj_b, r_3d, t_3d)
+        pc_b_in_a = _apply_transform_xyz(pc_b_plot, r_3d, t_3d)
+        poses_b_in_a = np.asarray(traj_bundle_b["camera_poses"], dtype=np.float64)
+        # Build 4x4 transform
+        tf = np.eye(4, dtype=np.float64)
+        tf[:3, :3] = r_3d
+        tf[:3, 3] = t_3d
+        poses_b_in_a = np.einsum("ij,njk->nik", tf, poses_b_in_a)
+
+        _print_cross_run_camera_comparison(
+            poses_a=traj_bundle_a["camera_poses"],
+            poses_b_aligned=poses_b_in_a,
+            positions_a=traj_bundle_a["positions"],
+            positions_b_aligned=traj_b_in_a,
+            frame_indices_a=traj_bundle_a["frame_indices"],
+            frame_indices_b=traj_bundle_b["frame_indices"],
         )
 
-        # Apply same 3D rigid transform to cloud, trajectory, and camera poses.
-        traj_b_aligned = _apply_transform_xyz(traj_b, r_pc3, t_pc3)
-        pc_b_aligned = _apply_transform_xyz(pc_b_plot, r_pc3, t_pc3)
-        pose_b_aligned = _transform_camera_poses_3d(traj_bundle_b["camera_poses"], r_pc3, t_pc3)
+        print("Rigid transform (B -> A world space):")
+        print(f"  Rotation matrix (3x3):\n{r_3d}")
+        print(f"  Translation vector: {t_3d}")
 
-        yaw_deg = float(np.degrees(np.arctan2(r_pc3[1, 0], r_pc3[0, 0])))
-        print("Estimated 3D rigid transform from point clouds only (B -> A):")
-        print(f"  yaw (deg): {yaw_deg:.6f}")
-        print(f"  translation xyz: tx={t_pc3[0]:.6f}, ty={t_pc3[1]:.6f}, tz={t_pc3[2]:.6f}")
-        print(f"  mean NN distance: {before_refine:.6f} -> {after_refine:.6f}")
-
-        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+        fig = plt.figure(figsize=(26, 8))
+        axes = [
+            fig.add_subplot(1, 3, 1),
+            fig.add_subplot(1, 3, 2),
+            fig.add_subplot(1, 3, 3, projection="3d"),
+        ]
         _plot_overlay(
             axes[0],
             traj_a,
@@ -717,45 +1048,55 @@ def main() -> None:
         _plot_overlay(
             axes[1],
             traj_a,
-            traj_b_aligned,
+            traj_b_in_a,
             pc_a_plot,
-            pc_b_aligned,
-            "After Alignment (B -> A)",
+            pc_b_in_a,
+            "B in A World Space",
             args.pc_alpha,
         )
         _set_axis_to_point_percentile(
             axes[1],
-            [pc_a_plot, pc_b_aligned, traj_a, traj_b_aligned],
+            [pc_a_plot, pc_b_in_a, traj_a, traj_b_in_a],
             keep_fraction=0.8,
+        )
+
+        mid_a = len(traj_bundle_a["camera_poses"]) // 2
+        mid_b = len(poses_b_in_a) // 2
+        _plot_middle_pose_rectangles_3d(
+            axes[2],
+            traj_bundle_a["camera_poses"][mid_a],
+            poses_b_in_a[mid_b],
+            label_b="B (in A world)",
         )
 
         if args.save_shifted_traj_b is not None:
             _save_shifted_trajectory_npz(
                 args.save_shifted_traj_b,
-                traj_b_aligned,
+                traj_b_in_a,
                 traj_npz_b,
-                shifted_camera_poses=pose_b_aligned,
+                shifted_camera_poses=poses_b_in_a,
                 frame_indices=traj_bundle_b["frame_indices"],
                 cam_names=traj_bundle_b["cam_names"],
                 cam_ids=traj_bundle_b["cam_ids"],
-                transform_r2=np.asarray(r_pc3[:2, :2], dtype=np.float64),
-                transform_t2=np.asarray(t_pc3[:2], dtype=np.float64),
-                transform_r3=r_pc3,
-                transform_t3=t_pc3,
+                transform_r2=np.asarray(r_3d[:2, :2], dtype=np.float64),
+                transform_t2=np.asarray(t_3d[:2], dtype=np.float64),
+                transform_r3=r_3d,
+                transform_t3=t_3d,
             )
             _print_camera_comparison(
                 source_positions=traj_bundle_b["positions"],
-                shifted_positions=traj_b_aligned,
+                shifted_positions=traj_b_in_a,
                 source_poses=traj_bundle_b["camera_poses"],
-                shifted_poses=pose_b_aligned,
+                shifted_poses=poses_b_in_a,
                 frame_indices=traj_bundle_b["frame_indices"],
-                transform_r2=np.asarray(r_pc3[:2, :2], dtype=np.float64),
-                transform_t2=np.asarray(t_pc3[:2], dtype=np.float64),
+                transform_r2=np.asarray(r_3d[:2, :2], dtype=np.float64),
+                transform_t2=np.asarray(t_3d[:2], dtype=np.float64),
             )
 
         handles, labels = axes[0].get_legend_handles_labels()
         uniq = dict(zip(labels, handles))
         axes[1].legend(uniq.values(), uniq.keys(), loc="best")
+        axes[2].legend(loc="best")
 
     plt.tight_layout()
 

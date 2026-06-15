@@ -64,7 +64,7 @@ trainer:
     cull_screen_size: 0.15 # if a gaussian is more than this percent of screen space, cull it
     split_screen_size: 0.05 # if a gaussian is more than this percent of screen space, split it
     stop_screen_size_at: 5000 # stop culling/splitting at this step WRT screen size of gaussians
-    stop_split_at: 20000 # stop splitting at this step
+    stop_split_at: 12000 # stop splitting at this step
     sh_degree: 3 # sh degree for gaussians
 
 # ------------- Model ------------ #
@@ -91,7 +91,7 @@ model:
     ctrl:
       cull_scale_thresh: 0.1
       stop_screen_size_at: 30000
-      stop_split_at: 20000
+      stop_split_at: 12000
       cull_out_of_bound: true
     reg:
       sharp_shape_reg:
@@ -127,7 +127,7 @@ model:
       reset_alpha_value: 0.1
       cull_scale_thresh: 0.1
       stop_screen_size_at: 30000
-      stop_split_at: 20000
+      stop_split_at: 12000
       sh_degree: 3
       cull_out_of_bound: false
       use_deformgs_for_nonrigid: True # default True

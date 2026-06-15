@@ -676,7 +676,7 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                 frame_data["cam_infos"][key] = value.cuda(non_blocking=True)
             for key, value in frame_data["image_infos"].items():
                 frame_data["image_infos"][key] = value.cuda(non_blocking=True)
-            
+
             # Perform rendering
             outputs = trainer(
                 image_infos=frame_data["image_infos"],
@@ -684,28 +684,36 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                 novel_view=True
             )
 
+            # Move all outputs to CPU and delete GPU references
+            outputs_cpu = {}
+            for k, v in outputs.items():
+                if hasattr(v, 'cpu'):
+                    outputs_cpu[k] = v.cpu()
+                else:
+                    outputs_cpu[k] = v
+            del outputs
+
             # Raw RGB data saving
-            rgb_raw = outputs["rgb"].cpu().numpy()  # Keep original data [H, W, 3]
-            
+            rgb_raw = outputs_cpu["rgb"].numpy()  # Keep original data [H, W, 3]
+
             # Generate unique filename
             frame_idx = frame_data["image_infos"]["frame_idx"][0,0].item()
-            
+
             # Generate filename
             raw_rgb_path = os.path.join(
                 raw_output_dir, 
                 f"new_frame{frame_idx:04d}.npy"
             )
-            
+
             # Save raw floating point data
             np.save(raw_rgb_path, rgb_raw)
             logger.debug(f"Saved raw RGB to {raw_rgb_path}")
 
-            
             # Extract RGB image and mask
-            rgb = outputs["rgb"].cpu().numpy().clip(
+            rgb = outputs_cpu["rgb"].numpy().clip(
                 min=1.e-6, max=1-1.e-6
             )
-            
+
             # Convert to uint8 and write to video
             rgb_uint8 = (rgb * 255).astype(np.uint8)
             writer.append_data(rgb_uint8)
@@ -715,7 +723,10 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                 img_path = os.path.join(image_output_dir, f"frame{frame_idx:04d}.png")
                 img = Image.fromarray(rgb_uint8)
                 img.save(img_path)
-                
+
+            # Explicitly delete CPU outputs and clear cache
+            del outputs_cpu, rgb_raw, rgb, rgb_uint8
+            torch.cuda.empty_cache()
         writer.close()
         print(f"video_utils.py:706 > Video saved to {save_path}")
 

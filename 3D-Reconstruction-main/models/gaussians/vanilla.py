@@ -59,6 +59,9 @@ class VanillaGaussians(nn.Module):
         self._opacities = torch.zeros(1, 1, device=self.device)
         self._features_dc = torch.zeros(1, 3, device=self.device)
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)
+        self.surface_normal_lock = None
+        self._trainable_point_mask = None
+        self._trainable_point_mask_hooks = []
         
     @property
     def sh_degree(self):
@@ -135,6 +138,94 @@ class VanillaGaussians(nn.Module):
     
     def quat_act(self, x: torch.Tensor) -> torch.Tensor:
         return x / x.norm(dim=-1, keepdim=True)
+
+    def set_surface_normal_lock(self, normal: torch.Tensor) -> None:
+        if normal is None:
+            self.surface_normal_lock = None
+            return
+        normal = normal.to(self.device).float()
+        self.surface_normal_lock = normal / normal.norm().clamp_min(1e-8)
+
+    def _clear_trainable_point_mask_hooks(self) -> None:
+        for handle in self._trainable_point_mask_hooks:
+            handle.remove()
+        self._trainable_point_mask_hooks = []
+
+    def _apply_trainable_point_mask_hooks(self) -> None:
+        self._clear_trainable_point_mask_hooks()
+        if self._trainable_point_mask is None:
+            return
+
+        if self._trainable_point_mask.shape[0] != self.num_points:
+            raise ValueError(
+                f"Trainable point mask has length {self._trainable_point_mask.shape[0]}, expected {self.num_points}"
+            )
+
+        def _mask_grad(grad):
+            if grad is None:
+                return None
+            view = self._trainable_point_mask.to(device=grad.device, dtype=grad.dtype)
+            while view.ndim < grad.ndim:
+                view = view.unsqueeze(-1)
+            return grad * view
+
+        for attr_name in ["_means", "_features_dc", "_features_rest", "_opacities", "_scales", "_quats"]:
+            param = getattr(self, attr_name, None)
+            if isinstance(param, Parameter):
+                self._trainable_point_mask_hooks.append(param.register_hook(_mask_grad))
+
+    def set_trainable_point_mask(self, trainable_mask) -> None:
+        if trainable_mask is None:
+            self._trainable_point_mask = None
+            self._clear_trainable_point_mask_hooks()
+            return
+
+        self._trainable_point_mask = trainable_mask.to(device=self.device, dtype=torch.bool)
+        self._apply_trainable_point_mask_hooks()
+
+    def _apply_surface_normal_lock(self, quats: torch.Tensor) -> torch.Tensor:
+        if self.surface_normal_lock is None:
+            return quats
+
+        n = self.surface_normal_lock[None, :].expand(quats.shape[0], -1)
+        rots = quat_to_rotmat(quats)
+
+        x_axis = rots[..., :, 0]
+        x_proj = x_axis - (x_axis * n).sum(dim=-1, keepdim=True) * n
+
+        y_axis = rots[..., :, 1]
+        y_proj = y_axis - (y_axis * n).sum(dim=-1, keepdim=True) * n
+
+        x_proj_norm = x_proj.norm(dim=-1, keepdim=True)
+        y_proj_norm = y_proj.norm(dim=-1, keepdim=True)
+        use_y = (x_proj_norm.squeeze(-1) < 1e-6) & (y_proj_norm.squeeze(-1) > 1e-6)
+        x_proj = torch.where(use_y[:, None], y_proj, x_proj)
+
+        x_proj = x_proj / x_proj.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        y_new = torch.cross(n, x_proj, dim=-1)
+        y_new = y_new / y_new.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        locked_rots = torch.stack([x_proj, y_new, n], dim=-1)
+        return matrix_to_quaternion(locked_rots)
+
+    def enforce_surface_normal_lock_(self) -> None:
+        """Project stored quaternions to the surface-normal lock manifold in place.
+
+        This keeps parameters consistent with the locked forward model while preserving
+        yaw (rotation around the locked normal) encoded in the current quaternion.
+        """
+        if self.surface_normal_lock is None:
+            return
+        with torch.no_grad():
+            normalized_quats = self.quat_act(self._quats.detach())
+            locked_quats = self._apply_surface_normal_lock(normalized_quats)
+            self._quats.data.copy_(locked_quats)
+
+    def enforce_scale_limits_(self) -> None:
+        pass
+
+    def set_spherical_harmonics_(self, degree=0):
+        pass
     
     def preprocess_per_train_step(self, step: int):
         self.step = step
@@ -374,6 +465,7 @@ class VanillaGaussians(nn.Module):
         activated_opacities = self.get_opacity
         activated_scales = self.get_scaling
         activated_rotations = self.get_quats
+        activated_rotations = self._apply_surface_normal_lock(activated_rotations)
         actovated_colors = rgbs
         
         # collect gaussians information

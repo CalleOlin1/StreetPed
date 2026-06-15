@@ -57,9 +57,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--scene_ids",
         default=None,
-        type=int,
+        type=str,
         nargs="+",
-        help="scene ids to be processed, a list of integers separated by space. Range: [0, 798] for training, [0, 202] for validation",
+        help="scene ids to be processed. Supports numeric IDs (e.g. 0 1) and named IDs (e.g. scene_001_clip_000).",
     )
     parser.add_argument(
         "--split_file", type=str, default=None, help="Split file in data/waymo_splits"
@@ -81,6 +81,11 @@ if __name__ == "__main__":
         action='store_true',
         help="Whether to process dynamic masks",
     )
+    parser.add_argument(
+        '--process_road_mask',
+        action='store_true',
+        help="Whether to process road masks",
+    )
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--ignore_existing', action='store_true')
     parser.add_argument('--no_compress', action='store_true')
@@ -96,27 +101,47 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     if args.config is None:
-        args.config = os.path.join(args.segformer_path, 'local_configs', 'segformer', 'B5', 'segformer.b5.1024x1024.city.160k.py')
+        args.config = os.path.join(
+            args.segformer_path,
+            'local_configs',
+            'segformer',
+            'B5',
+            'segformer.b5.1024x1024.city.160k.py',
+        )
     if args.checkpoint is None:
         args.checkpoint = os.path.join(args.segformer_path, 'pretrained', 'segformer.b5.1024x1024.city.160k.pth')
     
     if args.scene_ids is not None:
-        scene_ids_list = args.scene_ids
+        scene_ids_list = []
+        for scene_id in args.scene_ids:
+            if scene_id.isdigit():
+                scene_ids_list.append(int(scene_id))
+            else:
+                scene_ids_list.append(scene_id)
     elif args.split_file is not None:
         # parse the split file
-        split_file = open(args.split_file, "r").readlines()[1:]
-        # NOTE: small hack here, to be refined in the futher (TODO)
-        if "kitti" in args.split_file or "nuplan" in args.split_file:
-            scene_ids_list = [line.strip().split(",")[0] for line in split_file]
-        else:
-            scene_ids_list = [int(line.strip().split(",")[0]) for line in split_file]
+        split_lines = open(args.split_file, "r").readlines()
+        # Support both header + rows and plain row files.
+        if len(split_lines) > 0 and split_lines[0].lstrip().startswith("#"):
+            split_lines = split_lines[1:]
+        scene_ids_list = []
+        for line in split_lines:
+            token = line.strip().split(",")[0]
+            if token == "":
+                continue
+            if token.isdigit():
+                scene_ids_list.append(int(token))
+            else:
+                scene_ids_list.append(token)
     else:
         scene_ids_list = np.arange(args.start_idx, args.start_idx + args.num_scenes)
     
     model = init_segmentor(args.config, args.checkpoint, device=args.device)
     
     for scene_i, scene_id in enumerate(tqdm(scene_ids_list, f'Extracting Masks ...')):
-        scene_id = str(scene_id).zfill(3)
+        scene_id = str(scene_id)
+        if scene_id.isdigit():
+            scene_id = scene_id.zfill(3)
         img_dir = os.path.join(args.data_root, scene_id, args.rgb_dirname)
         
         # create mask dir
@@ -138,6 +163,12 @@ if __name__ == "__main__":
             vehicle_mask_dir = os.path.join(args.data_root, scene_id, "fine_dynamic_masks", "vehicle")
             if not os.path.exists(vehicle_mask_dir):
                 os.makedirs(vehicle_mask_dir)
+
+        # create road mask dir
+        if args.process_road_mask:
+            road_mask_dir = os.path.join(args.data_root, scene_id, "road_masks")
+            if not os.path.exists(road_mask_dir):
+                os.makedirs(road_mask_dir)
         
         flist = sorted(glob(os.path.join(img_dir, '*')))
         for fpath in tqdm(flist, f'scene[{scene_id}]'):
@@ -162,6 +193,10 @@ if __name__ == "__main__":
             # save sky mask
             sky_mask = np.isin(mask, [10])
             imageio.imwrite(os.path.join(sky_mask_dir, f"{fbase}.png"), sky_mask.astype(np.uint8)*255)
+
+            if args.process_road_mask:
+                road_mask = np.isin(mask, [0])
+                imageio.imwrite(os.path.join(road_mask_dir, f"{fbase}.png"), road_mask.astype(np.uint8)*255)
             
             if args.process_dynamic_mask:
                 # save human masks

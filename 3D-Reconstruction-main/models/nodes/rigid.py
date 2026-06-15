@@ -16,6 +16,8 @@ logger = logging.getLogger()
 class RigidNodes(VanillaGaussians):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._trainable_instance_mask = None
+        self._trainable_instance_mask_hooks = []
 
     @property
     def num_instances(self):
@@ -33,6 +35,38 @@ class RigidNodes(VanillaGaussians):
 
     def set_cur_frame(self, frame_id: int):
         self.cur_frame = frame_id
+
+    def _clear_trainable_instance_mask_hooks(self) -> None:
+        for handle in self._trainable_instance_mask_hooks:
+            handle.remove()
+        self._trainable_instance_mask_hooks = []
+
+    def freeze_to_instance(self, object_id: int) -> None:
+        object_id = int(object_id)
+        if object_id < 0 or object_id >= self.num_instances:
+            raise ValueError(
+                f"Rigid object id {object_id} is out of range for {self.num_instances} instances"
+            )
+
+        trainable_point_mask = self.point_ids[..., 0] == object_id
+        self.set_trainable_point_mask(trainable_point_mask)
+
+        self._trainable_instance_mask = torch.zeros(self.num_instances, dtype=torch.bool, device=self.device)
+        self._trainable_instance_mask[object_id] = True
+
+        self._clear_trainable_instance_mask_hooks()
+
+        def _mask_instance_grad(grad):
+            if grad is None:
+                return None
+            view = self._trainable_instance_mask.to(device=grad.device, dtype=grad.dtype)
+            if grad.ndim == 1:
+                return grad * view
+            view = view.view(1, -1, *([1] * (grad.ndim - 2)))
+            return grad * view
+
+        self._trainable_instance_mask_hooks.append(self.instances_quats.register_hook(_mask_instance_grad))
+        self._trainable_instance_mask_hooks.append(self.instances_trans.register_hook(_mask_instance_grad))
 
     def register_normalized_timestamps(self, normalized_timestamps: int):
         self.normalized_timestamps = normalized_timestamps

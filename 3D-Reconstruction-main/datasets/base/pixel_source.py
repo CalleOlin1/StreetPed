@@ -53,6 +53,13 @@ def get_rays(
         intrinsic = intrinsic[None, :, :]
     if len(c2w.shape) == 2:
         c2w = c2w[None, :, :]
+
+    if x.device != c2w.device or y.device != c2w.device or intrinsic.device != c2w.device:
+        raise RuntimeError(
+            "Device mismatch in get_rays: "
+            f"x={x.device}, y={y.device}, c2w={c2w.device}, intrinsic={intrinsic.device}. "
+            "Move trajectory/intrinsics/grids to the same device before calling get_rays."
+        )
     camera_dirs = torch.nn.functional.pad(
         torch.stack(
             [
@@ -105,6 +112,10 @@ class CameraData(object):
         load_dynamic_mask: bool = False,
         # whether to load the sky masks
         load_sky_mask: bool = False,
+        # whether to load RGB images
+        load_rgb_images: bool = True,
+        # whether to load road masks
+        load_road_mask: bool = True,
         # the size to load the images
         downscale_when_loading: float = 1.0,
         # whether to undistort the images
@@ -124,25 +135,84 @@ class CameraData(object):
         self.device = device
         
         self.cam_name = DATASETS_CONFIG[dataset_name][cam_id]["camera_name"]
-        self.original_size = DATASETS_CONFIG[dataset_name][cam_id]["original_size"]
+        # Build file lists first so we can infer real image resolution from disk.
+        self.create_all_filelist()
+
+        self.original_size = self._infer_original_size_from_images(
+            fallback_size=DATASETS_CONFIG[dataset_name][cam_id]["original_size"]
+        )
         self.load_size = [
             int(self.original_size[0] / downscale_when_loading),
             int(self.original_size[1] / downscale_when_loading),
         ]
-        
+
         # Load the images, dynamic masks, sky masks, etc.
-        self.create_all_filelist()
+        self.images = None
+        self.egocar_mask = None
+        self.dynamic_masks = None
+        self.human_masks = None
+        self.vehicle_masks = None
+        self.sky_masks = None
+        self.road_masks = None
         self.load_calibrations()
-        self.load_images()
-        self.load_egocar_mask()
+        if load_rgb_images:
+            self.load_images()
+            self.load_egocar_mask()
         if load_dynamic_mask:
             self.load_dynamic_masks()
         if load_sky_mask:
             self.load_sky_masks()
+        if load_road_mask and len(self.road_mask_filepaths) > 0 and all(os.path.exists(fp) for fp in self.road_mask_filepaths):
+            self.load_road_masks()
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)
         self.downscale_factor = 1.0
+
+    def _infer_original_size_from_images(self, fallback_size: Tuple[int, int]) -> Tuple[int, int]:
+        """
+        Infer (H, W) from the first image file in this camera stream.
+        Falls back to metadata size if files are missing/unreadable.
+        """
+        if len(self.img_filepaths) == 0:
+            logger.warning(
+                "No image filepaths found for %s cam %s. Falling back to metadata size %s.",
+                self.dataset_name,
+                self.cam_id,
+                fallback_size,
+            )
+            return fallback_size
+
+        first_image_path = self.img_filepaths[0]
+        if not os.path.exists(first_image_path):
+            logger.warning(
+                "Image file %s not found. Falling back to metadata size %s.",
+                first_image_path,
+                fallback_size,
+            )
+            return fallback_size
+
+        try:
+            with Image.open(first_image_path) as img:
+                width, height = img.size
+            inferred_size = (height, width)
+            if inferred_size != fallback_size:
+                logger.info(
+                    "Using inferred image size %s for %s cam %s (metadata: %s).",
+                    inferred_size,
+                    self.dataset_name,
+                    self.cam_id,
+                    fallback_size,
+                )
+            return inferred_size
+        except Exception as e:
+            logger.warning(
+                "Failed to infer image size from %s (%s). Falling back to metadata size %s.",
+                first_image_path,
+                str(e),
+                fallback_size,
+            )
+            return fallback_size
         
     @property
     def num_frames(self) -> int:
@@ -194,6 +264,7 @@ class CameraData(object):
         img_filepaths = []
         dynamic_mask_filepaths, sky_mask_filepaths = [], []
         human_mask_filepaths, vehicle_mask_filepaths = [], []
+        road_mask_filepaths = []
         
         fine_mask_path = os.path.join(self.data_path, "fine_dynamic_masks")
         if os.path.exists(fine_mask_path):
@@ -226,11 +297,15 @@ class CameraData(object):
             sky_mask_filepaths.append(
                 os.path.join(self.data_path, "sky_masks", f"{t:03d}_{self.cam_id}.png")
             )
+            road_mask_filepaths.append(
+                os.path.join(self.data_path, "road_masks", f"{t:03d}_{self.cam_id}.png")
+            )
         self.img_filepaths = np.array(img_filepaths)
         self.dynamic_mask_filepaths = np.array(dynamic_mask_filepaths)
         self.human_mask_filepaths = np.array(human_mask_filepaths)
         self.vehicle_mask_filepaths = np.array(vehicle_mask_filepaths)
         self.sky_mask_filepaths = np.array(sky_mask_filepaths)
+        self.road_mask_filepaths = np.array(road_mask_filepaths)
         
     def load_images(self):
         images = []
@@ -373,6 +448,29 @@ class CameraData(object):
                 )
             sky_masks.append(np.array(sky_mask) > 0)
         self.sky_masks = torch.from_numpy(np.stack(sky_masks, axis=0)).float()
+
+    def load_road_masks(self):
+        road_masks = []
+        for ix, fname in tqdm(
+            enumerate(self.road_mask_filepaths),
+            desc="Loading road masks",
+            dynamic_ncols=True,
+            total=len(self.road_mask_filepaths),
+        ):
+            road_mask = Image.open(fname).convert("L")
+            road_mask = road_mask.resize(
+                (self.load_size[1], self.load_size[0]), Image.NEAREST
+            )
+            if self.undistort:
+                if ix == 0:
+                    print("undistorting road mask")
+                road_mask = cv2.undistort(
+                    np.array(road_mask),
+                    self.intrinsics[ix].numpy(),
+                    self.distortions[ix].numpy(),
+                )
+            road_masks.append(np.array(road_mask) > 0)
+        self.road_masks = torch.from_numpy(np.stack(road_masks, axis=0)).float()
         
     def load_depth(
         self,
@@ -458,7 +556,8 @@ class CameraData(object):
         self.intrinsics = self.intrinsics.to(device)
         if self.distortions is not None:
             self.distortions = self.distortions.to(device)
-        self.images = self.images.to(device)
+        if self.images is not None:
+            self.images = self.images.to(device)
         if self.egocar_mask is not None:
             self.egocar_mask = self.egocar_mask.to(device)
         if self.dynamic_masks is not None:
@@ -469,6 +568,8 @@ class CameraData(object):
             self.vehicle_masks = self.vehicle_masks.to(device)
         if self.sky_masks is not None:
             self.sky_masks = self.sky_masks.to(device)
+        if self.road_masks is not None:
+            self.road_masks = self.road_masks.to(device)
         if self.lidar_depth_maps is not None:
             self.lidar_depth_maps = self.lidar_depth_maps.to(device)
         if self.image_error_maps is not None:
@@ -483,6 +584,7 @@ class CameraData(object):
             a dict containing the rays for rendering the given frame index.
         """
         rgb, sky_mask = None, None
+        road_mask = None
         dynamic_mask, human_mask, vehicle_mask = None, None, None
         pixel_coords, normalized_time = None, None
         egocar_mask = None
@@ -503,6 +605,8 @@ class CameraData(object):
                 img_height, img_width = rgb.shape[:2]
             else:
                 img_height, img_width = self.HEIGHT, self.WIDTH
+        else:
+            img_height, img_width = self.HEIGHT, self.WIDTH
 
         x, y = torch.meshgrid(
             torch.arange(img_width),
@@ -535,6 +639,18 @@ class CameraData(object):
                 sky_mask = (
                     torch.nn.functional.interpolate(
                         sky_mask.unsqueeze(0).unsqueeze(0),
+                        scale_factor=self.downscale_factor,
+                        mode="nearest",
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
+        if self.road_masks is not None:
+            road_mask = self.road_masks[frame_idx]
+            if self.downscale_factor != 1.0:
+                road_mask = (
+                    torch.nn.functional.interpolate(
+                        road_mask.unsqueeze(0).unsqueeze(0),
                         scale_factor=self.downscale_factor,
                         mode="nearest",
                     )
@@ -638,6 +754,7 @@ class CameraData(object):
             "frame_idx": frame_id,
             "pixels": rgb,
             "sky_masks": sky_mask,
+            "road_masks": road_mask,
             "dynamic_masks": dynamic_mask,
             "human_masks": human_mask,
             "vehicle_masks": vehicle_mask,
@@ -698,6 +815,7 @@ class ScenePixelSource(abc.ABC):
         self.device = device
         self._downscale_factor = 1 / pixel_data_config.downscale
         self._old_downscale_factor = []
+        self.load_rgb_images = bool(pixel_data_config.get("load_rgb_images", True))
 
     @abc.abstractmethod
     def load_cameras(self) -> None:
@@ -719,7 +837,10 @@ class ScenePixelSource(abc.ABC):
         A general function to load all data.
         """
         self.load_cameras()
-        self.build_image_error_buffer()
+        if self.load_rgb_images:
+            self.build_image_error_buffer()
+        else:
+            logger.info("[Pixel] Skipping image error buffer because RGB image loading is disabled.")
         logger.info("[Pixel] All Pixel Data loaded.")
         
         if self.data_cfg.load_objects:

@@ -24,6 +24,8 @@ trainer:
     mask:
       w: 0.05
       opacity_loss_type: bce # choose from [bce, safe_bce]
+    road_region:
+      w: 0.05
     depth:
       w: 0.01 # weight of depth loss
       inverse_depth: False # whether to use inverse depth, NOTE that when set to True, must normalize=True
@@ -82,6 +84,19 @@ model:
         w: 1.
         step_interval: 10
         max_gauss_ratio: 10.       # threshold of ratio of gaussian max to min scale before applying regularization loss from the PhysGaussian paper
+  Road:
+    type: models.gaussians.VanillaGaussians
+    init:
+      from_lidar:
+        num_samples: 800_000
+        return_color: True
+      near_randoms: 100_000
+      far_randoms: 100_000
+    reg:
+      sharp_shape_reg:
+        w: 1.
+        step_interval: 10
+        max_gauss_ratio: 10.
   RigidNodes:
     type: models.nodes.RigidNodes
     init:

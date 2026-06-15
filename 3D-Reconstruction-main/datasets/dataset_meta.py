@@ -131,12 +131,12 @@ DATASETS_CONFIG = {
 
         0: {
             "camera_name": "CAM_LEFT",
-            "original_size": (640, 960),
+            "original_size": (375, 1242),
             "egocar_visible": True,
         },
         1: {
             "camera_name": "CAM_RIGHT",
-            "original_size": (640, 960),
+            "original_size": (375, 1242),
             "egocar_visible": True,
         },
         2: {
