@@ -2,7 +2,7 @@
 """
 Road Mesh Training Script - Step 1 & 2 Implementation
 
-This script implements Steps 1-3 of the road mesh training pipeline:
+This script implements Steps 1-4 of the road mesh training pipeline:
 - Aggregate point cloud using road masks and lidar data (IMPLEMENTED HERE)
     - Use existing Driving_Dataset code to load data, masks, and images
     - Extract LiDAR points that project into road mask regions
@@ -15,9 +15,10 @@ This script implements Steps 1-3 of the road mesh training pipeline:
     - Use x and y range of point cloud to determine dimensions
     - Resolution: 10 pixels per meter (user requirement)
     - Map pixels to mesh using scaling factor based on scene size
-- Project rays using rgb images and cam position onto the mesh (TODO: Step 4)
+    - Project rays using rgb images and cam position onto the mesh (Step 4)
     - Only project road areas according to road mask
     - Fill image buffer using RGB data from images
+    - Reproject the final image buffer back onto the mesh
     - Log image buffer as an image
     - Log mesh with texture applied
     - Log example render from camera positions
@@ -986,7 +987,8 @@ def visualize_mesh(vertices: torch.Tensor,
 def export_mesh_to_ply(vertices: torch.Tensor, 
                        faces: torch.Tensor, 
                        colors: Union[torch.Tensor, None] = None,
-                       output_dir: str = ""):
+                       output_dir: str = "",
+                       filename: str = "road_mesh.ply"):
     """Export mesh to PLY format for external inspection."""
     import struct
     
@@ -994,7 +996,7 @@ def export_mesh_to_ply(vertices: torch.Tensor,
         logger.warning("Cannot export empty mesh")
         return
     
-    ply_path = os.path.join(output_dir, "road_mesh.ply") if output_dir else None
+    ply_path = os.path.join(output_dir, filename) if output_dir else None
     
     # Convert to numpy arrays for PLY export
     verts_np = vertices.cpu().numpy() if isinstance(vertices, torch.Tensor) else np.array(vertices)
@@ -1323,10 +1325,221 @@ def save_image_buffer_as_png(buffer: np.ndarray,
             logger.error(f"Failed to save image buffer as PNG: {e}; PIL also failed: {pil_error}")
 
 
+def save_texture_buffer_as_png(buffer: np.ndarray, output_path: str) -> None:
+    """Save a texture image with the vertical axis flipped for UV mapping."""
+    buffer_uint8 = np.clip(np.flipud(buffer) * 255.0, 0, 255).astype(np.uint8)
+    try:
+        from PIL import Image
+        Image.fromarray(buffer_uint8, mode="RGB").save(output_path)
+        logger.info(f"Saved texture image to {output_path}")
+    except Exception as e:
+        logger.error(f"Failed to save texture image: {e}")
+
+
+def export_textured_mesh_obj(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    image_buffer: np.ndarray,
+    buffer_metadata: dict,
+    output_dir: str = "",
+    filename: str = "road_textured_mesh.obj",
+    texture_filename: str = "road_textured_mesh_texture.png",
+):
+    """Export a true textured OBJ/MTL mesh with per-vertex UVs and a texture image."""
+    if len(vertices) == 0 or len(faces) == 0 or len(image_buffer) == 0 or len(buffer_metadata) == 0:
+        logger.warning("Cannot export textured mesh - missing mesh or buffer data")
+        return None
+    if not output_dir:
+        logger.warning("Cannot export textured mesh - output_dir is required")
+        return None
+
+    verts_np = vertices.detach().cpu().numpy() if torch.is_tensor(vertices) else np.asarray(vertices)
+    faces_np = faces.detach().cpu().numpy() if torch.is_tensor(faces) else np.asarray(faces)
+
+    x_min, x_max = buffer_metadata["x_range"]
+    y_min, y_max = buffer_metadata["y_range"]
+    width = max(int(buffer_metadata.get("width", image_buffer.shape[1])), 1)
+    height = max(int(buffer_metadata.get("height", image_buffer.shape[0])), 1)
+
+    x_span = max(float(x_max) - float(x_min), 1e-8)
+    y_span = max(float(y_max) - float(y_min), 1e-8)
+
+    # Match the saved texture image: y_min is at the bottom after vertical flip.
+    u = np.clip((verts_np[:, 0] - float(x_min)) / x_span, 0.0, 1.0)
+    v = np.clip((verts_np[:, 1] - float(y_min)) / y_span, 0.0, 1.0)
+    uv_coords = np.stack([u, v], axis=1).astype(np.float32)
+
+    obj_path = os.path.join(output_dir, filename)
+    mtl_filename = os.path.splitext(filename)[0] + ".mtl"
+    mtl_path = os.path.join(output_dir, mtl_filename)
+    texture_path = os.path.join(output_dir, texture_filename)
+
+    save_texture_buffer_as_png(image_buffer, texture_path)
+
+    with open(mtl_path, "w") as f:
+        f.write("# StreetPed textured mesh material\n")
+        f.write("newmtl road_texture\n")
+        f.write("Ka 1.000000 1.000000 1.000000\n")
+        f.write("Kd 1.000000 1.000000 1.000000\n")
+        f.write("Ks 0.000000 0.000000 0.000000\n")
+        f.write("d 1.0\n")
+        f.write("illum 1\n")
+        f.write(f"map_Kd {texture_filename}\n")
+
+    with open(obj_path, "w") as f:
+        f.write("# Road mesh exported from StreetPed training pipeline\n")
+        f.write(f"# Vertices: {len(verts_np)}, Faces: {len(faces_np)}\n")
+        f.write(f"mtllib {mtl_filename}\n")
+        f.write("usemtl road_texture\n")
+        f.write("# Units in meters, coordinate system: X-right, Y-forward, Z-up\n\n")
+
+        for x, y, z in verts_np:
+            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        for uu, vv in uv_coords:
+            f.write(f"vt {uu:.6f} {vv:.6f}\n")
+        for v0, v1, v2 in faces_np:
+            v0i, v1i, v2i = int(v0) + 1, int(v1) + 1, int(v2) + 1
+            f.write(f"f {v0i}/{v0i} {v1i}/{v1i} {v2i}/{v2i}\n")
+
+    logger.info(f"Exported textured mesh OBJ to {obj_path}")
+    logger.info(f"Exported textured mesh MTL to {mtl_path}")
+    return obj_path
+
+
+def reproject_image_buffer_onto_mesh(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    image_buffer: np.ndarray,
+    buffer_metadata: dict,
+    output_dir: str = "",
+):
+    """
+    Reproject the final image buffer back onto the mesh as per-vertex colors.
+
+    The mesh is a heightmap, so each vertex can be sampled directly from the
+    buffer using its X/Y world position.
+    """
+    if len(vertices) == 0 or len(faces) == 0 or len(image_buffer) == 0 or len(buffer_metadata) == 0:
+        logger.warning("Cannot reproject image buffer onto mesh - missing mesh or buffer data")
+        return None, {}
+
+    verts_np = vertices.detach().cpu().numpy() if torch.is_tensor(vertices) else np.asarray(vertices)
+    faces_np = faces.detach().cpu().numpy() if torch.is_tensor(faces) else np.asarray(faces)
+    buffer_np = np.asarray(image_buffer)
+
+    width = int(buffer_metadata.get("width", buffer_np.shape[1]))
+    height = int(buffer_metadata.get("height", buffer_np.shape[0]))
+    x_min, x_max = buffer_metadata["x_range"]
+    y_min, y_max = buffer_metadata["y_range"]
+    pixels_per_meter = float(buffer_metadata["pixels_per_meter"])
+
+    if width <= 0 or height <= 0:
+        logger.warning("Cannot reproject image buffer onto mesh - invalid buffer dimensions")
+        return None, {}
+
+    # Sample each vertex from the final texture buffer.
+    px = np.clip((verts_np[:, 0] - x_min) * pixels_per_meter, 0.0, max(width - 1, 0))
+    py = np.clip((verts_np[:, 1] - y_min) * pixels_per_meter, 0.0, max(height - 1, 0))
+
+    x0 = np.floor(px).astype(np.int64)
+    y0 = np.floor(py).astype(np.int64)
+    x1 = np.clip(x0 + 1, 0, width - 1)
+    y1 = np.clip(y0 + 1, 0, height - 1)
+    dx = (px - x0)[:, None]
+    dy = (py - y0)[:, None]
+
+    c00 = buffer_np[y0, x0]
+    c10 = buffer_np[y0, x1]
+    c01 = buffer_np[y1, x0]
+    c11 = buffer_np[y1, x1]
+    sampled_colors = (
+        c00 * (1.0 - dx) * (1.0 - dy)
+        + c10 * dx * (1.0 - dy)
+        + c01 * (1.0 - dx) * dy
+        + c11 * dx * dy
+    )
+    sampled_colors = np.clip(sampled_colors, 0.0, 1.0).astype(np.float32)
+
+    vertex_colors = torch.from_numpy(sampled_colors)
+    face_colors = sampled_colors[faces_np].mean(axis=1) if len(faces_np) > 0 else None
+    non_bg_vertices = int(np.sum(np.any(sampled_colors > 0.01, axis=1)))
+
+    reprojection_stats = {
+        "mesh_vertices_reprojected": int(len(verts_np)),
+        "mesh_vertices_textured": non_bg_vertices,
+        "mesh_texture_coverage": float(non_bg_vertices / max(len(verts_np), 1)),
+        "buffer_width": width,
+        "buffer_height": height,
+        "buffer_x_range": (float(x_min), float(x_max)),
+        "buffer_y_range": (float(y_min), float(y_max)),
+    }
+
+    if output_dir:
+        textured_mesh_path = os.path.join(output_dir, "road_textured_mesh.pth")
+        torch.save(
+            {
+                "vertices": vertices.detach().cpu() if torch.is_tensor(vertices) else torch.as_tensor(vertices),
+                "faces": faces.detach().cpu() if torch.is_tensor(faces) else torch.as_tensor(faces),
+                "vertex_colors": vertex_colors.cpu(),
+                "metadata": {
+                    "mesh_type": "road_mesh_reprojected_from_image_buffer",
+                    **reprojection_stats,
+                },
+            },
+            textured_mesh_path,
+        )
+        logger.info(f"Saved reprojected textured mesh tensor to {textured_mesh_path}")
+
+        export_textured_mesh_obj(
+            vertices,
+            faces,
+            image_buffer,
+            buffer_metadata,
+            output_dir,
+            filename="road_textured_mesh.obj",
+            texture_filename="road_textured_mesh_texture.png",
+        )
+        export_mesh_to_ply(vertices, faces, vertex_colors, output_dir, filename="road_textured_mesh.ply")
+
+        try:
+            facecolors_rgba = None
+            if face_colors is not None and len(face_colors) > 0:
+                facecolors_rgba = np.concatenate(
+                    [np.clip(face_colors, 0.0, 1.0), np.ones((len(face_colors), 1), dtype=np.float32)],
+                    axis=1,
+                )
+            fig = plt.figure(figsize=(16, 6))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.plot_trisurf(
+                verts_np[:, 0],
+                verts_np[:, 1],
+                verts_np[:, 2],
+                triangles=faces_np,
+                facecolors=facecolors_rgba,
+                linewidth=0.1,
+                antialiased=False,
+                shade=False,
+            )
+            ax.set_xlabel("X (meters)")
+            ax.set_ylabel("Y (meters)")
+            ax.set_zlabel("Z (meters)")
+            ax.set_title("Road Mesh Reprojected from Final Image Buffer")
+            plt.tight_layout()
+            preview_path = os.path.join(output_dir, "road_textured_mesh_reprojection.png")
+            plt.savefig(preview_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"Saved textured mesh preview to {preview_path}")
+        except Exception as preview_error:
+            logger.warning(f"Could not save textured mesh preview: {preview_error}")
+
+    return vertex_colors, reprojection_stats
+
+
 def export_mesh_to_obj(vertices: torch.Tensor, 
                        faces: torch.Tensor, 
                        colors: Union[torch.Tensor, None] = None,
-                       output_dir: str = ""):
+                       output_dir: str = "",
+                       filename: str = "road_mesh.obj"):
     """Export mesh to OBJ format for external inspection.
     
     The .obj format is a widely supported 3D file format that stores geometry as vertices and faces.
@@ -1346,7 +1559,7 @@ def export_mesh_to_obj(vertices: torch.Tensor,
         logger.warning("Cannot export empty mesh")
         return None
     
-    obj_path = os.path.join(output_dir, "road_mesh.obj") if output_dir else None
+    obj_path = os.path.join(output_dir, filename) if output_dir else None
     
     # Convert to numpy arrays for OBJ export
     verts_np = vertices.cpu().numpy() if isinstance(vertices, torch.Tensor) else np.array(vertices)
@@ -2474,6 +2687,145 @@ def create_camera_view_comparison(dataset, vertices_tensor, faces_tensor, cam_id
         return None
 
 
+def export_mesh_render_from_camera(
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    frame_idx=0,
+    cam_id=0,
+    output_dir="",
+    texture_buffer=None,
+    texture_metadata=None,
+):
+    """Export a real offscreen mesh render from the camera pose of a specific frame."""
+    logger.info(f"\nExporting standalone mesh render for frame {frame_idx}, camera {cam_id}...")
+
+    try:
+        os.environ.setdefault("OPEN3D_CPU_RENDERING", "true")
+        os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+        import open3d as o3d
+    except Exception as e:
+        logger.warning(f"Cannot export camera render - open3d unavailable: {e}")
+        return None
+
+    verts_np = vertices_tensor.cpu().numpy() if isinstance(vertices_tensor, torch.Tensor) else np.array(vertices_tensor)
+    faces_np = faces_tensor.cpu().numpy() if isinstance(faces_tensor, torch.Tensor) else np.array(faces_tensor)
+
+    if len(verts_np) == 0 or len(faces_np) == 0:
+        logger.warning("Cannot export camera render - empty mesh")
+        return None
+
+    total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 0
+    if total_train_indices <= 0 or not hasattr(dataset, 'full_image_set') or dataset.full_image_set is None:
+        logger.warning("Cannot export camera render - dataset camera frames unavailable")
+        return None
+
+    img_index = min(max(int(frame_idx), 0), total_train_indices - 1)
+    image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+
+    rgb_images = image_infos.get("pixels")
+    if rgb_images is None:
+        logger.warning("Cannot export camera render - missing RGB image for frame 0")
+        return None
+
+    if torch.is_tensor(rgb_images) and len(rgb_images.shape) == 4:
+        rgb_img = rgb_images[min(cam_id, rgb_images.shape[0] - 1)]
+    elif isinstance(rgb_images, np.ndarray) and rgb_images.ndim == 4:
+        rgb_img = rgb_images[min(cam_id, rgb_images.shape[0] - 1)]
+    else:
+        rgb_img = rgb_images
+
+    if torch.is_tensor(rgb_img):
+        rgb_img = rgb_img.detach().cpu().numpy()
+    else:
+        rgb_img = np.asarray(rgb_img)
+
+    K = cam_infos.get("intrinsics")
+    c2w = cam_infos.get("camera_to_world")
+    if K is None or c2w is None:
+        logger.warning("Cannot export camera render - missing camera intrinsics/extrinsics")
+        return None
+
+    if torch.is_tensor(K):
+        K_np = K.detach().cpu().numpy()
+    else:
+        K_np = np.asarray(K)
+    if torch.is_tensor(c2w):
+        c2w_np = c2w.detach().cpu().numpy()
+    else:
+        c2w_np = np.asarray(c2w)
+    if len(c2w_np.shape) == 3:
+        c2w_np = c2w_np[min(cam_id, c2w_np.shape[0] - 1)]
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(verts_np.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(faces_np.astype(np.int32))
+    mesh.compute_vertex_normals()
+
+    texture_image = None
+    if texture_buffer is not None and texture_metadata:
+        texture_np = np.clip(np.flipud(np.asarray(texture_buffer)) * 255.0, 0, 255).astype(np.uint8)
+        texture_image = o3d.geometry.Image(texture_np)
+        x_min, x_max = texture_metadata["x_range"]
+        y_min, y_max = texture_metadata["y_range"]
+        x_span = max(float(x_max) - float(x_min), 1e-8)
+        y_span = max(float(y_max) - float(y_min), 1e-8)
+        u = np.clip((verts_np[:, 0] - float(x_min)) / x_span, 0.0, 1.0)
+        v = np.clip((verts_np[:, 1] - float(y_min)) / y_span, 0.0, 1.0)
+        triangle_uvs = np.stack([np.column_stack([u, v])[faces_np[:, 0]],
+                                 np.column_stack([u, v])[faces_np[:, 1]],
+                                 np.column_stack([u, v])[faces_np[:, 2]]], axis=1).reshape(-1, 2)
+        mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs.astype(np.float64))
+        mesh.textures = [texture_image]
+    else:
+        color_np = plt.cm.viridis((verts_np[:, 2] - verts_np[:, 2].min()) / max(verts_np[:, 2].ptp(), 1e-6))[:, :3]
+        mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(color_np, 0.0, 1.0).astype(np.float64))
+
+    h, w = rgb_img.shape[:2]
+    renderer = o3d.visualization.rendering.OffscreenRenderer(w, h)
+    renderer.scene.set_background([0.0, 0.0, 0.0, 0.0])
+
+    material = o3d.visualization.rendering.MaterialRecord()
+    material.shader = "defaultLit"
+    material.base_color = [1.0, 1.0, 1.0, 1.0]
+    material.sRGB_color = True
+    if texture_image is not None:
+        material.albedo_img = texture_image
+    renderer.scene.add_geometry("road_mesh", mesh, material)
+
+    fx, fy = float(K_np[0, 0]), float(K_np[1, 1])
+    cx, cy = float(K_np[0, 2]), float(K_np[1, 2])
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
+    extrinsic = np.linalg.inv(c2w_np)
+
+    try:
+        renderer.setup_camera(intrinsic, extrinsic)
+    except Exception:
+        eye = c2w_np[:3, 3]
+        forward = c2w_np[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        up = c2w_np[:3, :3] @ np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        if np.linalg.norm(forward) < 1e-8:
+            forward = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if np.linalg.norm(up) < 1e-8:
+            up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        renderer.scene.camera.look_at(eye + forward, eye, up)
+
+    color = np.asarray(renderer.render_to_image())
+    render_path = None
+    if output_dir:
+        render_path = os.path.join(output_dir, f"frame_{frame_idx}_camera_{cam_id}_mesh_render.png")
+        try:
+            from PIL import Image
+
+            Image.fromarray(np.clip(color[:, :, :3], 0, 255).astype(np.uint8)).save(render_path)
+            logger.info(f"Saved mesh render to {render_path}")
+        except Exception as e:
+            logger.error(f"Failed to save mesh render: {e}")
+            return None
+
+    return render_path
+
+
 def log_rgb_projection_visualization(buffer: np.ndarray, 
                                       stats: dict, 
                                       output_dir: str) -> None:
@@ -2914,7 +3266,6 @@ def main():
     except Exception as e:
         logger.warning(f"Could not create camera view comparison (non-critical): {e}")
 
-    
     # Step 4: Project RGB images onto the mesh using ray casting from camera positions
     try:
         logger.info("\n" + "=" * 60)
@@ -2965,6 +3316,59 @@ def main():
             
         except Exception as rgb_save_error:
             logger.error(f"Error saving RGB texture map: {rgb_save_error}")
+
+        reprojection_stats = {}
+        # Reproject the final image buffer back onto the mesh surface.
+        try:
+            textured_vertex_colors, reprojection_stats = reproject_image_buffer_onto_mesh(
+                vertices_tensor,
+                faces_tensor,
+                updated_buffer,
+                buffer_metadata,
+                step1_dir,
+            )
+            if textured_vertex_colors is not None:
+                logger.info(
+                    f"Reprojected buffer onto mesh: {reprojection_stats.get('mesh_vertices_textured', 0):,} "
+                    f"of {reprojection_stats.get('mesh_vertices_reprojected', 0):,} vertices textured"
+                )
+        except Exception as mesh_reprojection_error:
+            logger.error(f"Error reprojecting buffer back onto mesh: {mesh_reprojection_error}")
+
+        # Export a true offscreen mesh render from the frame 0 camera pose.
+        try:
+            frame0_render_path = export_mesh_render_from_camera(
+                dataset,
+                vertices_tensor,
+                faces_tensor,
+                frame_idx=0,
+                cam_id=0,
+                output_dir=step1_dir,
+                texture_buffer=updated_buffer,
+                texture_metadata=buffer_metadata,
+            )
+            if frame0_render_path and os.path.exists(frame0_render_path):
+                logger.info(f"Frame 0 mesh render saved to: {frame0_render_path}")
+        except Exception as e:
+            logger.warning(f"Could not export frame 0 mesh render (non-critical): {e}")
+
+        if "stats_json_path" in locals() and stats_json_path:
+            try:
+                with open(stats_json_path, "w") as f:
+                    json.dump(
+                        {
+                            **projection_stats,
+                            **reprojection_stats,
+                            "width": buffer_metadata.get("width"),
+                            "height": buffer_metadata.get("height"),
+                            "pixels_per_meter": buffer_metadata.get("pixels_per_meter"),
+                        },
+                        f,
+                        indent=2,
+                    )
+                logger.info(f"Updated projection statistics to include mesh reprojection at {stats_json_path}")
+            except Exception as stats_error:
+                logger.warning(f"Could not update JSON stats with mesh reprojection data: {stats_error}")
         
         # Log projection statistics to console and file
         if len(projection_stats) > 0:
@@ -3001,12 +3405,19 @@ def main():
         logger.info("STEP 3 & STEP 4 COMPLETED:")
         logger.info(f"  - Initial texture map: road_texture_map.png")
         logger.info(f"  - RGB-projected mesh: road_textured_mesh.png")
+        logger.info(f"  - Reprojected textured mesh: road_textured_mesh.pth / .ply / .obj / .mtl")
+        logger.info(f"  - Texture image: road_textured_mesh_texture.png")
+        logger.info(f"  - Frame 0 mesh render: frame_0_camera_0_mesh_render.png")
         logger.info(f"  - Buffer dimensions: {buffer_metadata.get('width', 'N/A')} × {buffer_metadata.get('height', 'N/A')} pixels")
     
     logger.info("")
     logger.info("Generated files:")
     for filename in ['road_mesh.pth', 'road_pointcloud.ply', 'road_mesh.ply', 
                      'road_texture_map.png', 'road_textured_mesh.png',
+                     'road_textured_mesh.pth', 'road_textured_mesh.ply', 'road_textured_mesh.obj',
+                     'road_textured_mesh.mtl', 'road_textured_mesh_texture.png',
+                     'frame_0_camera_0_mesh_render.png',
+                     'road_textured_mesh_reprojection.png',
                      'image_buffer.npz', 'projection_stats.json']:
         filepath = os.path.join(step1_dir, filename) if step1_dir else None
         if filepath and os.path.exists(filepath):
