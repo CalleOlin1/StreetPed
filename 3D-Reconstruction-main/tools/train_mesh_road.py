@@ -85,6 +85,12 @@ def parse_args():
         default=None,
         help="Path to dataset config file (optional)"
     )
+    parser.add_argument(
+        "--num_projection_frames",
+        type=int,
+        default=None,
+        help="Limit how many training images are used for Step 4 ray projection (default: all training images)",
+    )
     
     return parser.parse_args()
 
@@ -111,16 +117,22 @@ def aggregate_road_pointcloud(dataset: DrivingDataset, device: torch.device):
     """
     Aggregate LiDAR points that project into road mask regions.
     
+    IMPORTANT: Uses PRUNED lidar data - only includes points remaining after
+    dataset.project_lidar_pts_on_images() removes out-of-view points during initialization.
+    This ensures mesh creation uses valid, visible LiDAR points rather than all raw lidar data.
+    
     Args:
-        dataset: Initialized DrivingDataset instance with loaded data
+        dataset: Initialized DrivingDataset instance with loaded data (already pruned)
         device: PyTorch device for computation
         
     Returns:
-        Tuple of (road_pts, road_colors) tensors containing aggregated point cloud
+        Tuple of (road_pts, road_colors) tensors containing aggregated point cloud from pruned LiDAR source
     """
-    logger.info("Starting road LiDAR point aggregation...")
+    logger.info("Starting road LiDAR point aggregation using PRUNED lidar data...")
+    logger.info(f"Using dataset.lidar_source.pts_xyz with {len(dataset.lidar_source.pts_xyz)} points (pruned)")
     
-    # Get all LiDAR points that project into road mask regions across all frames/cameras
+    # Get all LiDAR indices that project into road mask regions across all frames/cameras
+    # Note: This uses the pruned lidar source from self.lidar_source after project_lidar_pts_on_images()
     road_lidar_indices = dataset.get_lidar_indices_from_mask_region(mask_attr="road_masks")
     num_road_points = len(road_lidar_indices)
     
@@ -252,6 +264,93 @@ def log_point_cloud_statistics(pts_xyz: np.ndarray):
         logger.info(f"  Mean color: [{mean_color[0]:.3f}, {mean_color[1]:.3f}, {mean_color[2]:.3f}]")
 
 
+
+def create_birds_eye_view(pts_xyz: np.ndarray, 
+                          colors: np.ndarray = None,
+                          cam_positions=None,
+                          output_dir: str = None) -> str:
+    """
+    Create a bird's eye view visualization of the point cloud.
+    
+    This function generates three orthogonal views (X-Y, X-Z, Y-Z planes)
+    to visualize the 3D structure of the road surface from different perspectives.
+    Optionally overlays camera positions if provided.
+    
+    Args:
+        pts_xyz: N x 3 numpy array of point coordinates
+        colors: Optional N x 3 RGB color values (0-1 range)
+        cam_positions: Optional M x 3 array of camera locations to overlay
+        output_dir: Directory to save the visualization (optional, returns path if None)
+    
+    Returns:
+        Path to saved PNG file or None if no points provided
+    """
+    if len(pts_xyz) == 0:
+        logger.warning("Cannot create bird's eye view from empty point cloud")
+        return None
+    
+    num_points = len(pts_xyz)
+    cam_positions_arr = np.array(cam_positions) if cam_positions is not None else None
+    
+    # Create three orthogonal views
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # X-Y plane (bird's eye view - top down)
+    ax_xy = axes[0]
+    scatter = ax_xy.scatter(pts_xyz[:, 0], pts_xyz[:, 1], c=range(num_points), 
+                           cmap='viridis', s=1, alpha=0.5, label='Road Points')
+    
+    # Plot camera positions if available
+    if cam_positions_arr is not None and len(cam_positions_arr) > 0:
+        scatter_cams = ax_xy.scatter(cam_positions_arr[:, 0], cam_positions_arr[:, 1], 
+                                     c='red', s=80, marker='X', linewidths=2,
+                                     edgecolors='white', alpha=0.9, 
+                                     label=f'Cameras ({len(cam_positions_arr)} positions)')
+        ax_xy.legend(loc='upper right', fontsize=10)
+    
+    ax_xy.set_xlabel('X (meters)', fontsize=12)
+    ax_xy.set_ylabel('Y (meters)', fontsize=12)
+    title = f"Bird's Eye View - {num_points:,} Road Points"
+    if cam_positions_arr is not None and len(cam_positions_arr) > 0:
+        title += " + Camera Locations"
+    ax_xy.set_title(title, fontsize=14, fontweight='bold')
+    ax_xy.grid(True, alpha=0.3)
+    plt.colorbar(scatter, ax=ax_xy, label='Point Index', shrink=0.8)
+    
+    # X-Z plane (side view - looking from side)
+    ax_xz = axes[1]
+    scatter2 = ax_xz.scatter(pts_xyz[:, 0], pts_xyz[:, 2], c=range(num_points), 
+                            cmap='viridis', s=1, alpha=0.5)
+    ax_xz.set_xlabel('X (meters)', fontsize=12)
+    ax_xz.set_ylabel('Z height (meters)', fontsize=12)
+    ax_xz.set_title("Side View - X-Z Plane", fontsize=14, fontweight='bold')
+    ax_xz.grid(True, alpha=0.3)
+    
+    # Y-Z plane (front view - looking from front/side)  
+    ax_yz = axes[2]
+    scatter3 = ax_yz.scatter(pts_xyz[:, 1], pts_xyz[:, 2], c=range(num_points), 
+                            cmap='viridis', s=1, alpha=0.5)
+    ax_yz.set_xlabel('Y (meters)', fontsize=12)
+    ax_yz.set_ylabel('Z height (meters)', fontsize=12)
+    ax_yz.set_title("Front View - Y-Z Plane", fontsize=14, fontweight='bold')
+    ax_yz.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Determine output path
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        viz_path = os.path.join(output_dir, "birds_eye_view.png")
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        logger.info(f"Saved bird's eye view visualization to {viz_path}")
+    else:
+        # Return figure if no output directory specified
+        return fig
+    
+    plt.close(fig)
+    return viz_path
+
+
 def export_point_cloud(pts_xyz: np.ndarray, colors: np.ndarray, output_dir: str):
     """Export point cloud to PLY format for external inspection."""
     ply_path = os.path.join(output_dir, "road_pointcloud.ply")
@@ -288,6 +387,120 @@ def export_point_cloud(pts_xyz: np.ndarray, colors: np.ndarray, output_dir: str)
             f.write("end_header\n")
         
         logger.warning(f"Created empty PLY file at {ply_path}")
+
+
+def create_camera_locations_plot(dataset, output_dir: str = None):
+    """
+    Create a dedicated visualization showing ONLY camera locations across all frames.
+    
+    This function extracts and plots ALL available camera positions from the dataset,
+    providing a clear view of the data collection trajectory.
+    
+    Args:
+        dataset: DrivingDataset instance with loaded scene
+        output_dir: Directory to save the visualization (optional)
+    """
+    cam_positions = []
+    cam_frame_ids = []
+    cam_cam_ids = []
+    
+    try:
+        total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 10
+        logger.info(f"Extracting camera positions from {total_train_indices} frames...")
+        
+        for i in range(total_train_indices):
+            img_index = int(i * len(dataset.train_indices) / max(total_train_indices, 1)) if total_train_indices > 0 else 0
+            
+            if hasattr(dataset, 'full_image_set') and dataset.full_image_set is not None:
+                try:
+                    image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+                    c2w = cam_infos.get('camera_to_world', None)
+                    
+                    if c2w is not None:
+                        # Extract camera position from extrinsics matrix
+                        if torch.is_tensor(c2w):
+                            c2w_np = c2w.cpu().numpy()
+                        else:
+                            c2w_np = np.array(c2w)
+                        
+                        # Handle both single and multi-camera formats
+                        if len(c2w_np.shape) == 3:  # Multi-camera frame
+                            for j in range(min(5, c2w_np.shape[0])):  # Limit to first 5 cameras per frame
+                                cam_positions.append(c2w_np[j][:3, 3])
+                                cam_frame_ids.append(img_index)
+                                cam_cam_ids.append(j)
+                        elif len(c2w_np.shape) == 2:  # Single camera view
+                            cam_positions.append(c2w_np[:3, 3])
+                            cam_frame_ids.append(img_index)
+                            cam_cam_ids.append(0)
+                except Exception as e:
+                    logger.debug(f"Could not extract camera position from frame {i}: {e}")
+    
+        if len(cam_positions) == 0:
+            logger.warning("No camera positions could be extracted")
+            return None
+        
+        cam_array = np.array(cam_positions)
+        num_cams = len(cam_positions)
+        
+        # Create trajectory visualization
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # X-Y plane (top-down view of camera path)
+        ax_xy = axes[0]
+        scatter_cams = ax_xy.scatter(cam_array[:, 0], cam_array[:, 1], 
+                                     c=range(num_cams), cmap='Reds', s=50, alpha=0.7,
+                                     edgecolors='black', linewidths=0.5)
+        ax_xy.set_xlabel('X (meters)', fontsize=12)
+        ax_xy.set_ylabel('Y (meters)', fontsize=12)
+        ax_xy.set_title(f"Camera Trajectory - {num_cams} Positions", fontsize=14, fontweight='bold')
+        ax_xy.grid(True, alpha=0.3)
+        plt.colorbar(scatter_cams, ax=ax_xy, label='Frame Index', shrink=0.8)
+        
+        # X-Z plane (side view showing camera height variations)
+        ax_xz = axes[1]
+        scatter_heights = ax_xz.scatter(cam_array[:, 0], cam_array[:, 2],
+                                        c=range(num_cams), cmap='Reds', s=50, alpha=0.7,
+                                        edgecolors='black', linewidths=0.5)
+        ax_xz.set_xlabel('X (meters)', fontsize=12)
+        ax_xz.set_ylabel('Z height (meters)', fontsize=12)
+        ax_xz.set_title("Camera Height Profile - X-Z View", fontsize=14, fontweight='bold')
+        ax_xz.grid(True, alpha=0.3)
+        plt.colorbar(scatter_heights, ax=ax_xz, label='Frame Index', shrink=0.8)
+        
+        # Y-Z plane (front view showing camera height variations along path)
+        ax_yz = axes[2]
+        scatter_front = ax_yz.scatter(cam_array[:, 1], cam_array[:, 2],
+                                      c=range(num_cams), cmap='Reds', s=50, alpha=0.7,
+                                      edgecolors='black', linewidths=0.5)
+        ax_yz.set_xlabel('Y (meters)', fontsize=12)
+        ax_yz.set_ylabel('Z height (meters)', fontsize=12)
+        ax_yz.set_title("Camera Height Profile - Y-Z View", fontsize=14, fontweight='bold')
+        ax_yz.grid(True, alpha=0.3)
+        plt.colorbar(scatter_front, ax=ax_yz, label='Frame Index', shrink=0.8)
+        
+        # Log camera statistics
+        logger.info(f"\nCamera Position Statistics:")
+        logger.info(f"  Total positions: {num_cams}")
+        logger.info(f"  X range: [{cam_array[:, 0].min():.2f}, {cam_array[:, 0].max():.2f}] m")
+        logger.info(f"  Y range: [{cam_array[:, 1].min():.2f}, {cam_array[:, 1].max():.2f}] m")
+        logger.info(f"  Z height (avg): {cam_array[:, 2].mean():.3f} ± {cam_array[:, 2].std():.3f} m")
+        
+        plt.tight_layout()
+        
+        # Save visualization
+        if output_dir:
+            viz_path = os.path.join(output_dir, "camera_locations.png")
+            plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Saved camera locations plot to {viz_path}")
+        
+        return cam_array
+    
+    except Exception as e:
+        logger.error(f"Error creating camera locations plot: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def create_mesh_from_pointcloud(pts_xyz: np.ndarray, 
@@ -330,7 +543,7 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     scene_height = max(y_max - y_min, 0.1)
     
     # Fixed cell size of 0.2 meters per cell (as specified by user requirement)
-    cell_size = 0.2
+    cell_size = 1
     
     # Calculate grid dimensions: number of cells in x and y directions
     num_cells_x = int(np.ceil(scene_width / cell_size)) + 1
@@ -383,20 +596,22 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     cell_z_values = []
     cell_colors_list = [] if color_map is not None else None
     
+    # First pass: identify all valid cells that will become vertices
+    valid_cells = []
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
             z_val = height_map[x_idx, y_idx]
-            
-            # Skip cells with no data (infinity) and boundary cells that would create incomplete quads
-            if np.isinf(z_val) or x_idx == 0 or x_idx == num_cells_x - 1 or y_idx == 0 or y_idx == num_cells_y - 1:
-                continue
-            
-            height_map_dict[(x_idx, y_idx)] = len(cell_z_values)
-            cell_z_values.append(float(z_val))
-            
-            if color_map is not None and x_idx < num_cells_x and y_idx < num_cells_y:
-                mean_color = np.array([color_map[c][x_idx, y_idx] for c in range(3)], dtype=np.float32) / 255.0
-                cell_colors_list.append(mean_color)
+            if not np.isinf(z_val) and x_idx > 0 and x_idx < num_cells_x - 1 and y_idx > 0 and y_idx < num_cells_y - 1:
+                valid_cells.append((x_idx, y_idx))
+    
+    # Create mapping from grid position to vertex index
+    for i, (x_idx, y_idx) in enumerate(valid_cells):
+        height_map_dict[(x_idx, y_idx)] = len(cell_z_values)
+        cell_z_values.append(float(height_map[x_idx, y_idx]))
+        
+        if color_map is not None:
+            mean_color = np.array([color_map[c][x_idx, y_idx] for c in range(3)], dtype=np.float32) / 255.0
+            cell_colors_list.append(mean_color)
     
     if len(cell_z_values) == 0:
         logger.warning("No valid cells after boundary filtering")
@@ -430,10 +645,10 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
         logger.warning("No valid triangles could be created from the grid cells")
         return torch.empty(0, 3), torch.empty(0, 3), torch.empty(0, 3)
     
-    # Build final vertices with X-Y plane coordinates centered at origin (same as original)
+# Build final vertices with X-Y plane coordinates in original world space (preserving LiDAR coordinate system)
     final_vertices = []
     row_colors = cell_colors_list if color_map is not None else None
-    
+
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
             vertex_key = (x_idx, y_idx)
@@ -444,13 +659,14 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
             
             z_height = cell_z_values[height_map_dict[vertex_key]]
             
-            # Map grid index to world coordinates centered at origin
-            local_x = (x_idx - num_cells_x / 2 + 0.5) * scene_width / num_cells_x
-            local_y = (y_idx - num_cells_y / 2 + 0.5) * scene_height / num_cells_y
+            # Map grid index to world coordinates preserving original LiDAR coordinate system (NOT centered at origin).
+            # Use (num_cells - 1) so the generated mesh spans the original min/max bounds.
+            world_x = x_min + (x_idx / max(num_cells_x - 1, 1)) * scene_width
+            world_y = y_min + (y_idx / max(num_cells_y - 1, 1)) * scene_height
             
-            final_vertices.append([local_x, local_y, z_height])
+            final_vertices.append([world_x, world_y, z_height])
     
-    logger.info(f"Created {len(final_vertices):,} mesh vertices")
+    logger.info(f"Created {len(final_vertices):,} mesh vertices in original world space")
     
     # Convert to PyTorch tensors for compatibility with the rest of the pipeline
     vertices_tensor = torch.tensor(final_vertices).float() if len(final_vertices) > 0 else torch.empty(0, 3)
@@ -867,8 +1083,7 @@ def create_image_buffer(vertices: torch.Tensor,
     
     logger.info(f"Scene dimensions: {scene_width:.2f}m × {scene_height:.2f}m")
     
-    # User requirement: resolution of 10 pixels per meter
-    pixels_per_meter = 10
+    pixels_per_meter = 4
     
     # Calculate buffer dimensions based on scene size and pixel density (user specification)
     width_pixels = int(np.ceil(scene_width * pixels_per_meter))
@@ -1176,6 +1391,771 @@ def export_mesh_to_obj(vertices: torch.Tensor,
     return obj_path
 
 
+def project_rgb_onto_image_buffer(
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    image_buffer,
+    buffer_metadata,
+    device,
+    step1_dir=None,
+    num_frames=None,
+):
+    """Project RGB values from road-masked images onto the image buffer using ray casting."""
+
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 4 - RGB IMAGE PROJECTION")
+    logger.info("=" * 60)
+    
+        # Extract buffer parameters from metadata
+    width_pixels = buffer_metadata.get('width', image_buffer.shape[1])
+    height_pixels = buffer_metadata.get('height', image_buffer.shape[0])
+    x_min, y_min = buffer_metadata['x_range'][0], buffer_metadata['y_range'][0]
+    scene_width_meters = buffer_metadata['scene_width_meters']
+    scene_height_meters = buffer_metadata['scene_height_meters']
+    
+    # Store buffer bounds for debugging
+    x_max_buffer = x_min + scene_width_meters
+    y_max_buffer = y_min + scene_height_meters
+    
+    # Initialize updated buffer as copy of input (preserves initial texture)
+    updated_buffer = image_buffer.copy()
+    
+    # Statistics tracking with ray projection details
+    projection_stats = {
+        'total_frames': 0,
+        'total_cameras_processed': 0,
+        'road_pixels_projected': 0,
+        'buffer_pixels_updated': set(),  # Will convert to count later
+        'cameras_with_data': [],
+        'rays_cast_total': 0,           # Total rays cast from cameras
+        'rays_hit_mesh': 0,             # Rays that intersected mesh triangles
+        'rays_missed_mesh': 0,          # Rays that didn't hit any triangle
+    }
+    
+    if len(vertices_tensor) == 0 or faces_tensor.numel() == 0:
+        logger.warning("Cannot project RGB - mesh not available")
+        return updated_buffer, projection_stats
+    
+    # Convert mesh to numpy for ray intersection testing
+    verts_np = vertices_tensor.cpu().numpy() if isinstance(vertices_tensor, torch.Tensor) else np.array(vertices_tensor)
+
+    # Build triangle list with barycentric info for fast lookup
+    triangles = []
+    faces_np = faces_tensor.cpu().numpy() if isinstance(faces_tensor, torch.Tensor) else np.array(faces_tensor)
+    for i in range(len(faces_np)):
+        v0_idx, v1_idx, v2_idx = faces_np[i]
+        v0 = verts_np[v0_idx]
+        v1 = verts_np[v1_idx]
+        v2 = verts_np[v2_idx]
+        
+        # Precompute triangle plane and edge functions for faster ray intersection
+        tri_plane_normal = np.cross(v1 - v0, v2 - v0)
+        tri_plane_normal = tri_plane_normal / (np.linalg.norm(tri_plane_normal) + 1e-8)
+        tri_plane_d = -np.dot(tri_plane_normal, v0)
+        
+        triangles.append({
+            'vertices': [v0, v1, v2],
+            'plane_normal': tri_plane_normal,
+            'plane_d': tri_plane_d,
+            'face_idx': i
+        })
+    
+    logger.info(f"Built {len(triangles)} triangle lookup table for ray intersection")
+    
+    total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 0
+    # Iterate through a configurable number of training images and cameras to project RGB values.
+    num_frames = total_train_indices if num_frames is None else min(num_frames, total_train_indices)
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive when projecting RGB onto the image buffer")
+    
+    with tqdm(total=num_frames, desc="Processing frames", unit="frame") as pbar:
+        for frame_idx in range(num_frames):
+            projection_stats['total_frames'] += 1
+            
+            try:
+                # Get image data and camera information for this frame from the dataset wrapper
+                # The DrivingDataset stores images in full_image_set (SplitWrapper) which has get_image() method
+                
+                # Access through SplitWrapper - use normalized timestep index to map to actual indices
+                if not hasattr(dataset, 'full_image_set') or dataset.full_image_set is None:
+                    logger.warning(f"No full_image_set available for frame {frame_idx}, skipping")
+                    pbar.update(1)
+                    continue
+                
+                # Map from our iteration index (0..num_frames-1) to actual image indices in the dataset.
+                if total_train_indices == 0:
+                    logger.warning(f"No train_indices available for frame {frame_idx}, skipping")
+                    pbar.update(1)
+                    continue
+                
+                # Use proportional mapping to select frames from the dataset's training indices
+                img_index = int(frame_idx * total_train_indices / num_frames) if num_frames > 0 else 0
+                img_index = min(img_index, total_train_indices - 1)  # Ensure within bounds
+                
+                image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+                
+                if 'pixels' not in image_infos or 'road_masks' not in image_infos:
+                    pbar.update(1)
+                    continue
+                
+                # Handle both single-camera and multi-camera formats from pixel_source.get_image()
+                rgb_images = image_infos['pixels']  # Shape: [H, W, 3] for single cam or [num_cams, H, W, 3] for multi-cam
+                road_masks = image_infos['road_masks'] if 'road_masks' in image_infos else None
+                
+                # Determine if we have multiple cameras (shape starts with num_cameras)
+                is_multi_camera = torch.is_tensor(rgb_images) and len(rgb_images.shape) == 4 or \
+                                  (isinstance(rgb_images, np.ndarray) and rgb_images.ndim == 4)
+                
+                # If single camera, wrap in list for consistent processing
+                if not is_multi_camera:
+                    rgb_list = [rgb_images]
+                    road_mask_list = [road_masks] if road_masks is not None else []
+                else:
+                    rgb_list = torch.unbind(rgb_images, dim=0) if torch.is_tensor(rgb_images) else list(rgb_images)
+                    road_mask_list = torch.unbind(road_masks, dim=0) if (torch.is_tensor(road_masks)) and road_masks is not None else [None] * len(rgb_list)
+
+                # Process each camera view in the frame
+                for cam_id, rgb_img in enumerate(rgb_list):
+                    projection_stats['total_cameras_processed'] += 1
+                    
+                    # Get road mask for this camera (handle None case)
+                    road_mask = road_mask_list[cam_id] if cam_id < len(road_mask_list) and road_mask_list[cam_id] is not None else np.zeros(rgb_img.shape[:2], dtype=np.float32)
+                    
+                    # Convert tensor to numpy on CPU before processing (fixes CUDA->numpy conversion error)
+                    if torch.is_tensor(road_mask):
+                        road_mask = road_mask.cpu().numpy()
+                    
+                    # Get camera intrinsics and extrinsics for this frame/camera
+                    K = None
+                    camToWorld = None
+                    
+                    # Try different possible key names for intrinsics (from pixel_source.get_image)
+                    if 'intrinsics' in cam_infos:
+                        try:
+                            K = cam_infos['intrinsics'].cpu().numpy() if torch.is_tensor(cam_infos['intrinsics']) else np.array(cam_infos['intrinsics'])
+                        except Exception as e:
+                            logger.warning(f"Failed to extract intrinsics for frame {frame_idx}: {e}")
+                    
+                    # Try different possible key names for extrinsics (camera-to-world transform)
+                    if K is not None and 'camera_to_world' in cam_infos:
+                        try:
+                            # camera_to_world might be a single 4x4 matrix or per-camera array
+                            c2w = cam_infos['camera_to_world']
+                            if torch.is_tensor(c2w):
+                                c2w_np = c2w.cpu().numpy()
+                            else:
+                                c2w_np = np.array(c2w)
+                            
+                            # Handle both single matrix and per-camera array formats
+                            if len(c2w_np.shape) == 3:
+                                camToWorld = c2w_np[0]  # Take first camera view
+                            elif len(c2w_np.shape) == 2:
+                                camToWorld = c2w_np
+                            else:
+                                logger.warning(f"Unexpected shape for camera_to_world: {c2w_np.shape}")
+                        except Exception as e:
+                            logger.warning(f"Failed to extract extrinsics for frame {frame_idx}: {e}")
+                    
+                    if K is None or camToWorld is None:
+                        pbar.update(1)
+                        continue
+                    
+                    # Find road pixels in this image (single camera view from pixel_source.get_image())
+                    road_pixel_indices = np.where(road_mask > 0.5)
+
+                    if len(road_pixel_indices[0]) == 0:
+                        continue
+                    
+                    rays_per_image = 1000
+                    num_road_pixels = len(road_pixel_indices[0])
+                    if num_road_pixels > rays_per_image:
+                        logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
+                        # Randomly sample up to 100 pixel indices
+                        sampled_indices = np.random.choice(num_road_pixels, size=rays_per_image, replace=False)
+                        selected_py = road_pixel_indices[0][sampled_indices]
+                        selected_px = road_pixel_indices[1][sampled_indices]
+                    else:
+                        # Use all available pixels if fewer than 100
+                        selected_py = road_pixel_indices[0]
+                        selected_px = road_pixel_indices[1]
+
+                    projection_stats['cameras_with_data'].append(f"frame_{frame_idx}_cam{cam_id}")
+
+                    # Log first frame/camera for debugging (only once at the start of processing)
+                    if 'first_debug_log' not in locals():
+                        logger.info(f"\nProcessing frame {frame_idx}, camera {cam_id}:")
+                        logger.info(f"  - RGB image shape: {rgb_img.shape}")
+                        logger.info(f"  - Road mask pixels found: {len(road_pixel_indices[0])}")
+                        if K is not None and len(K.shape) == 2:
+                            logger.info(f"  - Camera intrinsics (K): fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}")
+                        if camToWorld is not None:
+                            logger.info(f"  - Camera position (world): {camToWorld[:3, 3]}")
+                        # Log mesh bounds for debugging
+                        x_min_mesh = verts_np[:, 0].min()
+                        y_min_mesh = verts_np[:, 1].min()
+                        z_min_mesh = verts_np[:, 2].min()
+                        
+                        # Define buffer coordinate variables (same as projection logic)
+                        x_min_buffer = float(x_min)
+                        y_min_buffer = float(y_min)
+                        scene_width_meters_float = float(scene_width_meters)
+                        scene_height_meters_float = float(scene_height_meters)
+                        x_max_buffer = x_min_buffer + scene_width_meters_float
+                        y_max_buffer = y_min_buffer + scene_height_meters_float
+                        
+                        logger.info(f"  - Mesh bounds: X=[{x_min_mesh:.3f}, {verts_np[:, 0].max():.3f}], Y=[{y_min_mesh:.3f}, {verts_np[:, 1].max():.3f}], Z=[{z_min_mesh:.3f}, {verts_np[:, 2].max():.3f}]")
+                        logger.info(f"  - Image buffer bounds: X=[{x_min_buffer:.3f}, {x_max_buffer:.3f}], Y=[{y_min_buffer:.3f}, {y_max_buffer:.3f}]")
+
+                    # Project each road pixel onto the image buffer via ray casting (max {rays_per_image} rays per image)
+                    for py, px in tqdm(zip(selected_py, selected_px), desc=f"Projecting pixels (frame {frame_idx}, cam {cam_id})"):
+                        projection_stats['rays_cast_total'] += 1
+                        # Get RGB color at this pixel (already normalized to [0, 1] by dataset loader)
+                        rgb_color = rgb_img[py, px]
+                        
+                        # Ensure rgb_color is on CPU and converted to numpy before use
+                        if torch.is_tensor(rgb_color):
+                            rgb_color = rgb_color.cpu().numpy()
+                        
+                        # Cast ray from camera through this pixel into the scene
+                        # Pixel coordinates to normalized device coordinates using intrinsics K: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+                        
+                        # Handle both numpy array and list formats for K matrix
+                        if isinstance(K, np.ndarray) or (hasattr(K, '__getitem__') and len(np.shape(K)) == 2):
+                            fx = float(K[0, 0])
+                            fy = float(K[1, 1])
+                            cx = float(K[0, 2])
+                            cy = float(K[1, 2])
+                        else:
+                            # Fallback for unexpected format - log warning and skip this pixel
+                            logger.warning(f"Unexpected K matrix shape: {type(K)}, skipping pixel ({px}, {py})")
+                            continue
+                        
+                        # Match datasets/base/pixel_source.py::get_rays():
+                        # pixel centers are offset by +0.5 and image Y grows downward.
+                        x_ndc = float((px - cx + 0.5) / fx) if abs(fx) > 1e-8 else 0.0
+                        y_ndc = float((py - cy + 0.5) / fy) if abs(fy) > 1e-8 else 0.0
+
+                        # Ray direction in camera frame: [x, y, z] where z points along optical axis (forward)
+                        ray_dir_cam = np.array([x_ndc, y_ndc, 1.0])
+
+                        # Normalize the ray direction vector to unit length for accurate intersection testing
+                        ray_length = float(np.linalg.norm(ray_dir_cam))
+                        if abs(ray_length) > 1e-8:
+                            ray_dir_cam = ray_dir_cam / ray_length
+                        
+                        # Transform from camera frame to world frame using the camera_to_world pose directly.
+                        ray_origin_world = camToWorld[:3, 3]
+
+                        # Rotate ray direction into world frame: R @ d where R is the camera-to-world rotation.
+                        rot_matrix = camToWorld[:3, :3]
+                        ray_dir_world = np.dot(rot_matrix, ray_dir_cam)
+                        
+                        # DEBUG LOGGING for first pixel to diagnose coordinate system issues
+                        if 'first_ray_debug' not in locals():
+                            logger.info(f"\n=== RAY CASTING DEBUG (frame {frame_idx}, cam {cam_id}) ===")
+                            logger.info(f"Ray origin world: {ray_origin_world}")
+                            logger.info(f"Ray direction world: {ray_dir_world}")
+                            logger.info(f"Mesh bounds check:")
+                            logger.info(f"  Ray origin X={ray_origin_world[0]:.3f} in mesh range [{x_min_mesh:.3f}, {verts_np[:, 0].max():.3f}]? {'YES' if x_min_mesh <= ray_origin_world[0] <= verts_np[:, 0].max() else 'NO'}")
+                            logger.info(f"  Ray origin Y={ray_origin_world[1]:.3f} in mesh range [{y_min_mesh:.3f}, {verts_np[:, 1].max():.3f}]? {'YES' if y_min_mesh <= ray_origin_world[1] <= verts_np[:, 1].max() else 'NO'}")
+                            logger.info(f"  Ray origin Z={ray_origin_world[2]:.3f} in mesh range [{z_min_mesh:.3f}, {verts_np[:, 2].max():.3f}]? {'YES' if z_min_mesh <= ray_origin_world[2] <= verts_np[:, 2].max() else 'NO'}")
+                            logger.info(f"Ray direction Z component: {ray_dir_world[2]:.4f} (should be negative for downward rays)")
+                            first_ray_debug = True
+                        
+                        # Ray-plane intersection: t = -(plane_d + n·o) / (n·d)
+                        # For our case, we project onto the X-Y grid plane at mesh level
+                        
+                        # Project ray direction to find where it hits the buffer plane
+                        # We'll use a simplified approach: cast ray and check if it intersects any triangle
+                        
+                        t_hit = None
+                        hit_point = None
+                        
+                        # For heightmap meshes, we need to find the triangle that projects onto this buffer pixel
+                        # Instead of ray-triangle intersection from camera, project each point in mesh plane and check visibility
+                        
+                        for tri_idx, tri in enumerate(triangles):
+                            v0, v1, v2 = tri['vertices']
+                            
+                            # Ray-triangle intersection using Moller-Trumbore algorithm (optimized)
+                            edge1 = v1 - v0
+                            edge2 = v2 - v0
+                            h_vec = np.cross(ray_dir_world, edge2)
+                            det_a = np.dot(edge1, h_vec)
+                            
+                            # Check if ray is parallel to triangle plane
+                            if abs(det_a) > 1e-8:  
+                                f_inv = 1.0 / det_a
+                                s_vec = ray_origin_world - v0
+                                
+                                u = f_inv * np.dot(s_vec, h_vec)
+                                
+                                # Check barycentric coordinate constraints
+                                if u >= 0 and u <= 1:
+                                    q_cross_edge1 = np.cross(s_vec, edge1)
+                                    v = f_inv * np.dot(ray_dir_world, q_cross_edge1)
+                                    
+                                    # Second barycentric constraint
+                                    if v >= 0 and (u + v) <= 1:
+                                        # Ray intersects triangle at distance t
+                                        t_hit_val = f_inv * np.dot(edge2, q_cross_edge1)
+                                        
+                                                                                # Hit must be in front of camera and not too close (avoid self-intersection)
+                                        if t_hit_val > 0.01:  
+                                            hit_point = ray_origin_world + t_hit_val * ray_dir_world
+                                            projection_stats['rays_hit_mesh'] += 1
+                                            logger.debug(f"Ray HIT at frame {frame_idx}, cam {cam_id}: distance={t_hit_val:.3f}m, point={hit_point}")
+                                            # For heightmap meshes, prefer closer intersections first
+                                            break
+                                    else:
+                                        v = -1.0  # Will fail check
+
+                        if hit_point is None:
+                            projection_stats['rays_missed_mesh'] += 1
+                            continue
+
+                        # Map intersection point to image buffer coordinates (world -> pixel)
+                        buf_x_idx = int((hit_point[0] - x_min) / scene_width_meters * width_pixels)
+                        buf_y_idx = int((hit_point[1] - y_min) / scene_height_meters * height_pixels)
+                        
+                        # Clamp to valid buffer range
+                        buf_x_idx = np.clip(buf_x_idx, 0, width_pixels - 1)
+                        buf_y_idx = np.clip(buf_y_idx, 0, height_pixels - 1)
+                        
+                        updated_buffer[buf_y_idx, buf_x_idx] = rgb_color
+                        projection_stats['buffer_pixels_updated'].add((buf_y_idx, buf_x_idx))
+                        print(f"Updated buffer pixel at ({buf_y_idx}, {buf_x_idx}) with color {rgb_color}")
+                    
+                    # Save the image buffer after processing each frame/camera combination
+                    save_path = os.path.join(step1_dir, f"frame_{frame_idx}_cam{cam_id}_buffer.png") if step1_dir else None
+                    
+                    try:
+                        if save_path and len(selected_py) > 0:
+                            # Convert to uint8 for PNG saving
+                            buffer_uint8 = np.clip(updated_buffer * 255.0, 0, 255).astype(np.uint8)
+                            
+                            plt.figure(figsize=(buffer_metadata['width']/72, buffer_metadata['height']/72), dpi=72)
+                            plt.imshow(buffer_uint8)
+                            plt.axis('off')
+                            plt.tight_layout()
+                            plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+                            plt.close()
+                            
+                            logger.info(f"Saved image buffer after frame {frame_idx}, camera {cam_id} to {save_path}")
+                    except Exception as save_error:
+                        logger.warning(f"Could not save intermediate buffer for frame {frame_idx}: {save_error}")
+
+                    pbar.update(1)
+            
+            except Exception as e:
+                logger.warning(f"Error processing frame {frame_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+        # Convert set to count for stats
+    projection_stats['road_pixels_projected'] = len(projection_stats['buffer_pixels_updated'])
+    num_unique_buffer_pixels = len(projection_stats['buffer_pixels_updated'])
+    del projection_stats['buffer_pixels_updated']  # Remove raw set from final output
+    
+    hit_rate = (projection_stats['rays_hit_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_cast_total' in projection_stats else 0.0
+    miss_rate = (projection_stats['rays_missed_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_missed_mesh' in projection_stats and projection_stats['rays_cast_total'] > 0 else 0.0
+    
+    logger.info("\n" + "="*60)
+    logger.info("RGB PROJECTION STATISTICS")
+    logger.info("="*60)
+    logger.info(f"Total frames processed: {projection_stats['total_frames']}")
+    logger.info(f"Total cameras processed: {projection_stats['total_cameras_processed']}")
+    logger.info(f"Rays cast from camera: {projection_stats.get('rays_cast_total', 0):,}")
+    logger.info(f"Rays that HIT mesh triangles: {projection_stats.get('rays_hit_mesh', 0):,} ({hit_rate:.1f}%)")
+    logger.info(f"Rays MISSED all triangles: {projection_stats.get('rays_missed_mesh', 0):,} ({miss_rate:.1f}%)")
+    logger.info(f"Unique buffer pixels updated with RGB colors: {num_unique_buffer_pixels:,}")
+    if projection_stats['total_cameras_processed'] > 0:
+        avg_rays_per_camera = projection_stats.get('rays_cast_total', 0) / max(projection_stats['total_cameras_processed'], 1)
+        logger.info(f"Average rays per camera: {avg_rays_per_camera:.1f}")
+    
+    # Log potential issues if hit rate is low
+    if 'rays_hit_mesh' in projection_stats and hit_rate < 50:
+        logger.warning("LOW HIT RATE DETECTED - Check coordinate system alignment!")
+        logger.warning(f"Only {hit_rate:.1f}% of rays intersected the mesh")
+
+    # Suggest fixes based on common issues
+    if 'first_ray_debug' in locals():
+        logger.info("")
+        logger.info("POSSIBLE FIXES:")
+        logger.info("  1. Check ray direction Z component - should be negative for downward rays onto heightmap")
+        logger.info("  2. Verify camera extrinsics matrix orientation (world-to-camera vs camera-to-world)")
+        logger.info("  3. Ensure mesh coordinate system matches world space from dataset")
+
+    logger.info(f"Projected {projection_stats['total_cameras_processed']} camera views")
+    logger.info(f"Updated {num_unique_buffer_pixels:,} unique buffer pixels with RGB colors")
+    
+    return updated_buffer, projection_stats
+
+
+def create_camera_view_comparison(dataset, vertices_tensor, faces_tensor, cam_id=2, frame_idx=None, output_dir="", num_frames=None):
+    """
+    Create a side-by-side comparison image of RGB view and mesh render from the same camera perspective.
+    
+    This function helps verify that world space alignment is correct between:
+    - The actual RGB camera image
+    - A rendered view of the road mesh from the same camera pose
+    
+    Args:
+        dataset: DrivingDataset instance with loaded data and camera information
+        vertices_tensor: M x 3 tensor of vertex positions in meters
+        faces_tensor: F x 3 tensor of face indices (triangles)
+        cam_id: Camera ID to visualize (default=2, middle camera view)
+        frame_idx: Specific frame index to use. If None, uses first available frame.
+        output_dir: Directory to save the comparison image
+        num_frames: Total number of frames for progress tracking
+        
+    Returns:
+        Path to saved comparison file or None if failed
+    """
+    import matplotlib.colors as mcolors
+    from mpl_toolkits.mplot3d.art3d import PolyCollection
+    
+    logger.info(f"\nCreating camera view comparison (camera {cam_id})...")
+    
+    # Convert mesh to numpy for rendering
+    verts_np = vertices_tensor.cpu().numpy() if isinstance(vertices_tensor, torch.Tensor) else np.array(vertices_tensor)
+    faces_np = faces_tensor.cpu().numpy() if isinstance(faces_tensor, torch.Tensor) else np.array(faces_tensor)
+    
+    logger.info(f"Mesh dimensions: {len(verts_np)} vertices, {len(faces_np)} triangles")
+    
+    # Validate vertex-face consistency (debugging check)
+    max_face_idx = faces_np.max() if len(faces_np) > 0 else -1
+    min_face_idx = faces_np.min() if len(faces_np) > 0 else 999
+    
+    if len(verts_np) == 0 or len(faces_np) == 0:
+        logger.warning("Cannot create comparison - empty mesh")
+        return None
+    
+    # Check for vertex-face index mismatch (common issue with grid-based meshes)
+    if max_face_idx >= len(verts_np):
+        logger.warning(f"Vertex-face index MISMATCH detected! Max face index {max_face_idx} exceeds vertex count {len(verts_np)}")
+        logger.warning("This indicates a bug in mesh creation where faces reference non-existent vertices.")
+    
+    # Determine which frame to use for visualization
+    total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 0
+    frame_count = total_train_indices if num_frames is None else min(num_frames, total_train_indices)
+    if frame_count <= 0:
+        logger.warning("No training frames available for comparison")
+        return None
+    target_frame_idx = frame_idx if frame_idx is not None and frame_idx < frame_count else min(cam_id * 2, frame_count - 1)
+    
+    logger.info(f"Using frame {target_frame_idx} for comparison")
+    
+    try:
+        # Get image data from dataset
+        if hasattr(dataset, 'full_image_set') and dataset.full_image_set is not None:
+            img_index = int(target_frame_idx * total_train_indices / max(frame_count, 1))
+            img_index = min(img_index, total_train_indices - 1)
+            
+            image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+        else:
+            logger.warning("No full_image_set available for comparison")
+            return None
+        
+        if 'pixels' not in image_infos or 'road_masks' not in image_infos:
+            logger.warning("Missing required data (pixels/road_masks) for comparison")
+            return None
+        
+        rgb_images = image_infos['pixels']
+        road_masks = image_infos.get('road_masks')
+        K = cam_infos.get('intrinsics', None)
+        c2w = cam_infos.get('camera_to_world', None)
+        
+        # Handle multi-camera format
+        is_multi_camera = torch.is_tensor(rgb_images) and len(rgb_images.shape) == 4 or (
+            isinstance(rgb_images, np.ndarray) and rgb_images.ndim == 4)
+        
+        if not is_multi_camera:
+            rgb_list = [rgb_images]
+            road_mask_list = [road_masks] if road_masks is not None else []
+        else:
+            rgb_list = torch.unbind(rgb_images, dim=0) if torch.is_tensor(rgb_images) else list(rgb_images)
+            road_mask_list = (torch.unbind(road_masks, dim=0) if (torch.is_tensor(road_masks)) and road_masks is not None 
+                             else [None] * len(rgb_list))
+        
+        # Get the specified camera view
+        cam_id_clamped = min(cam_id, len(rgb_list) - 1)
+        rgb_img = rgb_list[cam_id_clamped]
+        road_mask = road_mask_list[cam_id_clamped] if cam_id_clamped < len(road_mask_list) else None
+        
+        # Convert tensors to numpy on CPU before processing (fixes CUDA->numpy conversion error)
+        if torch.is_tensor(rgb_img):
+            rgb_img = rgb_img.cpu().numpy()
+        
+        # Handle road mask similarly - convert tensor to numpy on CPU first  
+        if road_mask is not None and torch.is_tensor(road_mask):
+            road_mask = road_mask.cpu().numpy()
+        
+        # Get camera parameters for this view
+        K_cam = K
+        c2w_cam = c2w
+        
+        if torch.is_tensor(K_cam):
+            K_np = K_cam.cpu().numpy()
+        elif isinstance(K_cam, np.ndarray) or (hasattr(K_cam, '__getitem__') and len(np.shape(K_cam)) == 2):
+            K_np = np.array(K_cam)
+        else:
+            logger.warning(f"Invalid intrinsics format: {type(K_cam)}")
+            return None
+        
+        if torch.is_tensor(c2w_cam):
+            c2w_np = c2w_cam.cpu().numpy()
+        elif isinstance(c2w_cam, np.ndarray) or (hasattr(c2w_cam, '__getitem__') and len(np.shape(c2w_cam)) >= 2):
+            c2w_np = np.array(c2w_cam)
+            if len(c2w_np.shape) == 3:
+                c2w_np = c2w_np[0] if isinstance(cam_id_clamped, int) else c2w_np
+        else:
+            logger.warning(f"Invalid extrinsics format: {type(c2w_cam)}")
+            return None
+        
+        # Create side-by-side comparison figure
+        fig = plt.figure(figsize=(16, 8))
+        
+        # Left panel: RGB camera view with road mask overlay
+        ax_rgb = fig.add_subplot(131)
+        rgb_display = np.clip(rgb_img * 255, 0, 255).astype(np.uint8) if (rgb_img.max() <= 1.0 and len(rgb_img.shape) == 3) else rgb_img
+        ax_rgb.imshow(rgb_display)
+        
+        # Overlay road mask in semi-transparent red
+        if road_mask is not None:
+            rm = np.array(road_mask)
+            if torch.is_tensor(rm):
+                rm = rm.cpu().numpy()
+            overlay = np.zeros_like(rgb_display, dtype=np.uint8)
+            overlay[rm > 0.5] = [255, 0, 0]
+            alpha = 0.4
+            blended = (rgb_display * (1 - alpha) + overlay * alpha).astype(np.uint8)
+            ax_rgb.imshow(blended, alpha=alpha if road_mask.max() > 0 else 0)
+        
+        # Get camera position from extrinsics
+        cam_pos_world = c2w_np[:3, 3] if len(c2w_np.shape) >= 2 and c2w_np.shape[0] == 4 else [0, 0, -1.6]
+        ax_rgb.set_title(f"RGB View (Camera {cam_id_clamped})\nPos: [{cam_pos_world[0]:+.2f}, {cam_pos_world[1]:+.2f}, {cam_pos_world[2]:+,.2f}m]", 
+                        fontsize=14, fontweight='bold')
+        ax_rgb.set_xlabel('Width (pixels)', fontsize=12)
+        ax_rgb.set_ylabel('Height (pixels)', fontsize=12)
+        
+        # Right panel: Projected mesh view from camera perspective (2D projection)
+        ax_proj = fig.add_subplot(133)
+        
+        # Project mesh vertices to 2D pixel space using camera intrinsics
+        verts_homogeneous = np.concatenate([verts_np, np.ones((len(verts_np), 1))], axis=1)  # (N, 4)
+        
+        # Transform from world to camera coordinates: p_cam = R @ p_world + t
+        cam_to_world = c2w_np if len(c2w_np.shape) == 4 and c2w_np.shape[0] >= 1 else np.eye(4)
+        rot_matrix = cam_to_world[:3, :3]
+        trans_vector = cam_to_world[:3, 3]
+        
+        # World to camera transform
+        R_cam_from_world = rot_matrix.T
+        t_cam = -R_cam_from_world @ trans_vector
+        p_camera = (R_cam_from_world @ verts_homogeneous[:, :3].T).T + t_cam  # (N, 3)
+        
+        # Project to pixel coordinates: u = K * [x/z, y/z, 1]
+        pixels_2d = np.dot(K_np[:2], p_camera.T) / (p_camera[:, 2] + 1e-6)  # (N, 2)
+        
+        # Draw projected triangles on image plane with bounds checking
+        valid_triangles = 0
+        skipped_invalid = 0
+        
+        for i in range(len(faces_np)):
+            v0_idx, v1_idx, v2_idx = faces_np[i]
+            
+            # Bounds check: ensure all vertex indices are within the projected vertices array
+            if (v0_idx >= len(pixels_2d) or v1_idx >= len(pixels_2d) or v2_idx >= len(pixels_2d)):
+                skipped_invalid += 1
+                continue
+            
+            tri_pixels = pixels_2d[[v0_idx, v1_idx, v2_idx]]
+            
+            # Check if triangle is visible (facing camera)
+            z_vals = p_camera[:, 2][[v0_idx, v1_idx, v2_idx]]
+            avg_z = np.mean(z_vals)
+            if avg_z > 0.5:  # Only draw triangles in front of camera
+                ax_proj.plot(tri_pixels[:, 0], tri_pixels[:, 1], 'b-', linewidth=0.3, alpha=0.6)
+                valid_triangles += 1
+        
+        logger.info(f"Projected {valid_triangles} valid triangles (skipped {skipped_invalid} with invalid vertex indices)")
+        x_min, y_min, z_min = verts_np.min(axis=0)
+        x_max, y_max, _ = verts_np.max(axis=0)
+        max_range = np.array([x_max-x_min, y_max-y_min]).max() / 2.0 * 1.5
+        
+        ax_proj.set_xlim(0, rgb_img.shape[1])
+        ax_proj.set_ylim(rgb_img.shape[0], 0)
+        
+        # Set axis labels
+        ax_proj.set_xlabel('Width (pixels)', fontsize=12)
+        ax_proj.set_ylabel('Height (pixels)', fontsize=12)
+        
+        # Calculate mid points for combined view projection (needed by code below)
+        x_min, y_min, z_min = verts_np.min(axis=0)
+        x_max, y_max, _ = verts_np.max(axis=0)
+        max_range = np.array([x_max-x_min, y_max-y_min]).max() / 2.0 * 1.5
+        mid_x = (x_max + x_min) * 0.5
+        mid_y = (y_max + y_min) * 0.5
+                
+        # Calculate mid points for combined view projection
+        x_min, y_min, z_min = verts_np.min(axis=0)
+        x_max, y_max, _ = verts_np.max(axis=0)
+        max_range = np.array([x_max-x_min, y_max-y_min]).max() / 2.0 * 1.5
+        mid_x = (x_max + x_min) * 0.5
+        mid_y = (y_max + y_min) * 0.5
+        
+        ax_proj.set_title(f"Projected Mesh from Camera {cam_id_clamped}\nSame Pose as RGB View", 
+                       fontsize=14, fontweight='bold')
+        
+        # Center panel: Combined view showing both for comparison
+        ax_combined = fig.add_subplot(132)
+        combined_display = np.zeros((max(rgb_img.shape[0], 500), rgb_img.shape[1] * 2 + 100, 3), dtype=np.uint8) if len(rgb_img.shape) == 3 else None
+        
+        # Create a simple side-by-side composite for quick comparison
+        left_half = np.zeros((max(400, rgb_img.shape[0]), 500, 3), dtype=np.uint8)
+        right_half = np.zeros((max(400, rgb_img.shape[0]), 500, 3), dtype=np.uint8)
+        
+        # Left: RGB image scaled to fit
+        if len(rgb_img.shape) == 3:
+            rgb_scaled = (rgb_img * 255).astype(np.uint8)[:400, :500]
+            left_half[:rgb_scaled.shape[0], :rgb_scaled.shape[1]] = rgb_scaled
+        
+        # Right: Mesh wireframe overlay on heightmap
+        z_vals = verts_np[:, 2].reshape(int(np.sqrt(len(verts_np))), int(np.sqrt(len(verts_np))))
+        x_vals = np.linspace(x_min, x_max, len(z_vals))[:int(np.sqrt(len(verts_np)))]
+        y_vals = np.linspace(y_min, y_max, z_vals.shape[1])
+        
+        # Create a simple mesh visualization
+        for i in range(min(50, len(faces_np))):
+            v0_idx, v1_idx, v2_idx = faces_np[i]
+            tri_verts = verts_np[[v0_idx, v1_idx, v2_idx]]
+            if len(tri_verts) == 3:
+                # Project to 2D for display
+                x_proj = (tri_verts[:, 0] - mid_x + max_range) / (max_range * 2) * 450 + 25
+                y_proj = (-tri_verts[:, 1] + mid_y + max_range) / (max_range * 2) * 450 + 25
+                if all(0 <= x < 500 and 0 <= y < 400 for x, y in zip(x_proj, y_proj)):
+                    right_half[y_proj[1]:y_proj[2], x_proj[1]:x_proj[2]] = [200, 200, 255]
+        
+        combined_display[:, :500] = left_half
+        combined_display[:, 600:1100] = right_half
+        ax_combined.imshow(combined_display)
+        ax_combined.set_title("Quick Comparison View", fontsize=14, fontweight='bold')
+        ax_combined.axis('off')
+        
+        plt.tight_layout()
+        
+        # Save comparison image
+        if output_dir:
+            comp_path = os.path.join(output_dir, f"camera_{cam_id_clamped}_rgb_vs_mesh_comparison.png")
+            plt.savefig(comp_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Saved camera view comparison to {comp_path}")
+        else:
+            comp_path = None
+        
+        plt.close(fig)
+        return comp_path
+    
+    except Exception as e:
+        logger.error(f"Error creating camera view comparison: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def log_rgb_projection_visualization(buffer: np.ndarray, 
+                                      stats: dict, 
+                                      output_dir: str) -> None:
+    """Create and save visualization of the projected RGB image buffer.
+    
+    Args:
+        buffer: H x W x 3 numpy array with float values in [0, 1] range
+        stats: Dictionary containing projection statistics
+        output_dir: Directory to save visualizations
+        
+    Returns:
+        Path to saved visualization file
+    """
+    
+    if len(buffer) == 0 or len(stats) == 0:
+        logger.warning("Cannot visualize empty projected buffer")
+        return
+    
+    width = stats.get('width', buffer.shape[1])
+    height = stats.get('height', buffer.shape[0])
+    pixels_updated = stats.get('road_pixels_projected', 'N/A')
+    
+    # Create visualization with multiple views
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # View 1: Full projected RGB buffer (top-down view of texture map)
+    ax_full = axes[0, 0]
+    im_full = ax_full.imshow(buffer, extent=[-width/2, width/2, -height/2, height/2], origin='lower')
+    ax_full.set_xlabel('Width (pixels)', fontsize=12)
+    ax_full.set_ylabel('Height (pixels)', fontsize=12)
+    ax_full.set_title(f"Projected RGB Buffer ({width}×{height})", fontsize=14, fontweight='bold')
+    plt.colorbar(im_full, ax=ax_full, label='RGB Intensity', shrink=0.8)
+    
+    # View 2: Zoomed center region (first quadrant for clarity)
+    zoom_x = min(width // 4, max(50, width // 10))
+    zoom_y = min(height // 4, max(50, height // 10))
+    ax_zoom = axes[0, 1]
+    im_zoom = ax_zoom.imshow(buffer[:zoom_y, :zoom_x], origin='lower', 
+                            extent=[-width/2, -width/2+zoom_x, -height/2, -height/2+zoom_y])
+    ax_zoom.set_xlabel('Width (pixels)', fontsize=12)
+    ax_zoom.set_ylabel('Height (pixels)', fontsize=12)
+    ax_zoom.set_title(f"Center Region ({zoom_x}×{zoom_y})", fontsize=14, fontweight='bold')
+    
+    # View 3: RGB channel breakdown - Red channel
+    ax_r = axes[0, 2]
+    im_r = ax_r.imshow(buffer[:, :, 0], cmap='Reds', origin='lower')
+    ax_r.set_xlabel('Width (pixels)', fontsize=12)
+    ax_r.set_ylabel('Height (pixels)', fontsize=12)
+    ax_r.set_title("Red Channel", fontsize=14, fontweight='bold')
+    
+    # View 4: RGB channel breakdown - Green channel  
+    ax_g = axes[1, 0]
+    im_g = ax_g.imshow(buffer[:, :, 1], cmap='Greens', origin='lower')
+    ax_g.set_xlabel('Width (pixels)', fontsize=12)
+    ax_g.set_ylabel('Height (pixels)', fontsize=12)
+    ax_g.set_title("Green Channel", fontsize=14, fontweight='bold')
+    
+    # View 5: RGB channel breakdown - Blue channel
+    ax_b = axes[1, 1]
+    im_b = ax_b.imshow(buffer[:, :, 2], cmap='Blues', origin='lower')
+    ax_b.set_xlabel('Width (pixels)', fontsize=12)
+    ax_b.set_ylabel('Height (pixels)', fontsize=12)
+    ax_b.set_title("Blue Channel", fontsize=14, fontweight='bold')
+    
+    # View 6: Updated pixel density heatmap
+    updated_mask = np.any(buffer > 0.01, axis=-1).astype(float)
+    ax_density = axes[1, 2]
+    im_density = ax_density.imshow(updated_mask, cmap='viridis', origin='lower')
+    ax_density.set_xlabel('Width (pixels)', fontsize=12)
+    ax_density.set_ylabel('Height (pixels)', fontsize=12)
+    ax_density.set_title(f"Updated Pixels ({pixels_updated:,})", 
+                        fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save visualization with high DPI for publication quality
+    viz_path = os.path.join(output_dir, "rgb_projection_visualization.png") if output_dir else None
+    
+    try:
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        logger.info(f"Saved RGB projection visualization to {viz_path}")
+        
+        # Also save a lower resolution version for quick viewing
+        viz_path_lowres = os.path.join(output_dir, "rgb_projection_preview.png") if output_dir else None
+        plt.savefig(viz_path_lowres, dpi=72, bbox_inches='tight')
+        logger.info(f"Saved preview visualization to {viz_path_lowres}")
+    except Exception as e:
+        logger.error(f"Error saving RGB projection visualization: {e}")
+    
+    plt.close(fig)
+
+
 def main():
     
     # Parse command line arguments
@@ -1277,7 +2257,7 @@ def main():
     # Convert to numpy for processing and visualization
     pts_xyz = torch.cat([road_pts, road_colors], dim=1).cpu().numpy() if len(road_pts) > 0 else np.empty((0, 6))
     
-    # Step 1.4: Log bird's eye view of point cloud
+    # Step 1.4: Log bird's eye view of point cloud with camera locations
     try:
         log_birds_eye_view(pts_xyz[:, :3], pts_xyz[:, 3:], step1_dir)
         
@@ -1286,9 +2266,110 @@ def main():
         
         # Log detailed statistics to console and file
         log_point_cloud_statistics(pts_xyz[:, :3])
-        
     except Exception as e:
         logger.error(f"Error during visualization logging: {e}")
+
+    # Step 1.45: Create camera locations plot showing all camera positions with point cloud
+    try:
+        create_camera_locations_plot(dataset, step1_dir)
+        
+        # Also create combined view of cameras + road points in same plot
+        cam_positions = None
+        if hasattr(dataset, 'full_image_set') and dataset.full_image_set is not None:
+            total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 10
+            
+            for i in range(min(5, max(1, total_train_indices // 2))):
+                img_index = int(i * len(dataset.train_indices) / max(total_train_indices, 1)) if total_train_indices > 0 else 0
+                
+                try:
+                    image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+                    c2w = cam_infos.get('camera_to_world', None)
+                    
+                    if c2w is not None:
+                        if torch.is_tensor(c2w):
+                            c2w_np = c2w.cpu().numpy()
+                        else:
+                            c2w_np = np.array(c2w)
+                        
+                        # Extract camera positions from extrinsics matrix
+                        if len(c2w_np.shape) == 3:  # Multi-camera frame
+                            for j in range(min(5, c2w_np.shape[0])):
+                                cam_positions.append(c2w_np[j][:3, 3]) if 'cam_positions' not in locals() else None
+                        elif len(c2w_np.shape) == 2:  # Single camera view
+                            cam_positions = np.array([c2w_np[:3, 3]]) if 'cam_positions' is None else np.vstack([cam_positions, c2w_np[:3, 3]])
+                except Exception as e:
+                    logger.debug(f"Could not extract camera position from frame {i}: {e}")
+            
+            # Create combined visualization with cameras and road points in same plot
+            if cam_positions is not None and len(cam_positions) > 0:
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                # X-Y plane (bird's eye view - top down) WITH CAMERAS
+                ax_xy = axes[0]
+                scatter_pts = ax_xy.scatter(pts_xyz[:, 0], pts_xyz[:, 1], c=range(len(pts_xyz)), 
+                                           cmap='viridis', s=1, alpha=0.5, label='Road Points')
+                
+                # Plot camera positions in red X markers
+                cam_array = np.array(cam_positions) if not isinstance(cam_positions, np.ndarray) else cam_positions
+                scatter_cams = ax_xy.scatter(cam_array[:, 0], cam_array[:, 1], 
+                                             c='red', s=80, marker='X', linewidths=2,
+                                             edgecolors='white', alpha=0.9, label=f'Cameras ({len(cam_positions)} positions)')
+                ax_xy.legend(loc='upper right', fontsize=10)
+                
+                ax_xy.set_xlabel('X (meters)', fontsize=12)
+                ax_xy.set_ylabel('Y (meters)', fontsize=12)
+                title = f"Bird's Eye View - {len(pts_xyz):,} Road Points + Camera Locations"
+                ax_xy.set_title(title, fontsize=14, fontweight='bold')
+                ax_xy.grid(True, alpha=0.3)
+                plt.colorbar(scatter_pts, ax=ax_xy, label='Point Index', shrink=0.8)
+                
+                # X-Z plane (side view - looking from side) WITH CAMERAS
+                ax_xz = axes[1]
+                scatter2_pts = ax_xz.scatter(pts_xyz[:, 0], pts_xyz[:, 2], c=range(len(pts_xyz)), 
+                                             cmap='viridis', s=1, alpha=0.5, label='Road Points')
+                
+                # Plot camera positions in red X markers  
+                scatter_cams_z = ax_xz.scatter(cam_array[:, 0], cam_array[:, 2], 
+                                               c='red', s=80, marker='X', linewidths=2,
+                                               edgecolors='white', alpha=0.9, label=f'Cameras ({len(cam_positions)} positions)')
+                ax_xz.legend(loc='upper right', fontsize=10)
+                
+                ax_xz.set_xlabel('X (meters)', fontsize=12)
+                ax_xz.set_ylabel('Z height (meters)', fontsize=12)
+                title_z = "Side View - X-Z Plane"
+                if len(cam_positions) > 0:
+                    title_z += " + Cameras"
+                ax_xz.set_title(title_z, fontsize=14, fontweight='bold')
+                ax_xz.grid(True, alpha=0.3)
+                
+                # Y-Z plane (front view - looking from front/side) WITH CAMERAS  
+                ax_yz = axes[2]
+                scatter3_pts = ax_yz.scatter(pts_xyz[:, 1], pts_xyz[:, 2], c=range(len(pts_xyz)), 
+                                             cmap='viridis', s=1, alpha=0.5, label='Road Points')
+                
+                # Plot camera positions in red X markers
+                scatter_cams_front = ax_yz.scatter(cam_array[:, 1], cam_array[:, 2], 
+                                                   c='red', s=80, marker='X', linewidths=2,
+                                                   edgecolors='white', alpha=0.9, label=f'Cameras ({len(cam_positions)} positions)')
+                ax_yz.legend(loc='upper right', fontsize=10)
+                
+                ax_yz.set_xlabel('Y (meters)', fontsize=12)
+                ax_yz.set_ylabel('Z height (meters)', fontsize=12)
+                title_front = "Front View - Y-Z Plane"
+                if len(cam_positions) > 0:
+                    title_front += " + Cameras"
+                ax_yz.set_title(title_front, fontsize=14, fontweight='bold')
+                ax_yz.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                
+                # Save combined visualization with high DPI for publication quality
+                viz_path = os.path.join(step1_dir, "combined_pointcloud_cameras.png")
+                plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+                logger.info(f"Saved combined point cloud + camera locations plot to {viz_path}")
+                
+    except Exception as e:
+        logger.warning(f"Could not create combined visualization with cameras (non-critical): {e}")
     
     # Step 1.5: Export point cloud to PLY format for external inspection
     try:
@@ -1298,6 +2379,8 @@ def main():
         logger.error(f"Error during PLY export: {e}")
     
     # Step 2: Create a 3D mesh from the aggregated point cloud (NO Z-AXIS OVERLAP!)
+    # IMPORTANT: This uses PRUNED lidar data - only includes points remaining after 
+    # dataset.project_lidar_pts_on_images() removes out-of-view points during initialization.
     try:
         vertices_tensor, faces_tensor, vertex_colors = create_and_log_mesh(
             pts_xyz[:, :3], 
@@ -1380,9 +2463,117 @@ def main():
     except Exception as e:
         logger.error(f"Error during image buffer creation (Step 3): {e}")
     
+    # Before Step 4: Create camera view verification (side-by-side RGB vs mesh render)
+    try:
+        logger.info("\n" + "=" * 60)
+        logger.info("VERIFICATION - Camera View Comparison")
+        logger.info("=" * 60)
+        
+        comparison_path = create_camera_view_comparison(
+            dataset, 
+            vertices_tensor, 
+            faces_tensor, 
+            cam_id=2,  # Use middle camera view (index 2 is typically the third/center view in multi-camera setups)
+            output_dir=step1_dir,
+            num_frames=args.num_projection_frames if args.num_projection_frames is not None else (len(dataset.train_indices) if hasattr(dataset, 'train_indices') else None)
+        )
+        
+        if comparison_path and os.path.exists(comparison_path):
+            logger.info(f"Camera verification image saved to: {comparison_path}")
+    except Exception as e:
+        logger.warning(f"Could not create camera view comparison (non-critical): {e}")
+
+    
+    # Before Step 4: Create camera view verification (side-by-side RGB vs mesh render)
+    try:
+        logger.info("\n" + "=" * 60)
+        logger.info("VERIFICATION - Camera View Comparison")
+        logger.info("=" * 60)
+        
+        comparison_path = create_camera_view_comparison(
+            dataset, 
+            vertices_tensor, 
+            faces_tensor, 
+            cam_id=2,  # Use middle camera view (index 2 is typically the third/center view in multi-camera setups)
+            output_dir=step1_dir,
+            num_frames=args.num_projection_frames if args.num_projection_frames is not None else (len(dataset.train_indices) if hasattr(dataset, 'train_indices') else None)
+        )
+        
+        if comparison_path and os.path.exists(comparison_path):
+            logger.info(f"Camera verification image saved to: {comparison_path}")
+    except Exception as e:
+        logger.warning(f"Could not create camera view comparison (non-critical): {e}")
+
+    
+    # Step 4: Project RGB images onto the mesh using ray casting from camera positions
+    try:
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 4 - RGB IMAGE PROJECTION")
+        logger.info("=" * 60)
+        
+        # Perform ray projection of road-masked RGB pixels onto image buffer
+        updated_buffer, projection_stats = project_rgb_onto_image_buffer(
+            dataset, 
+            vertices_tensor, 
+            faces_tensor, 
+            image_buffer, 
+            buffer_metadata,
+            device,
+            step1_dir,
+            num_frames=args.num_projection_frames,
+        )
+        
+        # Log visualization of the projected result
+        log_rgb_projection_visualization(updated_buffer, {**buffer_metadata, **projection_stats}, step1_dir)
+        
+        # Save updated texture map with RGB projections
+        rgb_texture_path = os.path.join(step1_dir, "road_textured_mesh.png") if step1_dir else None
+        
+        try:
+            save_image_buffer_as_png(
+                updated_buffer, 
+                buffer_metadata, 
+                rgb_texture_path
+            )
+            
+            # Save projection statistics for analysis
+            stats_json_path = os.path.join(step1_dir, "projection_stats.json") if step1_dir else None
+            
+            try:
+                with open(stats_json_path, 'w') as f:
+                    json.dump({
+                        **projection_stats,
+                        'width': buffer_metadata.get('width'),
+                        'height': buffer_metadata.get('height'),
+                        'pixels_per_meter': buffer_metadata.get('pixels_per_meter')
+                    }, f, indent=2)
+                logger.info(f"Saved projection statistics to {stats_json_path}")
+                
+            except Exception as stats_error:
+                logger.warning(f"Could not save JSON stats (non-critical): {stats_error}")
+            
+        except Exception as rgb_save_error:
+            logger.error(f"Error saving RGB texture map: {rgb_save_error}")
+        
+        # Log projection statistics to console and file
+        if len(projection_stats) > 0:
+            total_cameras = projection_stats.get('total_cameras_processed', 'N/A')
+            pixels_updated = projection_stats.get('road_pixels_projected', 'N/A')
+            
+            logger.info(f"\nRGB Projection Statistics:")
+            logger.info(f"  - Total cameras processed: {total_cameras}")
+            logger.info(f"  - Unique buffer pixels updated: {pixels_updated:,}")
+            logger.info(f"  - Output file: road_textured_mesh.png")
+        
+        # Update image_buffer variable for final summary (now contains RGB projections)
+        image_buffer = updated_buffer
+            
+    except Exception as e:
+        logger.error(f"Error during RGB projection (Step 4): {e}")
+    
     # Final summary logging
     logger.info("=" * 60)
-    logger.info("STEP 1, STEP 2 & STEP 3 COMPLETED SUCCESSFULLY")
+    logger.info("STEPS 1-4 COMPLETED SUCCESSFULLY")
     logger.info("=" * 60)
     logger.info(f"Output directory: {base_path}")
     logger.info(f"All files saved to: {step1_dir}")
@@ -1396,9 +2587,22 @@ def main():
     
     if 'image_buffer' in locals() and image_buffer is not None:
         logger.info("")
-        logger.info("STEP 3 - IMAGE BUFFER CREATION COMPLETED:")
-        logger.info(f"  - Texture map file: road_texture_map.png")
+        logger.info("STEP 3 & STEP 4 COMPLETED:")
+        logger.info(f"  - Initial texture map: road_texture_map.png")
+        logger.info(f"  - RGB-projected mesh: road_textured_mesh.png")
         logger.info(f"  - Buffer dimensions: {buffer_metadata.get('width', 'N/A')} × {buffer_metadata.get('height', 'N/A')} pixels")
+    
+    logger.info("")
+    logger.info("Generated files:")
+    for filename in ['road_mesh.pth', 'road_pointcloud.ply', 'road_mesh.ply', 
+                     'road_texture_map.png', 'road_textured_mesh.png',
+                     'image_buffer.npz', 'projection_stats.json']:
+        filepath = os.path.join(step1_dir, filename) if step1_dir else None
+        if filepath and os.path.exists(filepath):
+            logger.info(f"  - {filename}")
+    
+    logger.info("")
+    logger.info(f"  - Buffer dimensions: {buffer_metadata.get('width', 'N/A')} × {buffer_metadata.get('height', 'N/A')} pixels")
     
     logger.info("")
     logger.info("Next steps:")
@@ -1407,5 +2611,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
