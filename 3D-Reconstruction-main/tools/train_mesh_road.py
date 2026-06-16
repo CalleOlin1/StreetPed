@@ -1793,6 +1793,413 @@ def project_rgb_onto_image_buffer(
     return updated_buffer, projection_stats
 
 
+def _build_triangle_cache_gpu(vertices_tensor, faces_tensor, device):
+    """Build triangle vertices directly on the target device."""
+    if torch.is_tensor(vertices_tensor):
+        verts = vertices_tensor.to(device=device, dtype=torch.float32)
+    else:
+        verts = torch.as_tensor(vertices_tensor, dtype=torch.float32, device=device)
+
+    if torch.is_tensor(faces_tensor):
+        faces = faces_tensor.to(device=device, dtype=torch.long)
+    else:
+        faces = torch.as_tensor(faces_tensor, dtype=torch.long, device=device)
+
+    tri_vertices = verts[faces]
+    return tri_vertices[:, 0, :], tri_vertices[:, 1, :], tri_vertices[:, 2, :]
+
+
+def _intersect_rays_with_triangles_gpu(
+    ray_origins,
+    ray_directions,
+    triangle_vertices,
+    ray_chunk_size=512,
+    triangle_chunk_size=4096,
+    min_distance=0.01,
+    eps=1e-8,
+):
+    """Find the nearest triangle hit for each ray using batched GPU work."""
+    tri_v0, tri_v1, tri_v2 = triangle_vertices
+    device = ray_origins.device
+    dtype = ray_origins.dtype
+    num_rays = ray_origins.shape[0]
+
+    best_t = torch.full((num_rays,), float("inf"), device=device, dtype=dtype)
+    best_hit_points = torch.full((num_rays, 3), float("nan"), device=device, dtype=dtype)
+
+    for ray_start in range(0, num_rays, ray_chunk_size):
+        ray_end = min(ray_start + ray_chunk_size, num_rays)
+        origin_chunk = ray_origins[ray_start:ray_end]
+        direction_chunk = ray_directions[ray_start:ray_end]
+
+        chunk_best_t = torch.full((ray_end - ray_start,), float("inf"), device=device, dtype=dtype)
+        chunk_best_points = torch.full((ray_end - ray_start, 3), float("nan"), device=device, dtype=dtype)
+
+        for tri_start in range(0, tri_v0.shape[0], triangle_chunk_size):
+            tri_end = min(tri_start + triangle_chunk_size, tri_v0.shape[0])
+            v0 = tri_v0[tri_start:tri_end]
+            v1 = tri_v1[tri_start:tri_end]
+            v2 = tri_v2[tri_start:tri_end]
+
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+
+            h_vec = torch.cross(direction_chunk[:, None, :], edge2[None, :, :], dim=-1)
+            det = torch.sum(edge1[None, :, :] * h_vec, dim=-1)
+            valid_det = det.abs() > eps
+
+            inv_det = torch.zeros_like(det)
+            inv_det[valid_det] = 1.0 / det[valid_det]
+
+            s_vec = origin_chunk[:, None, :] - v0[None, :, :]
+            u = inv_det * torch.sum(s_vec * h_vec, dim=-1)
+
+            q_vec = torch.cross(s_vec, edge1[None, :, :], dim=-1)
+            v = inv_det * torch.sum(direction_chunk[:, None, :] * q_vec, dim=-1)
+            t = inv_det * torch.sum(edge2[None, :, :] * q_vec, dim=-1)
+
+            hit_mask = (
+                valid_det
+                & (u >= 0.0)
+                & (v >= 0.0)
+                & ((u + v) <= 1.0)
+                & (t > min_distance)
+            )
+
+            candidate_t = torch.where(hit_mask, t, torch.full_like(t, float("inf")))
+            local_best_t, _ = torch.min(candidate_t, dim=1)
+            better = local_best_t < chunk_best_t
+
+            if better.any():
+                chunk_best_t = torch.where(better, local_best_t, chunk_best_t)
+                candidate_points = origin_chunk + local_best_t.unsqueeze(1) * direction_chunk
+                chunk_best_points = torch.where(better.unsqueeze(1), candidate_points, chunk_best_points)
+
+        best_t[ray_start:ray_end] = chunk_best_t
+        best_hit_points[ray_start:ray_end] = chunk_best_points
+
+    hit_mask = torch.isfinite(best_t)
+    return best_hit_points, hit_mask, best_t
+
+
+def project_rgb_onto_image_buffer_gpu(
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    image_buffer,
+    buffer_metadata,
+    device,
+    step1_dir=None,
+    num_frames=None,
+    ray_chunk_size=512,
+    triangle_chunk_size=4096,
+):
+    """GPU batched version of RGB projection onto the image buffer."""
+    if not torch.cuda.is_available() or getattr(device, "type", str(device)) != "cuda":
+        logger.info("CUDA is unavailable; falling back to the CPU projection path.")
+        return project_rgb_onto_image_buffer(
+            dataset,
+            vertices_tensor,
+            faces_tensor,
+            image_buffer,
+            buffer_metadata,
+            device,
+            step1_dir=step1_dir,
+            num_frames=num_frames,
+        )
+
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 4 - RGB IMAGE PROJECTION (GPU)")
+    logger.info("=" * 60)
+
+    width_pixels = buffer_metadata.get('width', image_buffer.shape[1])
+    height_pixels = buffer_metadata.get('height', image_buffer.shape[0])
+    x_min, y_min = buffer_metadata['x_range'][0], buffer_metadata['y_range'][0]
+    scene_width_meters = buffer_metadata['scene_width_meters']
+    scene_height_meters = buffer_metadata['scene_height_meters']
+
+    updated_buffer = image_buffer.copy()
+    projection_stats = {
+        'total_frames': 0,
+        'total_cameras_processed': 0,
+        'road_pixels_projected': 0,
+        'buffer_pixels_updated': set(),
+        'cameras_with_data': [],
+        'rays_cast_total': 0,
+        'rays_hit_mesh': 0,
+        'rays_missed_mesh': 0,
+    }
+
+    if len(vertices_tensor) == 0 or faces_tensor.numel() == 0:
+        logger.warning("Cannot project RGB - mesh not available")
+        return updated_buffer, projection_stats
+
+    triangle_vertices = _build_triangle_cache_gpu(vertices_tensor, faces_tensor, device)
+    logger.info(f"Built {triangle_vertices[0].shape[0]} triangle lookup entries on GPU")
+    verts_np = vertices_tensor.cpu().numpy() if torch.is_tensor(vertices_tensor) else np.asarray(vertices_tensor)
+
+    total_train_indices = len(dataset.train_indices) if hasattr(dataset, 'train_indices') else 0
+    num_frames = total_train_indices if num_frames is None else min(num_frames, total_train_indices)
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive when projecting RGB onto the image buffer")
+
+    first_debug_log_done = False
+    first_ray_debug_done = False
+
+    with torch.no_grad():
+        with tqdm(total=num_frames, desc="Processing frames", unit="frame") as pbar:
+            for frame_idx in range(num_frames):
+                projection_stats['total_frames'] += 1
+
+                try:
+                    if not hasattr(dataset, 'full_image_set') or dataset.full_image_set is None:
+                        logger.warning(f"No full_image_set available for frame {frame_idx}, skipping")
+                        pbar.update(1)
+                        continue
+
+                    if total_train_indices == 0:
+                        logger.warning(f"No train_indices available for frame {frame_idx}, skipping")
+                        pbar.update(1)
+                        continue
+
+                    img_index = int(frame_idx * total_train_indices / num_frames) if num_frames > 0 else 0
+                    img_index = min(img_index, total_train_indices - 1)
+
+                    image_infos, cam_infos = dataset.full_image_set.get_image(img_index, camera_downscale=1.0)
+
+                    if 'pixels' not in image_infos or 'road_masks' not in image_infos:
+                        pbar.update(1)
+                        continue
+
+                    rgb_images = image_infos['pixels']
+                    road_masks = image_infos['road_masks'] if 'road_masks' in image_infos else None
+
+                    is_multi_camera = (torch.is_tensor(rgb_images) and len(rgb_images.shape) == 4) or (
+                        isinstance(rgb_images, np.ndarray) and rgb_images.ndim == 4
+                    )
+
+                    if not is_multi_camera:
+                        rgb_list = [rgb_images]
+                        road_mask_list = [road_masks] if road_masks is not None else []
+                    else:
+                        rgb_list = torch.unbind(rgb_images, dim=0) if torch.is_tensor(rgb_images) else list(rgb_images)
+                        road_mask_list = (
+                            torch.unbind(road_masks, dim=0)
+                            if torch.is_tensor(road_masks) and road_masks is not None
+                            else [None] * len(rgb_list)
+                        )
+
+                    for cam_id, rgb_img in enumerate(rgb_list):
+                        projection_stats['total_cameras_processed'] += 1
+
+                        road_mask = (
+                            road_mask_list[cam_id]
+                            if cam_id < len(road_mask_list) and road_mask_list[cam_id] is not None
+                            else np.zeros(rgb_img.shape[:2], dtype=np.float32)
+                        )
+                        if torch.is_tensor(road_mask):
+                            road_mask = road_mask.cpu().numpy()
+
+                        K = None
+                        camToWorld = None
+
+                        if 'intrinsics' in cam_infos:
+                            try:
+                                K = cam_infos['intrinsics'].cpu().numpy() if torch.is_tensor(cam_infos['intrinsics']) else np.array(cam_infos['intrinsics'])
+                            except Exception as e:
+                                logger.warning(f"Failed to extract intrinsics for frame {frame_idx}: {e}")
+
+                        if K is not None and 'camera_to_world' in cam_infos:
+                            try:
+                                c2w = cam_infos['camera_to_world']
+                                c2w_np = c2w.cpu().numpy() if torch.is_tensor(c2w) else np.array(c2w)
+                                if len(c2w_np.shape) == 3:
+                                    camToWorld = c2w_np[0]
+                                elif len(c2w_np.shape) == 2:
+                                    camToWorld = c2w_np
+                                else:
+                                    logger.warning(f"Unexpected shape for camera_to_world: {c2w_np.shape}")
+                            except Exception as e:
+                                logger.warning(f"Failed to extract extrinsics for frame {frame_idx}: {e}")
+
+                        if K is None or camToWorld is None:
+                            pbar.update(1)
+                            continue
+
+                        road_pixel_indices = np.where(road_mask > 0.5)
+                        if len(road_pixel_indices[0]) == 0:
+                            continue
+
+                        rays_per_image = 1000
+                        num_road_pixels = len(road_pixel_indices[0])
+                        if num_road_pixels > rays_per_image:
+                            logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
+                            sampled_indices = np.random.choice(num_road_pixels, size=rays_per_image, replace=False)
+                            selected_py = road_pixel_indices[0][sampled_indices]
+                            selected_px = road_pixel_indices[1][sampled_indices]
+                        else:
+                            selected_py = road_pixel_indices[0]
+                            selected_px = road_pixel_indices[1]
+
+                        projection_stats['cameras_with_data'].append(f"frame_{frame_idx}_cam{cam_id}")
+
+                        if not first_debug_log_done:
+                            logger.info(f"\nProcessing frame {frame_idx}, camera {cam_id}:")
+                            logger.info(f"  - RGB image shape: {rgb_img.shape}")
+                            logger.info(f"  - Road mask pixels found: {len(road_pixel_indices[0])}")
+                            if K is not None and len(K.shape) == 2:
+                                logger.info(f"  - Camera intrinsics (K): fx={K[0,0]:.1f}, fy={K[1,1]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}")
+                            if camToWorld is not None:
+                                logger.info(f"  - Camera position (world): {camToWorld[:3, 3]}")
+                            x_min_mesh = verts_np[:, 0].min()
+                            y_min_mesh = verts_np[:, 1].min()
+                            z_min_mesh = verts_np[:, 2].min()
+                            x_max_mesh = verts_np[:, 0].max()
+                            y_max_mesh = verts_np[:, 1].max()
+                            z_max_mesh = verts_np[:, 2].max()
+                            logger.info(f"  - Mesh bounds: X=[{x_min_mesh:.3f}, {x_max_mesh:.3f}], Y=[{y_min_mesh:.3f}, {y_max_mesh:.3f}], Z=[{z_min_mesh:.3f}, {z_max_mesh:.3f}]")
+                            logger.info(f"  - Image buffer bounds: X=[{float(x_min):.3f}, {float(x_min + scene_width_meters):.3f}], Y=[{float(y_min):.3f}, {float(y_min + scene_height_meters):.3f}]")
+                            first_debug_log_done = True
+
+                        if torch.is_tensor(rgb_img):
+                            rgb_img_np = rgb_img.detach().cpu().numpy()
+                        else:
+                            rgb_img_np = np.asarray(rgb_img)
+
+                        rgb_colors = rgb_img_np[selected_py, selected_px]
+                        if rgb_colors.shape[0] == 0:
+                            continue
+
+                        if isinstance(K, np.ndarray) or (hasattr(K, '__getitem__') and len(np.shape(K)) == 2):
+                            fx = float(K[0, 0])
+                            fy = float(K[1, 1])
+                            cx = float(K[0, 2])
+                            cy = float(K[1, 2])
+                        else:
+                            logger.warning(f"Unexpected K matrix shape: {type(K)}, skipping frame {frame_idx}, cam {cam_id}")
+                            continue
+
+                        px_tensor = torch.as_tensor(selected_px, dtype=torch.float32, device=device)
+                        py_tensor = torch.as_tensor(selected_py, dtype=torch.float32, device=device)
+
+                        if abs(fx) > 1e-8:
+                            x_ndc = (px_tensor - cx + 0.5) / fx
+                        else:
+                            x_ndc = torch.zeros_like(px_tensor)
+
+                        if abs(fy) > 1e-8:
+                            y_ndc = (py_tensor - cy + 0.5) / fy
+                        else:
+                            y_ndc = torch.zeros_like(py_tensor)
+                        ray_dirs_cam = torch.stack([x_ndc, y_ndc, torch.ones_like(x_ndc)], dim=-1)
+                        ray_dirs_cam = torch.nn.functional.normalize(ray_dirs_cam, dim=-1)
+
+                        cam_origin = torch.as_tensor(camToWorld[:3, 3], dtype=torch.float32, device=device)
+                        rot_matrix = torch.as_tensor(camToWorld[:3, :3], dtype=torch.float32, device=device)
+                        ray_origins = cam_origin.unsqueeze(0).expand(ray_dirs_cam.shape[0], -1)
+                        ray_dirs_world = ray_dirs_cam @ rot_matrix.T
+
+                        if not first_ray_debug_done:
+                            ray_origin_world = ray_origins[0].detach().cpu().numpy()
+                            ray_dir_world = ray_dirs_world[0].detach().cpu().numpy()
+                            logger.info(f"\n=== RAY CASTING DEBUG (frame {frame_idx}, cam {cam_id}) ===")
+                            logger.info(f"Ray origin world: {ray_origin_world}")
+                            logger.info(f"Ray direction world: {ray_dir_world}")
+                            first_ray_debug_done = True
+
+                        best_hit_points, hit_mask, _ = _intersect_rays_with_triangles_gpu(
+                            ray_origins,
+                            ray_dirs_world,
+                            triangle_vertices,
+                            ray_chunk_size=ray_chunk_size,
+                            triangle_chunk_size=triangle_chunk_size,
+                        )
+
+                        num_rays = int(ray_origins.shape[0])
+                        num_hits = int(hit_mask.sum().item())
+                        projection_stats['rays_cast_total'] += num_rays
+                        projection_stats['rays_hit_mesh'] += num_hits
+                        projection_stats['rays_missed_mesh'] += num_rays - num_hits
+
+                        if num_hits == 0:
+                            continue
+
+                        hit_points_np = best_hit_points[hit_mask].detach().cpu().numpy()
+                        hit_colors_np = rgb_colors[hit_mask.detach().cpu().numpy()]
+
+                        buf_x_idx = np.clip(
+                            ((hit_points_np[:, 0] - x_min) / scene_width_meters * width_pixels).astype(np.int64),
+                            0,
+                            width_pixels - 1,
+                        )
+                        buf_y_idx = np.clip(
+                            ((hit_points_np[:, 1] - y_min) / scene_height_meters * height_pixels).astype(np.int64),
+                            0,
+                            height_pixels - 1,
+                        )
+
+                        updated_buffer[buf_y_idx, buf_x_idx] = hit_colors_np
+                        projection_stats['buffer_pixels_updated'].update(zip(buf_y_idx.tolist(), buf_x_idx.tolist()))
+                        print(f"Updated buffer pixels with {num_hits} GPU ray hits for frame {frame_idx}, cam {cam_id}")
+
+                        save_path = os.path.join(step1_dir, f"frame_{frame_idx}_cam{cam_id}_buffer.png") if step1_dir else None
+                        try:
+                            if save_path and len(selected_py) > 0:
+                                buffer_uint8 = np.clip(updated_buffer * 255.0, 0, 255).astype(np.uint8)
+                                plt.figure(figsize=(buffer_metadata['width'] / 72, buffer_metadata['height'] / 72), dpi=72)
+                                plt.imshow(buffer_uint8)
+                                plt.axis('off')
+                                plt.tight_layout()
+                                plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+                                plt.close()
+                                logger.info(f"Saved image buffer after frame {frame_idx}, camera {cam_id} to {save_path}")
+                        except Exception as save_error:
+                            logger.warning(f"Could not save intermediate buffer for frame {frame_idx}: {save_error}")
+
+                    pbar.update(1)
+
+                except Exception as e:
+                    logger.warning(f"Error processing frame {frame_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+    projection_stats['road_pixels_projected'] = len(projection_stats['buffer_pixels_updated'])
+    num_unique_buffer_pixels = len(projection_stats['buffer_pixels_updated'])
+    del projection_stats['buffer_pixels_updated']
+
+    hit_rate = (projection_stats['rays_hit_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_cast_total' in projection_stats else 0.0
+    miss_rate = (projection_stats['rays_missed_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_missed_mesh' in projection_stats and projection_stats['rays_cast_total'] > 0 else 0.0
+
+    logger.info("\n" + "=" * 60)
+    logger.info("RGB PROJECTION STATISTICS")
+    logger.info("=" * 60)
+    logger.info(f"Total frames processed: {projection_stats['total_frames']}")
+    logger.info(f"Total cameras processed: {projection_stats['total_cameras_processed']}")
+    logger.info(f"Rays cast from camera: {projection_stats.get('rays_cast_total', 0):,}")
+    logger.info(f"Rays that HIT mesh triangles: {projection_stats.get('rays_hit_mesh', 0):,} ({hit_rate:.1f}%)")
+    logger.info(f"Rays MISSED all triangles: {projection_stats.get('rays_missed_mesh', 0):,} ({miss_rate:.1f}%)")
+    logger.info(f"Unique buffer pixels updated with RGB colors: {num_unique_buffer_pixels:,}")
+    if projection_stats['total_cameras_processed'] > 0:
+        avg_rays_per_camera = projection_stats.get('rays_cast_total', 0) / max(projection_stats['total_cameras_processed'], 1)
+        logger.info(f"Average rays per camera: {avg_rays_per_camera:.1f}")
+
+    if 'rays_hit_mesh' in projection_stats and hit_rate < 50:
+        logger.warning("LOW HIT RATE DETECTED - Check coordinate system alignment!")
+        logger.warning(f"Only {hit_rate:.1f}% of rays intersected the mesh")
+
+    if first_ray_debug_done:
+        logger.info("")
+        logger.info("POSSIBLE FIXES:")
+        logger.info("  1. Check ray direction Z component - should be negative for downward rays onto heightmap")
+        logger.info("  2. Verify camera extrinsics matrix orientation (world-to-camera vs camera-to-world)")
+        logger.info("  3. Ensure mesh coordinate system matches world space from dataset")
+
+    logger.info(f"Projected {projection_stats['total_cameras_processed']} camera views")
+    logger.info(f"Updated {num_unique_buffer_pixels:,} unique buffer pixels with RGB colors")
+
+    return updated_buffer, projection_stats
+
+
 def create_camera_view_comparison(dataset, vertices_tensor, faces_tensor, cam_id=2, frame_idx=None, output_dir="", num_frames=None):
     """
     Create a side-by-side comparison image of RGB view and mesh render from the same camera perspective.
@@ -2512,7 +2919,8 @@ def main():
         logger.info("=" * 60)
         
         # Perform ray projection of road-masked RGB pixels onto image buffer
-        updated_buffer, projection_stats = project_rgb_onto_image_buffer(
+        projection_fn = project_rgb_onto_image_buffer_gpu if device.type == "cuda" else project_rgb_onto_image_buffer
+        updated_buffer, projection_stats = projection_fn(
             dataset, 
             vertices_tensor, 
             faces_tensor, 
