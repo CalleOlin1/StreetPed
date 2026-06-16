@@ -95,10 +95,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_output_directories(output_folder: str) -> Tuple[str, str]:
+def setup_output_directories(output_folder: str, run_name: str) -> Tuple[str, str]:
     """Create output directories and set up logging."""
     # Construct full output path
-    base_path = os.path.join(output_folder, "road_mesh_training", "run_000")
+    base_path = os.path.join(output_folder, "road_mesh_training", run_name)
     
     step1_dir = os.path.join(base_path, "step1_pointcloud_visualization")
     os.makedirs(step1_dir, exist_ok=True)
@@ -597,11 +597,12 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     cell_colors_list = [] if color_map is not None else None
     
     # First pass: identify all valid cells that will become vertices
+    # Keep boundary cells too; dropping them removes the outer ring of triangles.
     valid_cells = []
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
             z_val = height_map[x_idx, y_idx]
-            if not np.isinf(z_val) and x_idx > 0 and x_idx < num_cells_x - 1 and y_idx > 0 and y_idx < num_cells_y - 1:
+            if not np.isinf(z_val):
                 valid_cells.append((x_idx, y_idx))
     
     # Create mapping from grid position to vertex index
@@ -633,11 +634,13 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
             if None in corner_indices:
                 continue
             
-            v0, v1, v2 = corner_indices[0], corner_indices[3], corner_indices[1]
-            final_faces.append([v0, v1, v2])  # First triangle
-            
-            v0, v1, v2 = corner_indices[2], corner_indices[1], corner_indices[3]
-            final_faces.append([v0, v1, v2])  # Second triangle
+            # Keep both triangles wound consistently so face culling doesn't drop half the quad.
+            final_faces.append(
+                [corner_indices[0], corner_indices[1], corner_indices[3]]
+            )
+            final_faces.append(
+                [corner_indices[0], corner_indices[3], corner_indices[2]]
+            )
     
     logger.info(f"Created {len(final_faces):,} triangular faces")
     
@@ -1083,7 +1086,7 @@ def create_image_buffer(vertices: torch.Tensor,
     
     logger.info(f"Scene dimensions: {scene_width:.2f}m × {scene_height:.2f}m")
     
-    pixels_per_meter = 4
+    pixels_per_meter = 20
     
     # Calculate buffer dimensions based on scene size and pixel density (user specification)
     width_pixels = int(np.ceil(scene_width * pixels_per_meter))
@@ -1567,7 +1570,7 @@ def project_rgb_onto_image_buffer(
                     if len(road_pixel_indices[0]) == 0:
                         continue
                     
-                    rays_per_image = 1000
+                    rays_per_image = 10000
                     num_road_pixels = len(road_pixel_indices[0])
                     if num_road_pixels > rays_per_image:
                         logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2030,7 +2033,7 @@ def project_rgb_onto_image_buffer_gpu(
                         if len(road_pixel_indices[0]) == 0:
                             continue
 
-                        rays_per_image = 1000
+                        rays_per_image = 10000
                         num_road_pixels = len(road_pixel_indices[0])
                         if num_road_pixels > rays_per_image:
                             logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2569,7 +2572,7 @@ def main():
     args = parse_args()
     
     # Setup output directories and logging
-    base_path, step1_dir = setup_output_directories(args.output_folder)
+    base_path, step1_dir = setup_output_directories(args.output_folder, args.run_name)
     logger.info(f"Output directory: {base_path}")
     
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
