@@ -1088,7 +1088,7 @@ def create_image_buffer(vertices: torch.Tensor,
     
     logger.info(f"Scene dimensions: {scene_width:.2f}m × {scene_height:.2f}m")
     
-    pixels_per_meter = 20
+    pixels_per_meter = 40
     
     # Calculate buffer dimensions based on scene size and pixel density (user specification)
     width_pixels = int(np.ceil(scene_width * pixels_per_meter))
@@ -1783,7 +1783,7 @@ def project_rgb_onto_image_buffer(
                     if len(road_pixel_indices[0]) == 0:
                         continue
                     
-                    rays_per_image = 10000
+                    rays_per_image = 30000
                     num_road_pixels = len(road_pixel_indices[0])
                     if num_road_pixels > rays_per_image:
                         logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2107,7 +2107,7 @@ def project_rgb_onto_image_buffer_gpu(
     device,
     step1_dir=None,
     num_frames=None,
-    ray_chunk_size=512,
+    ray_chunk_size=1024,
     triangle_chunk_size=4096,
 ):
     """GPU batched version of RGB projection onto the image buffer."""
@@ -2246,7 +2246,7 @@ def project_rgb_onto_image_buffer_gpu(
                         if len(road_pixel_indices[0]) == 0:
                             continue
 
-                        rays_per_image = 10000
+                        rays_per_image = 30000
                         num_road_pixels = len(road_pixel_indices[0])
                         if num_road_pixels > rays_per_image:
                             logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2786,7 +2786,7 @@ def export_mesh_render_from_camera(
     renderer.scene.set_background([0.0, 0.0, 0.0, 0.0])
 
     material = o3d.visualization.rendering.MaterialRecord()
-    material.shader = "defaultLit"
+    material.shader = "defaultUnlit"
     material.base_color = [1.0, 1.0, 1.0, 1.0]
     material.sRGB_color = True
     if texture_image is not None:
