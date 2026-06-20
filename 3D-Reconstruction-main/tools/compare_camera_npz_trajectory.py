@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import Slider
-
+import itertools
 
 def load_camera_trajectory(npz_path: str) -> Dict[str, np.ndarray]:
     data = np.load(npz_path, allow_pickle=True)
@@ -258,96 +258,56 @@ def get_velocity_at_frame(
 
 
 def plot_scene_trajectories(
-    camera: Dict[str, np.ndarray],
-    instances: List[Dict[str, np.ndarray]],
+    cameras: List[Dict[str, np.ndarray]],
     output_path: str,
     show: bool = False,
-    max_instances: int = 0,
     enable_slider: bool = False,
     highlight_size: float = 120.0,
     velocity_scale: float = 1.0,
 ) -> Tuple[int, int]:
-    camera_positions = camera["positions"]
-    camera_frames = np.asarray(camera["frame_indices"])
-    num_cameras = int(camera.get("num_cameras", 1))
-    camera_scene_frames = camera_frames // max(1, num_cameras)
-    instance_subset = instances if max_instances <= 0 else instances[:max_instances]
 
-    colors = {
-        "pedestrian": "tab:orange",
-        "vehicle": "tab:blue",
-        "camera": "tab:green",
-        "other": "tab:gray",
-    }
+    camera_positions_list = []
+    camera_frames_list = []
+
+    for cam in cameras:
+        camera_positions_list.append(np.asarray(cam["positions"]))
+        camera_frames_list.append(np.asarray(cam["frame_indices"]))
+
+    colors = itertools.cycle(
+        ["tab:green", "tab:pink", "tab:purple", "tab:brown", "tab:pink"]
+    )
 
     fig = plt.figure(figsize=(15, 7))
     ax_xy = fig.add_subplot(121)
     ax_3d = fig.add_subplot(122, projection="3d")
 
-    ax_xy.plot(
-        camera_positions[:, 0],
-        camera_positions[:, 1],
-        color="tab:green",
-        linewidth=2.5,
-        label="camera",
-    )
-    ax_xy.scatter(
-        camera_positions[0, 0],
-        camera_positions[0, 1],
-        color="green",
-        marker="o",
-        s=45,
-    )
-    ax_xy.scatter(
-        camera_positions[-1, 0],
-        camera_positions[-1, 1],
-        color="red",
-        marker="s",
-        s=45,
-    )
+    camera_colors = []
 
-    ax_3d.plot(
-        camera_positions[:, 0],
-        camera_positions[:, 1],
-        camera_positions[:, 2],
-        color="tab:green",
-        linewidth=2.0,
-        label="camera",
-    )
-
-    legend_flags = {"pedestrian": False, "vehicle": False, "other": False}
-
-    all_points = [camera_positions]
-
-    for instance in instance_subset:
-        positions = instance["positions"]
-        group = instance["group"]
-        color = colors[group]
-
-        line_label = group if not legend_flags[group] else None
-        legend_flags[group] = True
+    # ---- Plot trajectories ----
+    for i, (pos, col) in enumerate(zip(camera_positions_list, colors)):
+        camera_colors.append(col)
 
         ax_xy.plot(
-            positions[:, 0],
-            positions[:, 1],
-            color=color,
-            linewidth=1.1,
-            alpha=0.7,
-            label=line_label,
+            pos[:, 0],
+            pos[:, 1],
+            linewidth=2.5,
+            color=col,
+            label=f"camera{i}",
         )
+
+        ax_xy.scatter(pos[0, 0], pos[0, 1], color=col, marker="o", s=45)
+        ax_xy.scatter(pos[-1, 0], pos[-1, 1], color=col, marker="s", s=45)
 
         ax_3d.plot(
-            positions[:, 0],
-            positions[:, 1],
-            positions[:, 2],
-            color=color,
-            linewidth=1.0,
-            alpha=0.65,
-            label=line_label,
+            pos[:, 0],
+            pos[:, 1],
+            pos[:, 2],
+            linewidth=2.0,
+            color=col,
+            label=f"camera{i}",
         )
 
-        all_points.append(positions)
-
+    # ---- axis setup ----
     ax_xy.set_title("Scene Trajectories (XY Top-Down)")
     ax_xy.set_xlabel("X (m)")
     ax_xy.set_ylabel("Y (m)")
@@ -361,40 +321,62 @@ def plot_scene_trajectories(
     ax_3d.set_zlabel("Z (m)")
     ax_3d.grid(True, alpha=0.3)
 
-    merged = np.concatenate(all_points, axis=0)
+    merged = np.concatenate(camera_positions_list, axis=0)
     set_equal_3d(ax_3d, merged)
     ax_3d.legend(loc="best")
 
-    total_instances = len(instances)
-    shown_instances = len(instance_subset)
+    base_title = "Camera trajectories"
 
-    base_title = (
-        f"Camera + Actor Trajectories | instances shown: {shown_instances}/{total_instances}"
-    )
+    # ---- slider preparation ----
+    if enable_slider:
+        unique_slider_frames = sorted(
+            set(np.concatenate(camera_frames_list).tolist())
+        )
+        unique_slider_frames = np.asarray(unique_slider_frames, dtype=int)
+    else:
+        unique_slider_frames = np.array([], dtype=int)
 
-    unique_slider_frames = (
-        np.array(sorted(set(camera_scene_frames.tolist())), dtype=int)
-        if enable_slider
-        else np.array([], dtype=int)
-    )
-
+    highlighted_cam_xy = []
+    highlighted_cam_3d = []
     timestamp_text = None
-    highlighted_cam_xy = None
-    highlighted_obj_xy = None
-    highlighted_cam_3d = None
-    highlighted_obj_3d = None
     current_velocity_artists = []
 
     if enable_slider and unique_slider_frames.size > 0:
-        highlighted_cam_xy = ax_xy.scatter([], [], s=highlight_size, c=colors["camera"], edgecolors="black", linewidths=1.0, zorder=12, label="camera@t")
-        highlighted_obj_xy = ax_xy.scatter([], [], s=highlight_size, c=[], edgecolors="black", linewidths=0.8, zorder=11, label="objects@t")
 
-        highlighted_cam_3d = ax_3d.scatter([], [], [], s=highlight_size, c=colors["camera"], edgecolors="black", linewidths=1.0, depthshade=False, zorder=12)
-        highlighted_obj_3d = ax_3d.scatter([], [], [], s=highlight_size, c=[], edgecolors="black", linewidths=0.8, depthshade=False, zorder=11)
+        for col in camera_colors:
 
-        timestamp_text = fig.text(0.5, 0.02, "", ha="center", va="center", fontsize=11)
+            highlighted_cam_xy.append(
+                ax_xy.scatter(
+                    [],
+                    [],
+                    s=highlight_size,
+                    c=col,
+                    edgecolors="black",
+                    linewidths=1.0,
+                    zorder=12,
+                )
+            )
+
+            highlighted_cam_3d.append(
+                ax_3d.scatter(
+                    [],
+                    [],
+                    [],
+                    s=highlight_size,
+                    c=col,
+                    edgecolors="black",
+                    linewidths=1.0,
+                    depthshade=False,
+                    zorder=12,
+                )
+            )
+
+        timestamp_text = fig.text(
+            0.5, 0.02, "", ha="center", va="center", fontsize=11
+        )
 
         ax_slider = fig.add_axes([0.15, 0.05, 0.7, 0.03])
+
         frame_slider = Slider(
             ax=ax_slider,
             label="Frame",
@@ -405,8 +387,10 @@ def plot_scene_trajectories(
             valfmt="%d",
         )
 
-        def update_highlight(frame_idx_position: float) -> None:
+        def update_highlight(frame_idx_position: float):
+
             nonlocal current_velocity_artists
+
             idx = int(frame_idx_position)
             frame_value = int(unique_slider_frames[idx])
             frame_slider.valtext.set_text(str(frame_value))
@@ -416,92 +400,54 @@ def plot_scene_trajectories(
                     artist.remove()
                 except Exception:
                     pass
+
             current_velocity_artists = []
 
-            cam_pos = get_position_at_frame(
-                camera_scene_frames,
-                camera_positions,
-                frame_value,
-            )
-            if cam_pos is not None:
-                highlighted_cam_xy.set_offsets(cam_pos[:2].reshape(1, 2))
-                highlighted_cam_3d._offsets3d = (
-                    np.array([cam_pos[0]]),
-                    np.array([cam_pos[1]]),
-                    np.array([cam_pos[2]]),
-                )
+            for cam_i, (frames, pos) in enumerate(
+                zip(camera_frames_list, camera_positions_list)
+            ):
 
-                cam_vel = get_velocity_at_frame(
-                    camera_scene_frames,
-                    camera_positions,
-                    frame_value,
-                )
-                if cam_vel is not None:
-                    q_cam_xy = ax_xy.quiver(
-                        cam_pos[0],
-                        cam_pos[1],
-                        cam_vel[0],
-                        cam_vel[1],
-                        angles="xy",
-                        scale_units="xy",
-                        scale=1.0 / max(1e-6, velocity_scale),
-                        color=colors["camera"],
-                        width=0.004,
-                        zorder=13,
+                cam_pos = get_position_at_frame(frames, pos, frame_value)
+
+                if cam_pos is not None:
+
+                    highlighted_cam_xy[cam_i].set_offsets(
+                        cam_pos[:2].reshape(1, 2)
                     )
-                    current_velocity_artists.append(q_cam_xy)
-            else:
-                highlighted_cam_xy.set_offsets(np.empty((0, 2)))
-                highlighted_cam_3d._offsets3d = (np.array([]), np.array([]), np.array([]))
 
-            obj_xy_list = []
-            obj_z_list = []
-            obj_colors = []
-            for inst in instance_subset:
-                inst_pos = get_position_at_frame(
-                    np.asarray(inst["frame_indices"]),
-                    np.asarray(inst["positions"]),
-                    frame_value,
-                )
-                if inst_pos is None:
-                    continue
-                obj_xy_list.append(inst_pos[:2])
-                obj_z_list.append(inst_pos[2])
-                obj_colors.append(colors[inst["group"]])
-
-                inst_vel = get_velocity_at_frame(
-                    np.asarray(inst["frame_indices"]),
-                    np.asarray(inst["positions"]),
-                    frame_value,
-                )
-                if inst_vel is not None:
-                    q_obj_xy = ax_xy.quiver(
-                        inst_pos[0],
-                        inst_pos[1],
-                        inst_vel[0],
-                        inst_vel[1],
-                        angles="xy",
-                        scale_units="xy",
-                        scale=1.0 / max(1e-6, velocity_scale),
-                        color=colors[inst["group"]],
-                        width=0.003,
-                        alpha=0.9,
-                        zorder=12,
+                    highlighted_cam_3d[cam_i]._offsets3d = (
+                        np.array([cam_pos[0]]),
+                        np.array([cam_pos[1]]),
+                        np.array([cam_pos[2]]),
                     )
-                    current_velocity_artists.append(q_obj_xy)
 
-            if len(obj_xy_list) > 0:
-                obj_xy = np.asarray(obj_xy_list)
-                obj_z = np.asarray(obj_z_list)
-                highlighted_obj_xy.set_offsets(obj_xy)
-                highlighted_obj_xy.set_facecolor(obj_colors)
-                highlighted_obj_3d._offsets3d = (obj_xy[:, 0], obj_xy[:, 1], obj_z)
-                highlighted_obj_3d.set_facecolor(obj_colors)
-            else:
-                highlighted_obj_xy.set_offsets(np.empty((0, 2)))
-                highlighted_obj_xy.set_facecolor([])
-                highlighted_obj_3d._offsets3d = (np.array([]), np.array([]), np.array([]))
-                highlighted_obj_3d.set_facecolor([])
+                    cam_vel = get_velocity_at_frame(frames, pos, frame_value)
+
+                    if cam_vel is not None:
+
+                        q = ax_xy.quiver(
+                            cam_pos[0],
+                            cam_pos[1],
+                            cam_vel[0],
+                            cam_vel[1],
+                            angles="xy",
+                            scale_units="xy",
+                            scale=1.0 / max(1e-6, velocity_scale),
+                            color=camera_colors[cam_i],
+                            width=0.004,
+                            zorder=13,
+                        )
+
+                        current_velocity_artists.append(q)
+
+                else:
+
+                    highlighted_cam_xy[cam_i].set_offsets(np.empty((0, 2)))
+                    highlighted_cam_3d[cam_i]._offsets3d = (
+                        np.array([]),
+                        np.array([]),
+                        np.array([]),
+                    )
 
             if timestamp_text is not None:
                 timestamp_text.set_text(f"Selected frame: {frame_value}")
@@ -517,6 +463,7 @@ def plot_scene_trajectories(
         plt.tight_layout(rect=[0, 0.10, 1, 0.96])
     else:
         plt.tight_layout()
+
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
 
     if show:
@@ -524,18 +471,17 @@ def plot_scene_trajectories(
     else:
         plt.close(fig)
 
-    return shown_instances, total_instances
-
+    return len(cameras), len(cameras)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Visualize camera + instance trajectories in one scene plot"
+        description="Compare 2 camera trajectories in a single plot"
     )
     parser.add_argument(
-        "--camera_npz", required=False, help="Path to camera poses npz"
+        "--camera_npz_1", required=False, help="Path to camera poses npz"
     )
     parser.add_argument(
-        "--instances_json", required=False, help="Path to instances_info.json"
+        "--camera_npz_2", required=False, help="Path to secondary camera poses npz"
     )
     parser.add_argument(
         "--output",
@@ -556,12 +502,6 @@ def main() -> None:
         "--normalize_camera_with_ego_start",
         action="store_true",
         help="Also apply --ego_pose_start normalization to camera trajectory (use only if camera npz is still in raw world coordinates)",
-    )
-    parser.add_argument(
-        "--max_instances",
-        type=int,
-        default=0,
-        help="Max number of instances to plot (0 = all)",
     )
     parser.add_argument(
         "--show",
@@ -588,10 +528,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.camera_npz:
-        camera_path = Path(args.camera_npz)
-    if args.instances_json:
-        instance_path = Path(args.instances_json)
+    if args.camera_npz_1:
+        camera_path1 = Path(args.camera_npz_1)
+    if args.camera_npz_2:
+        camera_path2 = Path(args.camera_npz_2)
 
     output_path = Path(args.output)
 
@@ -601,44 +541,34 @@ def main() -> None:
     #     raise FileNotFoundError(f"Instances json not found: {instance_path}")
 
     world_transform = None
-    if args.ego_pose_start:
-        world_transform = load_ego_start_inverse_transform(args.ego_pose_start)
+    # if args.ego_pose_start:
+    #     world_transform = load_ego_start_inverse_transform(args.ego_pose_start)
 
-    if args.camera_npz:
-        camera_raw = load_camera_trajectory(str(camera_path))
-        camera = build_camera_reference_trajectory(camera_raw, camera_name=args.camera_name)
-        if world_transform is not None and args.normalize_camera_with_ego_start:
-            camera["positions"] = transform_points(camera["positions"], world_transform)
-
-    instances = []
-    if args.instances_json:
-        instances = load_instance_trajectories(
-            str(instance_path),
-            world_transform=world_transform,
-        )
-
-    if len(instances) == 0:
-        print("Warning: no valid instance trajectories found. Plotting camera only.")
+    if args.camera_npz_1:
+        camera_raw = load_camera_trajectory(str(camera_path1))
+        camera1 = build_camera_reference_trajectory(camera_raw, camera_name=args.camera_name)
+        # if world_transform is not None and args.normalize_camera_with_ego_start:
+        #     camera1["positions"] = transform_points(camera1["positions"], world_transform)
+    if args.camera_npz_2:
+        camera_raw = load_camera_trajectory(str(camera_path2))
+        camera2 = build_camera_reference_trajectory(camera_raw, camera_name=args.camera_name)
+        # if world_transform is not None and args.normalize_camera_with_ego_start:
+        #     camera2["positions"] = transform_points(camera2["positions"], world_transform)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    shown_instances, total_instances = plot_scene_trajectories(
-        camera,
-        instances,
+    plot_scene_trajectories(
+        [camera1, camera2],
         str(output_path),
         show=args.show,
-        max_instances=args.max_instances,
         enable_slider=args.interactive_slider,
         highlight_size=args.highlight_size,
         velocity_scale=args.velocity_scale,
     )
 
     print(f"Saved scene trajectory figure to: {output_path}")
-    print(f"Instances shown: {shown_instances}/{total_instances}")
-    print(f"Selected camera: {camera.get('selected_camera', 'unknown')}")
     if args.interactive_slider:
         print("Interactive frame slider: enabled")
     if args.ego_pose_start:
-        print(f"Applied first-ego normalization to instances from: {args.ego_pose_start}")
         if args.normalize_camera_with_ego_start:
             print("Also applied first-ego normalization to camera trajectory")
 

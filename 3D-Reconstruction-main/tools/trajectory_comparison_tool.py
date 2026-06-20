@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-轨迹数据比较工具
-比较实例自身的轨迹数据和外部JSON文件中的轨迹数据，并生成可视化图表
+Trajectory data comparison tool
+Compare the trajectory data of the instance itself with the trajectory data in the external JSON file, and generate a visual chart
 
-使用示例:
+Usage example:
 python trajectory_comparison_tool.py \
     --instance_file ./saved_instances/smpl_instance_0.pkl \
     --trajectory_json_path data/kitti/processed/training_20250630_170054_FollowLeadingVehicleWithObstacle_1/instances/instances_info.json \
@@ -22,35 +22,35 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import torch
 
-# 设置matplotlib支持中文
+# Set matplotlib to support Chinese
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 def load_instance_trajectory_data(instance_file: str) -> Dict:
     """
-    从实例文件中加载轨迹数据
+    Load trajectory data from instance file
     
     Args:
-        instance_file: 实例文件路径
+        instance_file: instance file path
         
     Returns:
-        Dict: 包含轨迹信息的字典
+        Dict: Dictionary containing trajectory information
     """
     print(f"加载实例文件: {instance_file}")
     
     with open(instance_file, 'rb') as f:
         instance_data = pickle.load(f)
     
-    # 提取运动数据
+    # Extract motion data
     motion = instance_data.get("motion", {})
     
-    # 提取位置和旋转数据
+    # Extract position and rotation data
     instances_trans = motion.get("instances_trans")  # [num_frames, 3]
     instances_quats = motion.get("instances_quats")  # [num_frames, 4] 或 [num_frames, 1, 4]
     smpl_qauts = motion.get("smpl_qauts")  # [num_frames, 23, 4]
-    instances_fv = motion.get("instances_fv")  # [num_frames]
+    instances_fv = motion.get("instances_fv")  # [num frames]
     
-    # 确保数据是numpy数组
+    # Make sure the data is a numpy array
     if isinstance(instances_trans, torch.Tensor):
         instances_trans = instances_trans.cpu().numpy()
     if isinstance(instances_quats, torch.Tensor):
@@ -60,7 +60,7 @@ def load_instance_trajectory_data(instance_file: str) -> Dict:
     if isinstance(instances_fv, torch.Tensor):
         instances_fv = instances_fv.cpu().numpy()
     
-    # 处理形状
+    # Work with shapes
     if instances_quats.ndim == 3 and instances_quats.shape[1] == 1:
         instances_quats = instances_quats[:, 0, :]  # [num_frames, 4]
     
@@ -86,14 +86,14 @@ def load_instance_trajectory_data(instance_file: str) -> Dict:
 
 def load_json_trajectory_data(json_path: str, instance_id: str) -> Dict:
     """
-    从JSON文件中加载轨迹数据
+    Load trajectory data from JSON file
     
     Args:
-        json_path: JSON文件路径
-        instance_id: 实例ID
+        json_path: JSON file path
+        instance_id: instance ID
         
     Returns:
-        Dict: 包含轨迹信息的字典
+        Dict: Dictionary containing trajectory information
     """
     print(f"加载JSON轨迹数据: {json_path}")
     
@@ -110,17 +110,17 @@ def load_json_trajectory_data(json_path: str, instance_id: str) -> Dict:
     frame_indices = np.array(frame_annotations["frame_idx"])
     obj_to_world_matrices = frame_annotations["obj_to_world"]
     
-    # 提取位置和旋转信息
+    # Extract position and rotation information
     positions = []
     rotations = []
     
     for matrix in obj_to_world_matrices:
         matrix = np.array(matrix)
-        # 提取位置 (最后一列的前三个元素)
+        # Extract position (first three elements of the last column)
         position = matrix[:3, 3]
         positions.append(position)
         
-        # 提取旋转矩阵并转换为四元数
+        # Extract rotation matrix and convert to quaternion
         rotation_matrix = matrix[:3, :3]
         quat = rotation_matrix_to_quaternion(rotation_matrix)
         rotations.append(quat)
@@ -148,30 +148,30 @@ def load_json_trajectory_data(json_path: str, instance_id: str) -> Dict:
 
 def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
     """
-    将旋转矩阵转换为四元数 (w, x, y, z)
+    Convert rotation matrix to quaternion (w, x, y, z)
     """
     trace = np.trace(R)
     
     if trace > 0:
-        s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
+        s = np.sqrt(trace + 1.0) * 2  # s = 4 *qw
         qw = 0.25 * s
         qx = (R[2, 1] - R[1, 2]) / s
         qy = (R[0, 2] - R[2, 0]) / s
         qz = (R[1, 0] - R[0, 1]) / s
     elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s = 4 * qx
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s = 4 *qx
         qw = (R[2, 1] - R[1, 2]) / s
         qx = 0.25 * s
         qy = (R[0, 1] + R[1, 0]) / s
         qz = (R[0, 2] + R[2, 0]) / s
     elif R[1, 1] > R[2, 2]:
-        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s = 4 * qy
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s = 4 *qy
         qw = (R[0, 2] - R[2, 0]) / s
         qx = (R[0, 1] + R[1, 0]) / s
         qy = 0.25 * s
         qz = (R[1, 2] + R[2, 1]) / s
     else:
-        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # s = 4 * qz
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # c = h *dam
         qw = (R[1, 0] - R[0, 1]) / s
         qx = (R[0, 2] + R[2, 0]) / s
         qy = (R[1, 2] + R[2, 1]) / s
@@ -182,14 +182,14 @@ def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
 
 def align_trajectories(instance_traj: Dict, json_traj: Dict) -> Tuple[Dict, Dict]:
     """
-    对齐两个轨迹的时间戳
+    Align the timestamps of two trajectories
     
     Args:
-        instance_traj: 实例轨迹数据
-        json_traj: JSON轨迹数据
+        instance_traj: instance trajectory data
+        json_traj: JSON trajectory data
         
     Returns:
-        Tuple[Dict, Dict]: 对齐后的轨迹数据
+        Tuple[Dict, Dict]: aligned trajectory data
     """
     print("对齐轨迹时间戳...")
     
@@ -199,37 +199,37 @@ def align_trajectories(instance_traj: Dict, json_traj: Dict) -> Tuple[Dict, Dict
     print(f"实例帧范围: {instance_frames.min()} - {instance_frames.max()} (共{len(instance_frames)}帧)")
     print(f"JSON帧范围: {json_frames.min()} - {json_frames.max()} (共{len(json_frames)}帧)")
     
-    # 找到重叠的帧
+    # Find overlapping frames
     common_frames = np.intersect1d(instance_frames, json_frames)
     print(f"重叠帧数: {len(common_frames)}")
     
     if len(common_frames) == 0:
         print("警告: 没有重叠的帧，将尝试基于偏移量对齐")
-        # 如果没有重叠，尝试基于偏移量对齐
+        # If there is no overlap, try aligning based on offset
         offset = json_frames.min() - instance_frames.min()
         print(f"计算的时间偏移量: {offset}")
         
-        # 创建对齐后的帧索引
+        # Create aligned frame index
         aligned_instance_frames = instance_frames + offset
         common_frames = np.intersect1d(aligned_instance_frames, json_frames)
         print(f"偏移后重叠帧数: {len(common_frames)}")
         
         if len(common_frames) > 0:
-            # 基于偏移对齐
+            # Align based on offset
             instance_mask = np.isin(aligned_instance_frames, common_frames)
             json_mask = np.isin(json_frames, common_frames)
         else:
-            # 如果还是没有重叠，使用长度较短的序列
+            # If there is still no overlap, use the shorter sequence
             min_length = min(len(instance_frames), len(json_frames))
             instance_mask = np.arange(min_length)
             json_mask = np.arange(min_length)
             print(f"使用前{min_length}帧进行比较")
     else:
-        # 找到对应的索引
+        # Find the corresponding index
         instance_mask = np.isin(instance_frames, common_frames)
         json_mask = np.isin(json_frames, common_frames)
     
-    # 创建对齐后的数据
+    # Create aligned data
     aligned_instance = {
         "frame_indices": instance_traj["frame_indices"][instance_mask],
         "positions": instance_traj["positions"][instance_mask] if instance_traj["positions"] is not None else None,
@@ -249,13 +249,13 @@ def align_trajectories(instance_traj: Dict, json_traj: Dict) -> Tuple[Dict, Dict
 
 def calculate_differences(aligned_instance: Dict, aligned_json: Dict) -> Dict:
     """
-    计算两个对齐轨迹之间的差异
+    Calculate the difference between two aligned trajectories
     """
     print("计算轨迹差异...")
     
     differences = {}
     
-    # 位置差异
+    # location difference
     if aligned_instance["positions"] is not None and aligned_json["positions"] is not None:
         pos_diff = aligned_instance["positions"] - aligned_json["positions"]
         pos_distance = np.linalg.norm(pos_diff, axis=1)
@@ -273,15 +273,15 @@ def calculate_differences(aligned_instance: Dict, aligned_json: Dict) -> Dict:
         print(f"  最大距离: {differences['position']['max_distance']:.4f}")
         print(f"  标准差: {differences['position']['std_distance']:.4f}")
     
-    # 旋转差异 (简化为角度差异)
+    # Rotation difference (simplified to angle difference)
     if aligned_instance["rotations"] is not None and aligned_json["rotations"] is not None:
-        # 计算四元数角度差异
+        # Calculate quaternion angle difference
         rot_diff = []
         for i in range(len(aligned_instance["rotations"])):
             q1 = aligned_instance["rotations"][i]
             q2 = aligned_json["rotations"][i]
             
-            # 计算四元数之间的角度差异
+            # Calculate angle difference between quaternions
             dot_product = np.abs(np.dot(q1, q2))
             dot_product = np.clip(dot_product, -1.0, 1.0)
             angle_diff = 2 * np.arccos(dot_product)
@@ -307,7 +307,7 @@ def calculate_differences(aligned_instance: Dict, aligned_json: Dict) -> Dict:
 def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict, 
                              differences: Dict, output_dir: str):
     """
-    绘制轨迹比较图表
+    Draw a trajectory comparison chart
     """
     print("生成可视化图表...")
     
@@ -316,12 +316,12 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
     
     frames = aligned_instance["frame_indices"]
     
-    # 1. 位置轨迹对比图
+    # 1. Position trajectory comparison chart
     if aligned_instance["positions"] is not None and aligned_json["positions"] is not None:
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle('位置轨迹对比', fontsize=16)
         
-        # 3D轨迹图
+        # 3D trajectory plot
         ax = fig.add_subplot(2, 2, 1, projection='3d')
         ax.plot(aligned_instance["positions"][:, 0], 
                 aligned_instance["positions"][:, 1], 
@@ -337,7 +337,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         ax.legend()
         ax.set_title('3D轨迹对比')
         
-        # X-Y平面图
+        # X y plan
         axes[0, 1].plot(aligned_instance["positions"][:, 0], 
                        aligned_instance["positions"][:, 1], 
                        'b-', label='实例轨迹', linewidth=2)
@@ -350,7 +350,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         axes[0, 1].set_title('X-Y平面轨迹')
         axes[0, 1].grid(True)
         
-        # 各轴位置随时间变化
+        # The position of each axis changes with time
         axes[1, 0].plot(frames, aligned_instance["positions"][:, 0], 'b-', label='实例X', linewidth=1.5)
         axes[1, 0].plot(frames, aligned_json["positions"][:, 0], 'r--', label='JSON X', linewidth=1.5)
         axes[1, 0].plot(frames, aligned_instance["positions"][:, 1], 'g-', label='实例Y', linewidth=1.5)
@@ -363,7 +363,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         axes[1, 0].set_title('位置随时间变化')
         axes[1, 0].grid(True)
         
-        # 位置差异
+        # location difference
         if "position" in differences:
             axes[1, 1].plot(frames, differences["position"]["distance"], 'k-', linewidth=2)
             axes[1, 1].axhline(y=differences["position"]["mean_distance"], 
@@ -379,12 +379,12 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         plt.savefig(output_path / 'position_comparison.png', dpi=300, bbox_inches='tight')
         plt.close()
     
-    # 2. 旋转对比图
+    # 2. Rotate comparison chart
     if aligned_instance["rotations"] is not None and aligned_json["rotations"] is not None:
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('旋转轨迹对比', fontsize=16)
         
-        # 四元数分量对比
+        # Quaternion component comparison
         quat_labels = ['W', 'X', 'Y', 'Z']
         colors_instance = ['b', 'g', 'r', 'c']
         colors_json = ['navy', 'darkgreen', 'darkred', 'darkcyan']
@@ -403,7 +403,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         axes[0, 0].set_title('四元数分量对比')
         axes[0, 0].grid(True)
         
-        # 各分量差异
+        # Differences in components
         quat_diff = aligned_instance["rotations"] - aligned_json["rotations"]
         for i in range(4):
             axes[0, 1].plot(frames, quat_diff[:, i], 
@@ -416,7 +416,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         axes[0, 1].set_title('四元数分量差异')
         axes[0, 1].grid(True)
         
-        # 角度差异
+        # angle difference
         if "rotation" in differences:
             axes[1, 0].plot(frames, np.degrees(differences["rotation"]["angle_diff"]), 
                            'k-', linewidth=2)
@@ -429,7 +429,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
             axes[1, 0].set_title('旋转角度差异')
             axes[1, 0].grid(True)
         
-        # 四元数模长对比
+        # Quaternion module length comparison
         instance_norms = np.linalg.norm(aligned_instance["rotations"], axis=1)
         json_norms = np.linalg.norm(aligned_json["rotations"], axis=1)
         
@@ -446,11 +446,11 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         plt.savefig(output_path / 'rotation_comparison.png', dpi=300, bbox_inches='tight')
         plt.close()
     
-    # 3. 统计摘要图
+    # 3. Statistical summary graph
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     fig.suptitle('轨迹差异统计摘要', fontsize=16)
     
-    # 位置差异直方图
+    # Position difference histogram
     if "position" in differences:
         axes[0].hist(differences["position"]["distance"], bins=30, alpha=0.7, 
                     color='blue', edgecolor='black')
@@ -466,7 +466,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
         axes[0].legend()
         axes[0].grid(True, alpha=0.3)
     
-    # 旋转差异直方图
+    # Rotated difference histogram
     if "rotation" in differences:
         axes[1].hist(np.degrees(differences["rotation"]["angle_diff"]), bins=30, 
                     alpha=0.7, color='green', edgecolor='black')
@@ -492,7 +492,7 @@ def plot_trajectory_comparison(aligned_instance: Dict, aligned_json: Dict,
 def save_comparison_report(instance_traj: Dict, json_traj: Dict, 
                           differences: Dict, output_dir: str):
     """
-    保存详细的比较报告
+    Save detailed comparison report
     """
     output_path = Path(output_dir)
     report_file = output_path / 'trajectory_comparison_report.txt'
@@ -501,7 +501,7 @@ def save_comparison_report(instance_traj: Dict, json_traj: Dict,
         f.write("轨迹数据比较报告\n")
         f.write("=" * 50 + "\n\n")
         
-        # 基本信息
+        # Basic information
         f.write("数据源信息:\n")
         f.write(f"实例轨迹帧数: {len(instance_traj['frame_indices'])}\n")
         f.write(f"JSON轨迹帧数: {len(json_traj['frame_indices'])}\n")
@@ -511,13 +511,13 @@ def save_comparison_report(instance_traj: Dict, json_traj: Dict,
             f.write(f"JSON实例ID: {json_traj['instance_id']}\n")
         f.write("\n")
         
-        # 时间范围
+        # time range
         f.write("时间范围:\n")
         f.write(f"实例轨迹: 帧 {instance_traj['frame_indices'].min()} - {instance_traj['frame_indices'].max()}\n")
         f.write(f"JSON轨迹: 帧 {json_traj['frame_indices'].min()} - {json_traj['frame_indices'].max()}\n")
         f.write("\n")
         
-        # 位置差异统计
+        # Location difference statistics
         if "position" in differences:
             pos_diff = differences["position"]
             f.write("位置差异统计:\n")
@@ -527,7 +527,7 @@ def save_comparison_report(instance_traj: Dict, json_traj: Dict,
             f.write(f"距离差异中位数: {np.median(pos_diff['distance']):.6f}\n")
             f.write("\n")
             
-            # 各轴差异
+            # Differences in each axis
             pos_diff_xyz = pos_diff['diff']
             f.write("各轴位置差异:\n")
             f.write(f"X轴 - 平均: {np.mean(pos_diff_xyz[:, 0]):.6f}, 标准差: {np.std(pos_diff_xyz[:, 0]):.6f}\n")
@@ -535,7 +535,7 @@ def save_comparison_report(instance_traj: Dict, json_traj: Dict,
             f.write(f"Z轴 - 平均: {np.mean(pos_diff_xyz[:, 2]):.6f}, 标准差: {np.std(pos_diff_xyz[:, 2]):.6f}\n")
             f.write("\n")
         
-        # 旋转差异统计
+        # Rotation difference statistics
         if "rotation" in differences:
             rot_diff = differences["rotation"]
             f.write("旋转差异统计:\n")
@@ -545,7 +545,7 @@ def save_comparison_report(instance_traj: Dict, json_traj: Dict,
             f.write(f"角度差异中位数: {np.degrees(np.median(rot_diff['angle_diff'])):.3f}°\n")
             f.write("\n")
         
-        # 数据质量评估
+        # Data quality assessment
         f.write("数据质量评估:\n")
         if "position" in differences:
             pos_quality = "良好" if differences["position"]["mean_distance"] < 0.1 else "需要注意" if differences["position"]["mean_distance"] < 1.0 else "较差"
@@ -612,33 +612,33 @@ def main():
         print("开始轨迹数据比较...")
         print("=" * 50)
         
-        # 加载数据
+        # Load data
         instance_traj = load_instance_trajectory_data(args.instance_file)
         json_traj = load_json_trajectory_data(args.trajectory_json_path, args.trajectory_instance_id)
         
         print("\n" + "=" * 50)
         
-        # 对齐轨迹
+        # Align tracks
         aligned_instance, aligned_json = align_trajectories(instance_traj, json_traj)
         
         print("\n" + "=" * 50)
         
-        # 计算差异
+        # Calculate difference
         differences = calculate_differences(aligned_instance, aligned_json)
         
         print("\n" + "=" * 50)
         
-        # 生成可视化
+        # Generate visualization
         plot_trajectory_comparison(aligned_instance, aligned_json, differences, args.output_dir)
         
-        # 保存报告
+        # save report
         save_comparison_report(aligned_instance, aligned_json, differences, args.output_dir)
         
         print("\n" + "=" * 50)
         print("轨迹比较完成!")
         print(f"结果已保存到: {args.output_dir}")
         
-        # 输出关键结论
+        # Output key conclusions
         print("\n关键结论:")
         if "position" in differences:
             pos_mean = differences["position"]["mean_distance"]
