@@ -5,6 +5,8 @@ from venv import logger
 import torch
 import numpy as np
 import os
+import logging
+from typing import Dict, Tuple, Optional, Any
 from datasets.base.pixel_source import get_rays
 
 import argparse
@@ -13,12 +15,17 @@ from omegaconf import OmegaConf
 from utils.misc import import_str
 from datasets.driving_dataset import DrivingDataset
 from models.video_utils import render_images, save_videos
+from models.road_mesh import RoadMesh
 import imageio
 from post_train_difix_loop import tensor_to_image, image_to_array
 from standalone_renderer import render_single_offset_novel_view
 from utils.logging import MetricLogger, setup_logging
 from PIL import Image
 import wandb
+
+# Setup logger for this module
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def _to_tensor(value, field_name: str) -> torch.Tensor:
@@ -368,6 +375,172 @@ def cache_image_errors(cfg, dataset, trainer, step):
     logger.info("Done caching rgb error maps")
 
 
+def _blend_mesh_with_outputs(
+    outputs: Dict[str, torch.Tensor],
+    mesh: RoadMesh,
+    image_h: int,
+    image_w: int,
+    mesh_blend_alpha: float = 0.3,
+) -> Dict[str, torch.Tensor]:
+    """
+    Blend mesh rendering with Gaussian rendering outputs.
+    
+    This function composites the road mesh texture onto the Gaussian renderings,
+    allowing the mesh to contribute to the final rendered output while the 
+    Gaussians handle dynamic content (vehicles, people, etc.).
+    
+    Args:
+        outputs: Dictionary with Gaussian rendering outputs including 'rgbs'
+        mesh: RoadMesh instance
+        image_h: Image height in pixels
+        image_w: Image width in pixels
+        mesh_blend_alpha: Blend factor for mesh contribution (0.0-1.0)
+        
+    Returns:
+        Updated outputs dictionary with blended RGB
+    """
+    try:
+        # Get mesh texture
+        mesh_texture = mesh.get_texture_as_tensor()
+        
+        if mesh_texture is None or mesh_texture.shape[1] != 3:
+            return outputs
+        
+        # Resize mesh texture to match output image size if needed
+        if mesh_texture.shape[2] != image_h or mesh_texture.shape[3] != image_w:
+            import torch.nn.functional as F
+            mesh_texture = F.interpolate(
+                mesh_texture,
+                size=(image_h, image_w),
+                mode='bilinear',
+                align_corners=False,
+            )
+        
+        # Blend mesh with Gaussian output
+        if 'rgbs' in outputs:
+            gaussian_rgb = outputs['rgbs']
+            
+            # Ensure shapes match (batch_size, H, W, 3)
+            if gaussian_rgb.dim() == 3:
+                gaussian_rgb = gaussian_rgb.unsqueeze(0)
+            
+            if mesh_texture.dim() == 4:
+                mesh_rgb = mesh_texture.permute(0, 2, 3, 1)  # (1, H, W, 3)
+            else:
+                mesh_rgb = mesh_texture
+            
+            # Ensure both are on same device
+            mesh_rgb = mesh_rgb.to(gaussian_rgb.device)
+            
+            # Simple alpha blending: output = gaussian * (1-alpha) + mesh * alpha
+            blended_rgb = gaussian_rgb * (1.0 - mesh_blend_alpha) + mesh_rgb * mesh_blend_alpha
+            
+            outputs['rgbs'] = blended_rgb
+            
+            # Also store mesh RGB separately for inspection
+            outputs['road_mesh_rgb'] = mesh_rgb.squeeze(0) if mesh_rgb.shape[0] == 1 else mesh_rgb
+        
+        return outputs
+        
+    except Exception as e:
+        logger.debug(f"Error during mesh blending: {e}")
+        return outputs
+
+
+def _initialize_road_mesh(dataset, device, log_dir=None):
+    """
+    Initialize road mesh from LiDAR data and road masks, or load from checkpoint.
+    
+    This function:
+    1. Checks for saved mesh checkpoint (if log_dir provided)
+    2. If checkpoint exists, loads and returns it
+    3. Otherwise, aggregates LiDAR points from road mask regions
+    4. Creates a 3D mesh from the aggregated point cloud
+    5. Initializes a texture buffer for RGB projection
+    6. Projects camera images onto the mesh texture
+    
+    Args:
+        dataset: DrivingDataset instance with loaded data
+        device: PyTorch device for computation
+        log_dir: Optional directory containing saved mesh checkpoint
+        
+    Returns:
+        RoadMesh instance or None if initialization fails
+    """
+    try:
+        # Check if mesh checkpoint exists
+        if log_dir is not None:
+            mesh_checkpoint_path = os.path.join(log_dir, "road_mesh.pth")
+            if os.path.exists(mesh_checkpoint_path):
+                logger.info(f"Loading road mesh from checkpoint: {mesh_checkpoint_path}")
+                try:
+                    road_mesh = RoadMesh.load_checkpoint(mesh_checkpoint_path, device=device)
+                    logger.info("Road mesh loaded successfully from checkpoint")
+                    return road_mesh
+                except Exception as e:
+                    logger.warning(f"Failed to load mesh checkpoint: {e}. Creating new mesh...")
+        
+        # Step 1: Aggregate LiDAR points in road regions
+        logger.info("Step 1: Aggregating LiDAR points from road masks...")
+        road_lidar_indices = dataset.get_lidar_indices_from_mask_region(mask_attr="road_masks")
+        
+        if len(road_lidar_indices) == 0:
+            logger.warning("No LiDAR points found in road regions")
+            return None
+        
+        road_pts, road_colors = dataset.get_lidar_points_from_mask_region(
+            mask_attr="road_masks",
+            num_samples=None,  # Use all available points
+            return_color=True,
+            device=device
+        )
+        
+        logger.info(f"Extracted {len(road_pts):,} road LiDAR points")
+        
+        # Convert to numpy for mesh creation
+        pts_xyz = road_pts.cpu().numpy() if isinstance(road_pts, torch.Tensor) else road_pts
+        colors_arr = road_colors.cpu().numpy() if isinstance(road_colors, torch.Tensor) else road_colors
+        
+        # Step 2: Create mesh from point cloud
+        logger.info("Step 2: Creating 3D mesh from point cloud...")
+        cell_size = 0.5  # Grid resolution in meters
+        road_mesh = RoadMesh.from_pointcloud(
+            pts_xyz=pts_xyz,
+            colors=colors_arr,
+            cell_size=cell_size,
+            device=device,
+        )
+        
+        if len(road_mesh.vertices) == 0:
+            logger.warning("Failed to create mesh from point cloud")
+            return None
+        
+        # Step 3: Initialize texture buffer for RGB projection
+        logger.info("Step 3: Initializing texture buffer...")
+        resolution_ppm = 100.0
+        road_mesh.initialize_texture_buffer(resolution_pixels_per_meter=resolution_ppm)
+        
+        # Step 4: Project images onto mesh texture
+        logger.info("Step 4: Projecting camera images onto mesh texture...")
+        try:
+            projection_stats = road_mesh.project_images_onto_buffer(
+                dataset=dataset,
+                num_frames=None,  # Use all available frames
+            )
+            logger.info(f"Texture projection complete with stats: {projection_stats}")
+        except Exception as proj_error:
+            logger.warning(f"Image projection failed (mesh will use default texture): {proj_error}")
+            # Continue even if projection fails - mesh will still render with default texture
+        
+        logger.info("Road mesh initialization complete!")
+        return road_mesh
+        
+    except Exception as e:
+        logger.error(f"Error during road mesh initialization: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def build_trainer(dataset, cfg, args, ckpt_to_load=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -405,6 +578,33 @@ def build_trainer(dataset, cfg, args, ckpt_to_load=None):
     else:
         trainer.init_gaussians_from_dataset(dataset=dataset)
         logger.info(f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}")
+
+    # Initialize road mesh before training starts (STEP 0)
+    # Check if mesh should be enabled (default True, unless --disable_mesh_road is set)
+    enable_mesh = not getattr(args, "disable_mesh_road", False)
+    
+    if enable_mesh:
+        try:
+            logger.info("Initializing road mesh from LiDAR and road masks...")
+            # When training from scratch, do not load an existing road mesh checkpoint.
+            mesh_log_dir = None if getattr(args, "from_scratch", False) else cfg.log_dir
+            if mesh_log_dir is not None:
+                logger.info(f"Road mesh checkpoint directory: {mesh_log_dir}")
+            road_mesh = _initialize_road_mesh(dataset, device, log_dir=mesh_log_dir)
+            
+            if road_mesh is not None:
+                trainer.road_mesh = road_mesh
+                trainer.mesh_blend_alpha = getattr(args, "mesh_blend_alpha", 1.0)
+                logger.info(f"Road mesh successfully integrated into trainer (blend alpha: {trainer.mesh_blend_alpha})")
+            else:
+                logger.warning("Failed to initialize road mesh, continuing without mesh")
+                trainer.road_mesh = None
+        except Exception as e:
+            logger.error(f"Error initializing road mesh: {e}")
+            trainer.road_mesh = None
+    else:
+        logger.info("Mesh road reconstruction disabled (--disable_mesh_road flag set)")
+        trainer.road_mesh = None
 
     if getattr(args, "selected_object_id", None) is not None:
         freeze_trainer_to_selected_object(
@@ -457,6 +657,12 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     all_iters = np.arange(trainer.step, trainer.num_iters + 1)
     road_preview_freq = 3000
+    
+    # Add mesh render key if mesh is available
+    mesh_render_keys = render_keys.copy()
+    if hasattr(trainer, 'road_mesh') and trainer.road_mesh is not None:
+        if "road_mesh_rgb" not in mesh_render_keys:
+            mesh_render_keys.insert(0, "road_mesh_rgb")
 
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
         # training step
@@ -472,7 +678,9 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
             if isinstance(v, torch.Tensor):
                 cam_infos[k] = v.cuda(non_blocking=True)
 
+        # Forward pass: Gaussian + road-mesh composition happens inside trainer.forward()
         outputs = trainer(image_infos, cam_infos)
+        
         trainer.update_visibility_filter()
         loss_dict = trainer.compute_losses(outputs, image_infos, cam_infos)
 
@@ -507,6 +715,14 @@ def run_training_loop(cfg, dataset, trainer, render_keys, args):
                     raise
                 logger.warning("Retrying checkpoint save after removing %d broken models", removed)
                 trainer.save_checkpoint(log_dir=cfg.log_dir, save_only_model=True, is_final=step==trainer.num_iters)
+             
+            # Save mesh checkpoint alongside trainer checkpoint
+            if hasattr(trainer, "road_mesh") and trainer.road_mesh is not None:
+                try:
+                    mesh_checkpoint_path = os.path.join(cfg.log_dir, "road_mesh.pth")
+                    trainer.road_mesh.save_checkpoint(mesh_checkpoint_path)
+                except Exception as e:
+                    logger.warning(f"Failed to save mesh checkpoint: {e}")
 
         if step > 0 and step % road_preview_freq == 0:
             save_road_reference_preview(dataset, trainer, cfg.log_dir, args)
@@ -549,9 +765,18 @@ def save_road_reference_preview(dataset, trainer, ckpt_dir, args):
 
     def _save_image_if_present(tensor, filename):
         if isinstance(tensor, torch.Tensor):
-            img = tensor_to_image(tensor.cpu())
+            img_tensor = tensor.detach().cpu()
+            if img_tensor.ndim == 4 and img_tensor.shape[0] == 1:
+                img_tensor = img_tensor[0]
+            if img_tensor.ndim != 3:
+                return
+            img = tensor_to_image(img_tensor)
             img.save(os.path.join(quality_dir, filename))
 
+    _save_image_if_present(
+        road_sample.get("rendered_rgb", None),
+        f"rgb_reference_frame{args.ref_frame}_step{trainer.step}.png",
+    )
     _save_image_if_present(
         road_sample.get("background_rgb", None),
         f"background_reference_frame{args.ref_frame}_step{trainer.step}.png",
@@ -559,6 +784,10 @@ def save_road_reference_preview(dataset, trainer, ckpt_dir, args):
     _save_image_if_present(
         road_sample.get("sky_rgb", None),
         f"sky_reference_frame{args.ref_frame}_step{trainer.step}.png",
+    )
+    _save_image_if_present(
+        road_sample.get("road_mesh_rgb", None),
+        f"road_mesh_reference_frame{args.ref_frame}_step{trainer.step}.png",
     )
     road_rgb = road_sample.get("road_rgb", None)
     if isinstance(road_rgb, torch.Tensor):
@@ -645,7 +874,10 @@ def cli_start_training():
     parser.add_argument("--from_scratch", action="store_true", help="Train from scratch")
     parser.add_argument("--selected_object_type", type=str, default="rigid", choices=["rigid"], help="Type of object to keep trainable")
     parser.add_argument("--selected_object_id", type=int, default=None, help="Selected object id to keep trainable")
-    parser.add_argument("--synthetic_ratio", type=float, default=1.0, help="Fraction of synthetic samples to use (0.0-1.0). Use ~0.3 for 70%% real / 30%% synthetic split.")
+    parser.add_argument("--synthetic_ratio", type=float, default=0.3, help="Fraction of synthetic samples to use (0.0-1.0). Use ~0.3 for 70%% real / 30%% synthetic split.")
+    parser.add_argument("--enable_mesh_road", action="store_true", default=True, help="Enable mesh-based road reconstruction (default: True)")
+    parser.add_argument("--disable_mesh_road", action="store_true", help="Disable mesh-based road reconstruction")
+    parser.add_argument("--mesh_blend_alpha", type=float, default=1.0, help="Mesh blending factor (0.0-1.0, default 1.0)")
 
     args = parser.parse_args()
 

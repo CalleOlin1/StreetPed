@@ -550,6 +550,84 @@ class RigidNodes(VanillaGaussians):
         }
         return gs_dict
 
+    def get_reflected_gaussians(self, cam: dataclass_camera) -> Dict[str, torch.Tensor]:
+        filter_mask = torch.ones_like(
+            self._means[:, 0],
+            dtype=torch.bool
+        )
+
+        # --------------------------------------------------
+        # STEP 1: REFLECT IN CANONICAL SPACE (IMPORTANT)
+        # --------------------------------------------------
+        reflected_means = self._means.clone()
+
+        # mirror across local X axis (paper's symmetry plane)
+        reflected_means[:, 0] *= -1.0
+
+        # --------------------------------------------------
+        # STEP 2: APPLY INSTANCE TRANSFORM (unchanged)
+        # --------------------------------------------------
+        world_means = self.transform_means(reflected_means)
+        world_quats = self.transform_quats(self._quats)
+
+        # --------------------------------------------------
+        # STEP 3: COLORS / SH
+        # --------------------------------------------------
+        colors = torch.cat(
+            (
+                self._features_dc[:, None, :],
+                self._features_rest
+            ),
+            dim=1
+        )
+
+        if self.sh_degree > 0:
+            viewdirs = (
+                world_means.detach()
+                - cam.camtoworlds.data[..., :3, 3]
+            )
+
+            viewdirs = viewdirs / (
+                viewdirs.norm(dim=-1, keepdim=True) + 1e-8
+            )
+
+            n = min(
+                self.step // self.ctrl_cfg.sh_degree_interval,
+                self.sh_degree
+            )
+
+            rgbs = spherical_harmonics(
+                n,
+                viewdirs,
+                colors
+            )
+
+            rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
+        else:
+            rgbs = torch.sigmoid(colors[:, 0, :])
+
+        valid_mask = self.get_pts_valid_mask()
+
+        activated_opacities = self.get_opacity * valid_mask.float().unsqueeze(-1)
+        activated_scales = self.get_scaling
+        activated_rotations = self.quat_act(world_quats)
+
+        gs_dict = dict(
+            _means=world_means[filter_mask],
+            _opacities=activated_opacities[filter_mask],
+            _rgbs=rgbs[filter_mask],
+            _scales=activated_scales[filter_mask],
+            _quats=activated_rotations[filter_mask],
+        )
+
+        for k, v in gs_dict.items():
+            if torch.isnan(v).any():
+                raise ValueError(f"NaN detected in gaussian {k}")
+            if torch.isinf(v).any():
+                raise ValueError(f"Inf detected in gaussian {k}")
+
+        return gs_dict
+
     def get_instance_activated_gs_dict(self, ins_id: int) -> Dict[str, torch.Tensor]:
         pts_mask = self.point_ids[..., 0] == ins_id
         if pts_mask.sum() < 100:

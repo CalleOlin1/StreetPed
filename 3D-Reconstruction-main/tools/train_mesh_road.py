@@ -555,6 +555,8 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     # Create heightmap grid initialized with infinity (user requirement)
     # Shape is num_cells_x × num_cells_y, storing minimum z values per cell
     height_map = np.full((num_cells_x, num_cells_y), np.inf, dtype=np.float64)
+    x_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
+    y_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
     
     if colors_arr is not None and len(colors_arr) == len(points):
         color_map = [np.full((num_cells_x, num_cells_y), -1.0, dtype=np.int32) for _ in range(3)]
@@ -578,6 +580,8 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
         # Update heightmap if this is a lower (better) z value for this cell
         if z_val < height_map[x_idx, y_idx]:
             height_map[x_idx, y_idx] = z_val
+            x_coord_map[x_idx, y_idx] = point[0]
+            y_coord_map[x_idx, y_idx] = point[1]
             
             # Store color information if available
             if colors_arr is not None:
@@ -663,10 +667,13 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
             
             z_height = cell_z_values[height_map_dict[vertex_key]]
             
-            # Map grid index to world coordinates preserving original LiDAR coordinate system (NOT centered at origin).
-            # Use (num_cells - 1) so the generated mesh spans the original min/max bounds.
-            world_x = x_min + (x_idx / max(num_cells_x - 1, 1)) * scene_width
-            world_y = y_min + (y_idx / max(num_cells_y - 1, 1)) * scene_height
+            # Preserve original world placement by using the stored point coordinates
+            # of the selected minimum-height sample for each occupied grid cell.
+            world_x = x_coord_map[x_idx, y_idx]
+            world_y = y_coord_map[x_idx, y_idx]
+            if np.isnan(world_x) or np.isnan(world_y):
+                world_x = x_min + (x_idx / max(num_cells_x - 1, 1)) * scene_width
+                world_y = y_min + (y_idx / max(num_cells_y - 1, 1)) * scene_height
             
             final_vertices.append([world_x, world_y, z_height])
     
@@ -1088,7 +1095,7 @@ def create_image_buffer(vertices: torch.Tensor,
     
     logger.info(f"Scene dimensions: {scene_width:.2f}m × {scene_height:.2f}m")
     
-    pixels_per_meter = 40
+    pixels_per_meter = 80
     
     # Calculate buffer dimensions based on scene size and pixel density (user specification)
     width_pixels = int(np.ceil(scene_width * pixels_per_meter))
@@ -1326,14 +1333,111 @@ def save_image_buffer_as_png(buffer: np.ndarray,
 
 
 def save_texture_buffer_as_png(buffer: np.ndarray, output_path: str) -> None:
-    """Save a texture image with the vertical axis flipped for UV mapping."""
-    buffer_uint8 = np.clip(np.flipud(buffer) * 255.0, 0, 255).astype(np.uint8)
+    """Save texture image in the same orientation used by runtime road-mesh rendering."""
+    buffer_uint8 = np.clip(buffer * 255.0, 0, 255).astype(np.uint8)
     try:
         from PIL import Image
         Image.fromarray(buffer_uint8, mode="RGB").save(output_path)
         logger.info(f"Saved texture image to {output_path}")
     except Exception as e:
         logger.error(f"Failed to save texture image: {e}")
+
+
+def _resize_texture_buffer(buffer: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize a texture buffer while preserving normalized RGB values."""
+    if buffer.shape[:2] == (height, width):
+        return np.asarray(buffer, dtype=np.float32).copy()
+
+    from PIL import Image
+
+    buffer_uint8 = np.clip(buffer * 255.0, 0, 255).astype(np.uint8)
+    resampling = getattr(Image, "Resampling", Image)
+    resized = Image.fromarray(buffer_uint8, mode="RGB").resize(
+        (max(int(width), 1), max(int(height), 1)),
+        resample=resampling.BILINEAR,
+    )
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def _downscale_buffer_metadata(buffer_metadata: dict, downscale_factor: int = 10) -> dict:
+    """Create metadata for a lower-resolution projection pass."""
+    lowres_metadata = dict(buffer_metadata)
+    width = max(int(np.ceil(buffer_metadata.get("width", 1) / downscale_factor)), 1)
+    height = max(int(np.ceil(buffer_metadata.get("height", 1) / downscale_factor)), 1)
+    lowres_metadata["width"] = width
+    lowres_metadata["height"] = height
+    if "pixels_per_meter" in lowres_metadata:
+        lowres_metadata["pixels_per_meter"] = float(lowres_metadata["pixels_per_meter"]) / downscale_factor
+    return lowres_metadata
+
+
+def _run_two_pass_projection(
+    projection_fn,
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    image_buffer,
+    buffer_metadata,
+    device,
+    step1_dir=None,
+    num_frames=None,
+    **projection_kwargs,
+):
+    """Run the existing projection logic at low resolution, then refine at target resolution."""
+    lowres_metadata = _downscale_buffer_metadata(buffer_metadata, downscale_factor=10)
+    lowres_buffer = _resize_texture_buffer(
+        image_buffer,
+        lowres_metadata["width"],
+        lowres_metadata["height"],
+    )
+
+    logger.info(
+        "Two-pass texture projection: pass 1 at %dx%d, pass 2 at %dx%d",
+        lowres_metadata["width"],
+        lowres_metadata["height"],
+        buffer_metadata.get("width", image_buffer.shape[1]),
+        buffer_metadata.get("height", image_buffer.shape[0]),
+    )
+
+    lowres_buffer, lowres_stats = projection_fn(
+        dataset,
+        vertices_tensor,
+        faces_tensor,
+        lowres_buffer,
+        lowres_metadata,
+        device,
+        step1_dir=step1_dir,
+        num_frames=num_frames,
+        **projection_kwargs,
+    )
+
+    upscaled_buffer = _resize_texture_buffer(
+        lowres_buffer,
+        int(buffer_metadata.get("width", image_buffer.shape[1])),
+        int(buffer_metadata.get("height", image_buffer.shape[0])),
+    )
+
+    highres_buffer, highres_stats = projection_fn(
+        dataset,
+        vertices_tensor,
+        faces_tensor,
+        upscaled_buffer,
+        buffer_metadata,
+        device,
+        step1_dir=step1_dir,
+        num_frames=num_frames,
+        **projection_kwargs,
+    )
+
+    combined_stats = dict(highres_stats)
+    combined_stats["projection_passes"] = 2
+    combined_stats["lowres_pass"] = {
+        "width": lowres_metadata["width"],
+        "height": lowres_metadata["height"],
+        **lowres_stats,
+    }
+    combined_stats["highres_pass"] = highres_stats
+    return highres_buffer, combined_stats
 
 
 def export_textured_mesh_obj(
@@ -1364,10 +1468,10 @@ def export_textured_mesh_obj(
     x_span = max(float(x_max) - float(x_min), 1e-8)
     y_span = max(float(y_max) - float(y_min), 1e-8)
 
-    # Match the saved texture image: y_min is at the bottom after vertical flip.
+    # Keep export UV orientation consistent with runtime rendering.
     u = np.clip((verts_np[:, 0] - float(x_min)) / x_span, 0.0, 1.0)
     v = np.clip((verts_np[:, 1] - float(y_min)) / y_span, 0.0, 1.0)
-    uv_coords = np.stack([u, v], axis=1).astype(np.float32)
+    uv_coords = np.stack([u, 1.0 - v], axis=1).astype(np.float32)
 
     obj_path = os.path.join(output_dir, filename)
     mtl_filename = os.path.splitext(filename)[0] + ".mtl"
@@ -1607,7 +1711,7 @@ def export_mesh_to_obj(vertices: torch.Tensor,
     return obj_path
 
 
-def project_rgb_onto_image_buffer(
+def _project_rgb_onto_image_buffer_single_pass(
     dataset,
     vertices_tensor,
     faces_tensor,
@@ -1783,7 +1887,7 @@ def project_rgb_onto_image_buffer(
                     if len(road_pixel_indices[0]) == 0:
                         continue
                     
-                    rays_per_image = 30000
+                    rays_per_image = 100000
                     num_road_pixels = len(road_pixel_indices[0])
                     if num_road_pixels > rays_per_image:
                         logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2098,7 +2202,31 @@ def _intersect_rays_with_triangles_gpu(
     return best_hit_points, hit_mask, best_t
 
 
-def project_rgb_onto_image_buffer_gpu(
+def project_rgb_onto_image_buffer(
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    image_buffer,
+    buffer_metadata,
+    device,
+    step1_dir=None,
+    num_frames=None,
+):
+    """Run the RGB projection in two passes: low-res preview then full-res refinement."""
+    return _run_two_pass_projection(
+        _project_rgb_onto_image_buffer_single_pass,
+        dataset,
+        vertices_tensor,
+        faces_tensor,
+        image_buffer,
+        buffer_metadata,
+        device,
+        step1_dir=step1_dir,
+        num_frames=num_frames,
+    )
+
+
+def _project_rgb_onto_image_buffer_gpu_single_pass(
     dataset,
     vertices_tensor,
     faces_tensor,
@@ -2113,7 +2241,7 @@ def project_rgb_onto_image_buffer_gpu(
     """GPU batched version of RGB projection onto the image buffer."""
     if not torch.cuda.is_available() or getattr(device, "type", str(device)) != "cuda":
         logger.info("CUDA is unavailable; falling back to the CPU projection path.")
-        return project_rgb_onto_image_buffer(
+        return _project_rgb_onto_image_buffer_single_pass(
             dataset,
             vertices_tensor,
             faces_tensor,
@@ -2246,7 +2374,7 @@ def project_rgb_onto_image_buffer_gpu(
                         if len(road_pixel_indices[0]) == 0:
                             continue
 
-                        rays_per_image = 30000
+                        rays_per_image = 100000
                         num_road_pixels = len(road_pixel_indices[0])
                         if num_road_pixels > rays_per_image:
                             logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2414,6 +2542,34 @@ def project_rgb_onto_image_buffer_gpu(
     logger.info(f"Updated {num_unique_buffer_pixels:,} unique buffer pixels with RGB colors")
 
     return updated_buffer, projection_stats
+
+
+def project_rgb_onto_image_buffer_gpu(
+    dataset,
+    vertices_tensor,
+    faces_tensor,
+    image_buffer,
+    buffer_metadata,
+    device,
+    step1_dir=None,
+    num_frames=None,
+    ray_chunk_size=1024,
+    triangle_chunk_size=4096,
+):
+    """Run the GPU RGB projection in two passes: low-res preview then full-res refinement."""
+    return _run_two_pass_projection(
+        _project_rgb_onto_image_buffer_gpu_single_pass,
+        dataset,
+        vertices_tensor,
+        faces_tensor,
+        image_buffer,
+        buffer_metadata,
+        device,
+        step1_dir=step1_dir,
+        num_frames=num_frames,
+        ray_chunk_size=ray_chunk_size,
+        triangle_chunk_size=triangle_chunk_size,
+    )
 
 
 def create_camera_view_comparison(dataset, vertices_tensor, faces_tensor, cam_id=2, frame_idx=None, output_dir="", num_frames=None):
@@ -2750,12 +2906,20 @@ def export_mesh_render_from_camera(
         K_np = K.detach().cpu().numpy()
     else:
         K_np = np.asarray(K)
+    if K_np.ndim == 3:
+        K_np = K_np[min(cam_id, K_np.shape[0] - 1)]
     if torch.is_tensor(c2w):
         c2w_np = c2w.detach().cpu().numpy()
     else:
         c2w_np = np.asarray(c2w)
     if len(c2w_np.shape) == 3:
         c2w_np = c2w_np[min(cam_id, c2w_np.shape[0] - 1)]
+
+    if K_np.shape != (3, 3) or c2w_np.shape != (4, 4):
+        logger.warning(
+            f"Cannot export camera render - unexpected camera shapes K={K_np.shape}, c2w={c2w_np.shape}"
+        )
+        return None
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts_np.astype(np.float64))
@@ -2764,7 +2928,7 @@ def export_mesh_render_from_camera(
 
     texture_image = None
     if texture_buffer is not None and texture_metadata:
-        texture_np = np.clip(np.flipud(np.asarray(texture_buffer)) * 255.0, 0, 255).astype(np.uint8)
+        texture_np = np.clip(np.asarray(texture_buffer) * 255.0, 0, 255).astype(np.uint8)
         texture_image = o3d.geometry.Image(texture_np)
         x_min, x_max = texture_metadata["x_range"]
         y_min, y_max = texture_metadata["y_range"]
@@ -2772,9 +2936,10 @@ def export_mesh_render_from_camera(
         y_span = max(float(y_max) - float(y_min), 1e-8)
         u = np.clip((verts_np[:, 0] - float(x_min)) / x_span, 0.0, 1.0)
         v = np.clip((verts_np[:, 1] - float(y_min)) / y_span, 0.0, 1.0)
-        triangle_uvs = np.stack([np.column_stack([u, v])[faces_np[:, 0]],
-                                 np.column_stack([u, v])[faces_np[:, 1]],
-                                 np.column_stack([u, v])[faces_np[:, 2]]], axis=1).reshape(-1, 2)
+        uv_coords = np.column_stack([u, 1.0 - v])
+        triangle_uvs = np.stack([uv_coords[faces_np[:, 0]],
+                                 uv_coords[faces_np[:, 1]],
+                                 uv_coords[faces_np[:, 2]]], axis=1).reshape(-1, 2)
         mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs.astype(np.float64))
         mesh.textures = [texture_image]
     else:
@@ -2783,7 +2948,7 @@ def export_mesh_render_from_camera(
 
     h, w = rgb_img.shape[:2]
     renderer = o3d.visualization.rendering.OffscreenRenderer(w, h)
-    renderer.scene.set_background([0.0, 0.0, 0.0, 0.0])
+    renderer.scene.set_background([1.0, 1.0, 1.0, 0.0])
 
     material = o3d.visualization.rendering.MaterialRecord()
     material.shader = "defaultUnlit"
@@ -2796,21 +2961,17 @@ def export_mesh_render_from_camera(
     fx, fy = float(K_np[0, 0]), float(K_np[1, 1])
     cx, cy = float(K_np[0, 2]), float(K_np[1, 2])
     intrinsic = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
-    extrinsic = np.linalg.inv(c2w_np)
-
-    try:
-        renderer.setup_camera(intrinsic, extrinsic)
-    except Exception:
-        eye = c2w_np[:3, 3]
-        forward = c2w_np[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        up = c2w_np[:3, :3] @ np.array([0.0, -1.0, 0.0], dtype=np.float64)
-        if np.linalg.norm(forward) < 1e-8:
-            forward = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if np.linalg.norm(up) < 1e-8:
-            up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
-        renderer.scene.camera.look_at(eye + forward, eye, up)
-
+    renderer.setup_camera(intrinsic, np.linalg.inv(c2w_np))
     color = np.asarray(renderer.render_to_image())
+
+    if color.dtype.kind in {"f", "c"}:
+        color_max = float(np.nanmax(color)) if color.size else 0.0
+        if color_max <= 1.5:
+            color = color * 255.0
+    if color.ndim == 2:
+        color = np.repeat(color[:, :, None], 3, axis=2)
+    if color.shape[-1] == 4:
+        color = color[:, :, :3]
     render_path = None
     if output_dir:
         render_path = os.path.join(output_dir, f"frame_{frame_idx}_camera_{cam_id}_mesh_render.png")

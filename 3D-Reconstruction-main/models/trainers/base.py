@@ -128,6 +128,11 @@ class BasicTrainer(nn.Module):
         self.cur_frame = torch.tensor(0, device=self.device)
         self.test_set_indices = test_set_indices # will be override
         
+        # Optional road-mesh rendering state.
+        self.road_mesh = None
+        self.mesh_blend_alpha = 1.0
+        self._mesh_glctx = None
+        
         # a simple viewer for background visualization
         self.viewer = None
         self.frozen_model_classes = set()
@@ -517,6 +522,155 @@ class BasicTrainer(nn.Module):
         else:       
             return rgb_blended
     
+    def _render_road_mesh_from_camera(
+        self,
+        cam: dataclass_camera,
+    ) -> Dict[str, torch.Tensor]:
+        road_mesh = getattr(self, "road_mesh", None)
+        if road_mesh is None:
+            return {}
+        if road_mesh.texture_metadata is None:
+            return {}
+        if road_mesh.vertices.numel() == 0 or road_mesh.faces.numel() == 0:
+            return {}
+        if self.device is None or self.device.type != "cuda":
+            return {}
+        if not torch.cuda.is_available():
+            return {}
+        
+        texture = road_mesh.get_texture_as_tensor()
+        if texture is None:
+            return {}
+        
+        try:
+            import nvdiffrast.torch as dr
+        except Exception:
+            return {}
+        
+        def _to_int_scalar(value) -> int:
+            if torch.is_tensor(value):
+                return int(value.flatten()[0].item())
+            return int(value)
+        
+        c2w = cam.camtoworlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        K = cam.Ks
+        if K.ndim == 3:
+            K = K[0]
+        
+        H = _to_int_scalar(cam.H)
+        W = _to_int_scalar(cam.W)
+        if H <= 0 or W <= 0:
+            return {}
+        
+        vertices = road_mesh.vertices.to(device=self.device, dtype=torch.float32)
+        faces = road_mesh.faces.to(device=self.device, dtype=torch.long)
+        
+        # world -> camera
+        w2c = torch.linalg.inv(c2w.to(device=self.device, dtype=torch.float32))
+        vertices_h = torch.cat(
+            [vertices, torch.ones((vertices.shape[0], 1), device=self.device, dtype=torch.float32)],
+            dim=-1,
+        )
+        vertices_cam = (vertices_h @ w2c.T)[..., :3]
+        z_cam = vertices_cam[..., 2]
+        
+        valid_vertex_mask = z_cam > 1e-4
+        valid_face_mask = valid_vertex_mask[faces].all(dim=-1)
+        if not valid_face_mask.any():
+            return {}
+        faces = faces[valid_face_mask]
+        
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        z_safe = z_cam.clamp_min(1e-4)
+        px = fx * (vertices_cam[..., 0] / z_safe) + cx
+        py = fy * (vertices_cam[..., 1] / z_safe) + cy
+        
+        x_ndc = ((px + 0.5) / max(W, 1)) * 2.0 - 1.0
+        y_ndc = 1.0 - ((py + 0.5) / max(H, 1)) * 2.0
+        
+        z_valid = z_cam[valid_vertex_mask]
+        z_min = z_valid.min()
+        z_max = z_valid.max()
+        z_denom = (z_max - z_min).clamp_min(1e-6)
+        z_ndc = ((z_cam - z_min) / z_denom) * 2.0 - 1.0
+        
+        clip_vertices = torch.stack(
+            [x_ndc, y_ndc, z_ndc, torch.ones_like(z_ndc)],
+            dim=-1,
+        )[None, ...].contiguous()
+        
+        texture_nhwc = texture.to(device=self.device, dtype=torch.float32).permute(0, 2, 3, 1).contiguous()
+        
+        x_min, x_max = road_mesh.texture_metadata["x_range"]
+        y_min, y_max = road_mesh.texture_metadata["y_range"]
+        x_span = max(float(x_max) - float(x_min), 1e-8)
+        y_span = max(float(y_max) - float(y_min), 1e-8)
+        u = ((vertices[..., 0] - float(x_min)) / x_span).clamp(0.0, 1.0)
+        v = ((vertices[..., 1] - float(y_min)) / y_span).clamp(0.0, 1.0)
+        # Texture buffer rows are already indexed in world-Y order during projection.
+        # Avoid inverting V again here, otherwise the rendered road mesh appears upside down.
+        uv = torch.stack([u, v], dim=-1)[None, ...].contiguous()
+        
+        if self._mesh_glctx is None:
+            self._mesh_glctx = dr.RasterizeCudaContext()
+        
+        tri = faces.to(dtype=torch.int32).contiguous()
+        rast, _ = dr.rasterize(self._mesh_glctx, clip_vertices, tri, (H, W))
+        rast = rast.contiguous()
+        coverage = (rast[..., 3:4] > 0).float()
+        
+        interp_uv, _ = dr.interpolate(uv.contiguous(), rast, tri)
+        mesh_rgb = dr.texture(
+            texture_nhwc,
+            interp_uv,
+            filter_mode="linear",
+            boundary_mode="clamp",
+        )[0]
+        
+        z_attr = z_cam[None, :, None].contiguous()
+        interp_depth, _ = dr.interpolate(z_attr, rast, tri)
+        mesh_depth = interp_depth[0]
+        mesh_alpha = coverage[0]
+        
+        # nvdiffrast outputs images in OpenGL convention (origin at bottom-left),
+        # while the training pipeline uses image tensors with top-left origin.
+        mesh_rgb = torch.flip(mesh_rgb, dims=[0])
+        mesh_depth = torch.flip(mesh_depth, dims=[0])
+        mesh_alpha = torch.flip(mesh_alpha, dims=[0])
+        
+        mesh_rgb = torch.where(mesh_alpha > 0, mesh_rgb, torch.zeros_like(mesh_rgb))
+        
+        return {
+            "rgb": mesh_rgb,
+            "alpha": mesh_alpha,
+            "depth": mesh_depth,
+        }
+    
+    def _compose_mesh_into_outputs(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        image_infos: Dict[str, torch.Tensor],
+        cam: dataclass_camera,
+    ) -> Dict[str, torch.Tensor]:
+        rgb_base = outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"])
+        mesh_render = self._render_road_mesh_from_camera(cam)
+        
+        if len(mesh_render) > 0:
+            blend_alpha = float(getattr(self, "mesh_blend_alpha", 1.0))
+            blend_alpha = float(np.clip(blend_alpha, 0.0, 1.0))
+            mesh_alpha = (mesh_render["alpha"] * blend_alpha).clamp(0.0, 1.0)
+            
+            rgb_base = mesh_render["rgb"] * mesh_alpha + rgb_base * (1.0 - mesh_alpha)
+            outputs["road_mesh_rgb"] = mesh_render["rgb"]
+            outputs["road_mesh_opacity"] = mesh_alpha
+            outputs["road_mesh_depth"] = mesh_render["depth"]
+        
+        outputs["rgb"] = self.affine_transformation(rgb_base, image_infos)
+        return outputs
+    
     def forward(
         self, 
         image_infos: Dict[str, torch.Tensor],
@@ -565,9 +719,10 @@ class BasicTrainer(nn.Module):
         outputs["rgb_sky"] = sky_model(image_infos)
         outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
         
-        # affine transformation
-        outputs["rgb"] = self.affine_transformation(
-            outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
+        outputs = self._compose_mesh_into_outputs(
+            outputs=outputs,
+            image_infos=image_infos,
+            cam=processed_cam,
         )
         
         # no sky render
@@ -1386,6 +1541,40 @@ class BasicTrainer(nn.Module):
             })
 
         # ------------------------
+        # Dynamic RGB loss
+        # ------------------------
+        # sym_cfg = self.losses_dict.get("symmetry", None)
+        # if (
+        #     sym_cfg is not None
+        #     and "fg_rgb_reflected" in outputs
+        # ):
+        #     fg_mask = image_infos["foreground_mask"].float()
+
+        #     gt_fg = gt_rgb * fg_mask[..., None]
+        #     reflected_fg = outputs["fg_rgb_reflected"] * fg_mask[..., None]
+
+        #     l1_sym = torch.abs(
+        #         gt_fg - reflected_fg
+        #     ).mean()
+
+        #     ssim_sym = 1 - self.ssim(
+        #         gt_fg.permute(2,0,1)[None],
+        #         reflected_fg.permute(2,0,1)[None]
+        #     )
+
+        #     loss_dict["symmetry_l1"] = (
+        #         (1 - sym_cfg.lambda_ssim)
+        #         * sym_cfg.w
+        #         * l1_sym
+        #     )
+
+        #     loss_dict["symmetry_ssim"] = (
+        #         sym_cfg.lambda_ssim
+        #         * sym_cfg.w
+        #         * ssim_sym
+        #     )
+
+        # ------------------------
         # Opacity targets (UNCHANGED)
         # ------------------------
         gt_bg_opacity = bg_mask * valid_loss_mask
@@ -1553,6 +1742,32 @@ class BasicTrainer(nn.Module):
             for k, v in loaded_state_schedulers.items():
                 self.schedulers[k].load_state_dict(v)
             self.grad_scaler.load_state_dict(loaded_grad_scaler)
+
+        road_mesh_state_dict = {
+            key[len("road_mesh."):]: value
+            for key, value in list(state_dict.items())
+            if key.startswith("road_mesh.")
+        }
+        if road_mesh_state_dict:
+            from models.road_mesh import RoadMesh
+
+            if self.road_mesh is None:
+                if "vertices" not in road_mesh_state_dict or "faces" not in road_mesh_state_dict:
+                    logger.warning("Cannot reconstruct road_mesh from checkpoint because vertices/faces are missing")
+                else:
+                    self.road_mesh = RoadMesh(
+                        vertices=road_mesh_state_dict["vertices"],
+                        faces=road_mesh_state_dict["faces"],
+                        device=self.device,
+                    )
+                    logger.info("Restored road_mesh module from checkpoint")
+                    logger.info("RoadMesh: checkpoint state will be loaded by the parent module loader")
+
+            if self.road_mesh is None:
+                logger.warning("Dropping road_mesh checkpoint keys because the module could not be reconstructed")
+                for key in list(state_dict.keys()):
+                    if key.startswith("road_mesh."):
+                        state_dict.pop(key)
         
         # load model
         model_state_dict = state_dict.pop("models")

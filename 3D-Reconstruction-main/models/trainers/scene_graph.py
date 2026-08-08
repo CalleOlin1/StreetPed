@@ -544,10 +544,10 @@ class MultiTrainer(BasicTrainer):
         outputs["rgb_sky"] = sky_model(image_infos)
         outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
 
-        # affine transformation
-        outputs["rgb"] = self.affine_transformation(
-            outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]),
-            image_infos,
+        outputs = self._compose_mesh_into_outputs(
+            outputs=outputs,
+            image_infos=image_infos,
+            cam=processed_cam,
         )
 
         if self.training and "Background" in self.gaussian_classes and "sky_masks" in image_infos:

@@ -1,7 +1,4 @@
-"""
-The goal of this file is to create a structured and memory efficient approach to improve the quality of a trained checkpoint file.
 
-"""
 import os
 import argparse
 import io
@@ -55,11 +52,26 @@ def image_to_array(img: Image.Image, normalize: bool = True) -> np.ndarray:
     array = np.transpose(img_np, (2, 0, 1))
     return array
 
-def log_synthetic_image(novel_image, repaired_image, run_path, img_no):
+def make_side_by_side_image(novel_image, repaired_image):
     side_by_side = Image.new('RGB', (novel_image.width + repaired_image.width, novel_image.height))
     side_by_side.paste(novel_image, (0, 0))
     side_by_side.paste(repaired_image, (novel_image.width, 0))
+    return side_by_side
+
+def log_synthetic_image(novel_image, repaired_image, run_path, img_no):
+    side_by_side = make_side_by_side_image(novel_image, repaired_image)
     side_by_side.save(os.path.join(run_path, "synthetic_image_samples", f"sidebyside_{img_no}.png"))
+
+def log_composite_image(novel_image, repaired_image, run_path, frame_index, lateral_offset, img_no):
+    composite_image = make_side_by_side_image(novel_image, repaired_image)
+    quality_dir = os.path.join(run_path, "novel_view_quality")
+    os.makedirs(quality_dir, exist_ok=True)
+    composite_image.save(
+        os.path.join(
+            quality_dir,
+            f"novelview_frame{frame_index}_offset{lateral_offset}_step{img_no}_composite.png",
+        )
+    )
 
 def render_novel_sample(checkpoint_path, frame_index, lateral_offset):
     """
@@ -344,9 +356,12 @@ def one_iteration(synthetic_samples, checkpoint_path, lateral_offset, max_latera
     road_masks = get_road_masks(repaired_images, segformer_path=SEGFORMER_REPO_PATH)
 
     # Logging and update samples
-    for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask, road_mask) in enumerate(zip(batch_results, novel_imgs, repaired_images, sky_masks, road_masks)):
+    for i, ((curr_step, novel_sample), novel_img, repaired_image, sky_mask, road_mask, frame_idx, lateral_offset) in enumerate(
+        zip(batch_results, novel_imgs, repaired_images, sky_masks, road_masks, frame_indices, lateral_offsets)
+    ):
         if i % 10 == 0:
             log_synthetic_image(novel_img, repaired_image, run_path, len(synthetic_samples))
+            # log_composite_image(novel_img, repaired_image, run_path, frame_idx, lateral_offset, len(synthetic_samples))
         # Convert repaired_image (PIL) back to numpy array (normalized float32, CHW)
         repaired_array = image_to_array(repaired_image, normalize=True)
         novel_sample["rendered_rgb"] = repaired_array
@@ -383,7 +398,8 @@ def create_run_folders(run_path):
         "configs_bk",
         "buffer_maps",
         "backup",
-        "synthetic_image_samples"
+        "synthetic_image_samples",
+        "novel_view_quality",
     ]:
         os.makedirs(os.path.join(run_path, folder), exist_ok=True)
 
@@ -464,6 +480,7 @@ def main(
     run_training_loop(
         checkpoint_path=checkpoint_path,
         min_frame_index=20, max_frame_index=280,
+        # min_frame_index=20, max_frame_index=140,
         min_lateral_offset=0.8, max_lateral_offset=3.5,
         num_synthetic_samples=10
     )

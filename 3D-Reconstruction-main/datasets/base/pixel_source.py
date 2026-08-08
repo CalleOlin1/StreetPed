@@ -162,8 +162,24 @@ class CameraData(object):
             self.load_dynamic_masks()
         if load_sky_mask:
             self.load_sky_masks()
-        if load_road_mask and len(self.road_mask_filepaths) > 0 and all(os.path.exists(fp) for fp in self.road_mask_filepaths):
-            self.load_road_masks()
+        if load_road_mask:
+            if len(self.road_mask_filepaths) == 0:
+                logger.warning(
+                    "[PixelSource] Road masks requested, but no road mask filepaths were found for %s cam %s.",
+                    self.dataset_name,
+                    self.cam_id,
+                )
+            elif all(os.path.exists(fp) for fp in self.road_mask_filepaths):
+                self.load_road_masks()
+            else:
+                missing = sum(not os.path.exists(fp) for fp in self.road_mask_filepaths)
+                logger.warning(
+                    "[PixelSource] Skipping road masks for %s cam %s because %d/%d files are missing.",
+                    self.dataset_name,
+                    self.cam_id,
+                    missing,
+                    len(self.road_mask_filepaths),
+                )
         self.lidar_depth_maps = None # will be loaded by: self.load_depth()
         self.image_error_maps = None # will be built by: self.build_image_error_buffer()
         self.to(self.device)

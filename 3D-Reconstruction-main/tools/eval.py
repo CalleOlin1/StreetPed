@@ -15,10 +15,28 @@ import torch
 from datasets.driving_dataset import DrivingDataset
 from utils.misc import import_str
 from models.trainers import BasicTrainer
+from models.road_mesh import RoadMesh
 from models.video_utils import render_images, save_videos, render_novel_views, extract_camera_poses_from_dataset, save_camera_poses, analyze_camera_trajectory  
 
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+
+
+def _restore_textured_road_mesh(trainer: BasicTrainer, checkpoint_dir: str):
+    """Restore textured road mesh from checkpoint if available."""
+    if not hasattr(trainer, 'road_mesh') or trainer.road_mesh is None:
+        return
+    
+    road_mesh_path = os.path.join(checkpoint_dir, 'road_mesh.pth')
+    if os.path.exists(road_mesh_path):
+        try:
+            trainer.road_mesh = RoadMesh.load_checkpoint(road_mesh_path, device=trainer.device)
+            logger.info(f"Loaded textured road mesh from {road_mesh_path} (has_texture={trainer.road_mesh.texture_buffer is not None})")
+        except Exception as e:
+            logger.warning(f"Failed to load textured road mesh from {road_mesh_path}: {e}")
+    else:
+        logger.debug(f"Road mesh texture file not found: {road_mesh_path}")
+
 
 
 def _load_novel_trajectory_from_file(
@@ -377,6 +395,9 @@ def main(args):
     logger.info(
         f"Resuming training from {args.resume_from}, starting at step {trainer.step}"
     )
+    
+    # Restore textured road mesh if available
+    _restore_textured_road_mesh(trainer, ckpt_dir)
 
     if args.enable_viewer:
         # a simple viewer for background visualization
@@ -404,6 +425,8 @@ def main(args):
         render_keys += ["rgb_sky_blend", "rgb_sky"]
     if cfg.render.vis_error:
         render_keys.insert(render_keys.index("rgbs") + 1, "rgb_error_maps")
+    if hasattr(trainer, 'road_mesh') and trainer.road_mesh is not None:
+        render_keys.append("road_mesh_rgb")
 
     if args.save_catted_videos:
         cfg.logging.save_seperate_video = False

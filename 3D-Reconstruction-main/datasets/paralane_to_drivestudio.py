@@ -546,9 +546,9 @@ def convert_clip(paralane_clip_dir, output_scene_dir, verbose=True):
         # Copy image → {timestep:03d}_0.jpg (KITTI-compatible resolution)
         dst_img = out_path / 'images' / f'{timestep_idx:03d}_0.jpg'
         img = Image.open(str(src_img_path)).convert('RGB')
-        if img.size != (target_width, target_height):
-            img = img.resize((target_width, target_height), Image.BILINEAR)
-        img.save(str(dst_img), quality=95)
+        # if img.size != (target_width, target_height):
+        #     img = img.resize((target_width, target_height), Image.BILINEAR)
+        img.save(str(dst_img), quality=100)
         ts_part = src_img_path.parent.name
         timestamp_to_timestep[ts_part] = timestep_idx
 
@@ -579,8 +579,8 @@ def convert_clip(paralane_clip_dir, output_scene_dir, verbose=True):
         if src_mask_path.exists():
             # all/ = combined foreground mask (everything moving)
             dyn = Image.open(str(src_mask_path)).convert('L')
-            if dyn.size != (target_width, target_height):
-                dyn = dyn.resize((target_width, target_height), Image.NEAREST)
+            # if dyn.size != (target_width, target_height):
+            #     dyn = dyn.resize((target_width, target_height), Image.NEAREST)
             dyn.save(str(out_path / 'dynamic_masks' / 'all' / f'{prefix}.png'))
             dyn.save(str(out_path / 'fine_dynamic_masks' / 'all' / f'{prefix}.png'))
         else:
