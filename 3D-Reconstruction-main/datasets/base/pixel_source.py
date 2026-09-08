@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, List, Callable
+from typing import Dict, Tuple, List, Callable, Iterator
 from omegaconf import OmegaConf
 import os
 import abc
@@ -1204,16 +1204,18 @@ class ScenePixelSource(abc.ABC):
         """
         return self.data_cfg.sampler.buffer_downscale
     
-    def prepare_novel_view_render_data(self, dataset_type: str, traj: torch.Tensor) -> list:
+    def iter_novel_view_render_data(
+        self, dataset_type: str, traj: torch.Tensor
+    ) -> Iterator[dict]:
         """
-        Prepare all necessary elements for novel view rendering.
+        Lazily prepare elements required for rendering novel-view frames.
 
         Args:
             dataset_type (str): Type of dataset
             traj (torch.Tensor): Novel view trajectory, shape (N, 4, 4)
 
-        Returns:
-            list: List of dicts, each containing elements required for rendering a single frame:
+        Yields:
+            dict: Per-frame dict containing:
                 - cam_infos: Camera information (extrinsics, intrinsics, image dimensions)
                 - image_infos: Image-related information (indices, normalized time, viewdirs, etc.)
         """
@@ -1229,41 +1231,50 @@ class ScenePixelSource(abc.ABC):
         scaled_indices = torch.linspace(0, original_frame_count - 1, len(traj))
         normed_time = torch.linspace(0, 1, len(traj))
         
-        render_data = []
+        x, y = torch.meshgrid(torch.arange(W), torch.arange(H), indexing="xy")
+        x, y = x.to(self.device), y.to(self.device)
         for i in range(len(traj)):
             c2w = traj[i]
-            
+
             # Generate ray origins and directions
-            x, y = torch.meshgrid(torch.arange(W), torch.arange(H), indexing='xy')
-            x, y = x.to(self.device), y.to(self.device)
-            
             origins, viewdirs, direction_norm = get_rays(x.flatten(), y.flatten(), c2w, intrinsics)
             origins = origins.reshape(H, W, 3)
             viewdirs = viewdirs.reshape(H, W, 3)
             direction_norm = direction_norm.reshape(H, W, 1)
-            
+
             cam_infos = {
                 "camera_to_world": c2w,
                 "intrinsics": intrinsics,
                 "height": torch.tensor([H], dtype=torch.long, device=self.device),
                 "width": torch.tensor([W], dtype=torch.long, device=self.device),
             }
-            
+
+            # Novel-view trajectories can extend beyond the training image range.
+            # Clamp to the last valid embedding index so the model reuses the final
+            # learned appearance instead of crashing on an out-of-range lookup.
+            valid_img_idx = min(i, max(self.num_frames - 1, 0))
             image_infos = {
                 "origins": origins,
                 "viewdirs": viewdirs,
                 "direction_norm": direction_norm,
-                "img_idx": torch.full((H, W), i, dtype=torch.long, device=self.device),
+                "img_idx": torch.full((H, W), valid_img_idx, dtype=torch.long, device=self.device),
                 "frame_idx": torch.full((H, W), scaled_indices[i].round().long(), device=self.device),
                 "normed_time": torch.full((H, W), normed_time[i], dtype=torch.float32, device=self.device),
                 "pixel_coords": torch.stack(
                     [y.float() / H, x.float() / W], dim=-1
                 ),  # [H, W, 2]
             }
-            
-            render_data.append({
+
+            yield {
                 "cam_infos": cam_infos,
                 "image_infos": image_infos,
-            })
-        
-        return render_data
+            }
+
+    def prepare_novel_view_render_data(self, dataset_type: str, traj: torch.Tensor) -> list:
+        """
+        Prepare all necessary elements for novel view rendering.
+
+        Returns:
+            list: Materialized per-frame render inputs.
+        """
+        return list(self.iter_novel_view_render_data(dataset_type, traj))

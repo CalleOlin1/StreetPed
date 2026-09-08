@@ -11,6 +11,7 @@ from datasets.base.pixel_source import get_rays
 
 import argparse
 import pickle
+import sys
 from omegaconf import OmegaConf
 from utils.misc import import_str
 from datasets.driving_dataset import DrivingDataset
@@ -26,6 +27,17 @@ import wandb
 # Setup logger for this module
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _emit_road_mesh_warning(message: str) -> None:
+    banner = "!" * 28
+    logger.error(message)
+    print(
+        f"\n{banner}\nROAD MESH ERROR\n{message}\n{banner}\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise RuntimeError(message)
 
 
 def _to_tensor(value, field_name: str) -> torch.Tensor:
@@ -447,7 +459,7 @@ def _blend_mesh_with_outputs(
         return outputs
 
 
-def _initialize_road_mesh(dataset, device, log_dir=None):
+def _initialize_road_mesh(dataset, device, cfg, log_dir=None):
     """
     Initialize road mesh from LiDAR data and road masks, or load from checkpoint.
     
@@ -478,15 +490,23 @@ def _initialize_road_mesh(dataset, device, log_dir=None):
                     logger.info("Road mesh loaded successfully from checkpoint")
                     return road_mesh
                 except Exception as e:
-                    logger.warning(f"Failed to load mesh checkpoint: {e}. Creating new mesh...")
+                    _emit_road_mesh_warning(
+                        f"Failed to load road mesh checkpoint ({mesh_checkpoint_path}): {e}. "
+                        "Cannot continue without a valid road mesh checkpoint."
+                    )
+            _emit_road_mesh_warning(
+                f"No road mesh checkpoint found at {mesh_checkpoint_path}. "
+                "Cannot continue because the run expects a prebuilt road mesh."
+            )
         
         # Step 1: Aggregate LiDAR points in road regions
         logger.info("Step 1: Aggregating LiDAR points from road masks...")
         road_lidar_indices = dataset.get_lidar_indices_from_mask_region(mask_attr="road_masks")
         
         if len(road_lidar_indices) == 0:
-            logger.warning("No LiDAR points found in road regions")
-            return None
+            _emit_road_mesh_warning(
+                "No LiDAR points found in road regions. Road mesh cannot be created."
+            )
         
         road_pts, road_colors = dataset.get_lidar_points_from_mask_region(
             mask_attr="road_masks",
@@ -504,16 +524,22 @@ def _initialize_road_mesh(dataset, device, log_dir=None):
         # Step 2: Create mesh from point cloud
         logger.info("Step 2: Creating 3D mesh from point cloud...")
         cell_size = 0.5  # Grid resolution in meters
+        vertex_selection = getattr(cfg, "road_vertex_selection", "median")
+        rays_per_image = getattr(cfg, "road_rays_per_image", 400000)
+
         road_mesh = RoadMesh.from_pointcloud(
             pts_xyz=pts_xyz,
             colors=colors_arr,
             cell_size=cell_size,
+            vertex_selection=vertex_selection,
             device=device,
         )
         
         if len(road_mesh.vertices) == 0:
-            logger.warning("Failed to create mesh from point cloud")
-            return None
+            _emit_road_mesh_warning(
+                "Road mesh creation produced zero vertices. "
+                "Road mesh cannot be created."
+            )
         
         # Step 3: Initialize texture buffer for RGB projection
         logger.info("Step 3: Initializing texture buffer...")
@@ -526,20 +552,20 @@ def _initialize_road_mesh(dataset, device, log_dir=None):
             projection_stats = road_mesh.project_images_onto_buffer(
                 dataset=dataset,
                 num_frames=None,  # Use all available frames
+                rays_per_image=rays_per_image,
             )
             logger.info(f"Texture projection complete with stats: {projection_stats}")
         except Exception as proj_error:
-            logger.warning(f"Image projection failed (mesh will use default texture): {proj_error}")
-            # Continue even if projection fails - mesh will still render with default texture
+            _emit_road_mesh_warning(
+                f"Road mesh texture projection failed: {proj_error}. "
+                "Road mesh cannot be used."
+            )
         
         logger.info("Road mesh initialization complete!")
         return road_mesh
         
     except Exception as e:
-        logger.error(f"Error during road mesh initialization: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        _emit_road_mesh_warning(f"Error during road mesh initialization: {e}")
 
 
 def build_trainer(dataset, cfg, args, ckpt_to_load=None):
@@ -584,24 +610,16 @@ def build_trainer(dataset, cfg, args, ckpt_to_load=None):
     enable_mesh = not getattr(args, "disable_mesh_road", False)
     
     if enable_mesh:
-        try:
-            logger.info("Initializing road mesh from LiDAR and road masks...")
-            # When training from scratch, do not load an existing road mesh checkpoint.
-            mesh_log_dir = None if getattr(args, "from_scratch", False) else cfg.log_dir
-            if mesh_log_dir is not None:
-                logger.info(f"Road mesh checkpoint directory: {mesh_log_dir}")
-            road_mesh = _initialize_road_mesh(dataset, device, log_dir=mesh_log_dir)
-            
-            if road_mesh is not None:
-                trainer.road_mesh = road_mesh
-                trainer.mesh_blend_alpha = getattr(args, "mesh_blend_alpha", 1.0)
-                logger.info(f"Road mesh successfully integrated into trainer (blend alpha: {trainer.mesh_blend_alpha})")
-            else:
-                logger.warning("Failed to initialize road mesh, continuing without mesh")
-                trainer.road_mesh = None
-        except Exception as e:
-            logger.error(f"Error initializing road mesh: {e}")
-            trainer.road_mesh = None
+        logger.info("Initializing road mesh from LiDAR and road masks...")
+        # When training from scratch, do not load an existing road mesh checkpoint.
+        mesh_log_dir = None if getattr(args, "from_scratch", False) else cfg.log_dir
+        if mesh_log_dir is not None:
+            logger.info(f"Road mesh checkpoint directory: {mesh_log_dir}")
+        road_mesh = _initialize_road_mesh(dataset, device, cfg, log_dir=mesh_log_dir)
+
+        trainer.road_mesh = road_mesh
+        trainer.mesh_blend_alpha = getattr(args, "mesh_blend_alpha", 1.0)
+        logger.info(f"Road mesh successfully integrated into trainer (blend alpha: {trainer.mesh_blend_alpha})")
     else:
         logger.info("Mesh road reconstruction disabled (--disable_mesh_road flag set)")
         trainer.road_mesh = None

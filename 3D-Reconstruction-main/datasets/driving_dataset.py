@@ -1,4 +1,4 @@
-from typing import Dict, Union, Literal
+from typing import Dict, Union, Literal, Iterator
 import logging
 import os
 import cv2
@@ -1001,3 +1001,9 @@ class DrivingDataset(SceneDataset):
         """
         # Call the PixelSource's method
         return self.pixel_source.prepare_novel_view_render_data(self.type, traj)
+
+    def iter_novel_view_render_data(self, traj: torch.Tensor) -> Iterator[dict]:
+        """
+        Lazily prepare per-frame elements for novel view rendering.
+        """
+        return self.pixel_source.iter_novel_view_render_data(self.type, traj)

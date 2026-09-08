@@ -646,13 +646,22 @@ def save_videos(
     return return_frame
 
 
-def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30, traj_type: str = None, save_images: bool = False) -> None:
+def render_novel_views(
+    trainer,
+    render_data: list,
+    save_path: str,
+    fps: int = 30,
+    traj_type: str = None,
+    save_images: bool = False,
+    save_raw: bool = False,
+) -> None:
     """
     Perform rendering and save the result as a video.
     
     Args:
         traj_type (str): Trajectory type parameter
-        save_images (bool): Boolean to enable saving the images in a folder at the same location as the reultant video file.
+        save_images (bool): Save rendered PNGs next to the output video.
+        save_raw (bool): Save raw float RGB arrays (.npy) per frame.
     """
     print("render_novel_views.py:657")
     print("Save images argument:", save_images)
@@ -660,10 +669,11 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
     
     writer = imageio.get_writer(save_path, mode='I', fps=fps)
 
-    # Modification 1: Use trajectory type as subdirectory name
-    raw_output_dir = os.path.join(os.path.dirname(save_path), f"raw_{traj_type}")
-    os.makedirs(raw_output_dir, exist_ok=True)
-    logger.info(f"Created trajectory-specific raw output: {raw_output_dir}")
+    raw_output_dir = None
+    if save_raw:
+        raw_output_dir = os.path.join(os.path.dirname(save_path), f"raw_{traj_type}")
+        os.makedirs(raw_output_dir, exist_ok=True)
+        logger.info(f"Created trajectory-specific raw output: {raw_output_dir}")
     if save_images:
         image_output_dir = os.path.join(os.path.dirname(save_path), f"images_{traj_type}")
         os.makedirs(image_output_dir, exist_ok=True)
@@ -693,21 +703,16 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                     outputs_cpu[k] = v
             del outputs
 
-            # Raw RGB data saving
-            rgb_raw = outputs_cpu["rgb"].numpy()  # Keep original data [H, W, 3]
-
             # Generate unique filename
             frame_idx = frame_data["image_infos"]["frame_idx"][0,0].item()
-
-            # Generate filename
-            raw_rgb_path = os.path.join(
-                raw_output_dir, 
-                f"new_frame{frame_idx:04d}.npy"
-            )
-
-            # Save raw floating point data
-            np.save(raw_rgb_path, rgb_raw)
-            logger.debug(f"Saved raw RGB to {raw_rgb_path}")
+            if save_raw and raw_output_dir is not None:
+                rgb_raw = outputs_cpu["rgb"].numpy()  # Keep original data [H, W, 3]
+                raw_rgb_path = os.path.join(
+                    raw_output_dir,
+                    f"new_frame{frame_idx:04d}.npy"
+                )
+                np.save(raw_rgb_path, rgb_raw)
+                logger.debug(f"Saved raw RGB to {raw_rgb_path}")
 
             # Extract RGB image and mask
             rgb = outputs_cpu["rgb"].numpy().clip(
@@ -725,7 +730,9 @@ def render_novel_views(trainer, render_data: list, save_path: str, fps: int = 30
                 img.save(img_path)
 
             # Explicitly delete CPU outputs and clear cache
-            del outputs_cpu, rgb_raw, rgb, rgb_uint8
+            if save_raw and raw_output_dir is not None:
+                del rgb_raw
+            del outputs_cpu, rgb, rgb_uint8
             torch.cuda.empty_cache()
         writer.close()
         print(f"video_utils.py:706 > Video saved to {save_path}")

@@ -78,6 +78,7 @@ class RoadMesh(nn.Module):
         pts_xyz: np.ndarray,
         colors: Optional[np.ndarray] = None,
         cell_size: float = 1.0,
+        vertex_selection: str = "median",
         device: torch.device = torch.device("cuda"),
     ) -> "RoadMesh":
         """
@@ -87,13 +88,16 @@ class RoadMesh(nn.Module):
             pts_xyz: N x 3 numpy array of point coordinates (x, y, z) in meters
             colors: Optional N x 3 numpy array of RGB colors (0-1 or 0-255 range)
             cell_size: Grid cell size in meters
+            vertex_selection: Representative point choice per cell. Use "median"
+                to pick the lidar point closest to the median Z value, or "lowest"
+                to preserve the previous minimum-height behavior.
             device: PyTorch device for computation
             
         Returns:
             Initialized RoadMesh instance
         """
         vertices, faces, vertex_colors = _create_mesh_from_pointcloud(
-            pts_xyz, colors, cell_size
+            pts_xyz, colors, cell_size, vertex_selection=vertex_selection
         )
         
         mesh = cls(
@@ -184,6 +188,7 @@ class RoadMesh(nn.Module):
         self,
         dataset,
         num_frames: Optional[int] = None,
+        rays_per_image: int = 400000,
     ) -> Dict[str, Any]:
         """
         Project RGB values from dataset images onto the texture buffer.
@@ -224,6 +229,7 @@ class RoadMesh(nn.Module):
                     buffer_metadata=self.texture_metadata,
                     device=self.device,
                     num_frames=num_frames,
+                    rays_per_image=rays_per_image,
                     ray_chunk_size=1024,
                     triangle_chunk_size=4096,
                 )
@@ -237,6 +243,7 @@ class RoadMesh(nn.Module):
                     buffer_metadata=self.texture_metadata,
                     device=self.device,
                     num_frames=num_frames,
+                    rays_per_image=rays_per_image,
                 )
             
             self.texture_buffer = updated_buffer
@@ -354,6 +361,7 @@ def _create_mesh_from_pointcloud(
     pts_xyz: np.ndarray,
     colors: Optional[np.ndarray] = None,
     cell_size: float = 1.0,
+    vertex_selection: str = "median",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create a 3D mesh from point cloud using heightmap-based approach.
@@ -364,6 +372,9 @@ def _create_mesh_from_pointcloud(
         pts_xyz: N x 3 numpy array of point coordinates (x, y, z) in meters
         colors: Optional N x 3 numpy array of RGB colors
         cell_size: Grid cell size in meters
+        vertex_selection: Representative point choice per cell. Use "median"
+            to pick the lidar point closest to the median Z value, or "lowest"
+            to preserve the previous minimum-height behavior.
         
     Returns:
         Tuple of (vertices, faces, vertex_colors) as PyTorch tensors
@@ -375,6 +386,12 @@ def _create_mesh_from_pointcloud(
     
     points = pts_xyz if isinstance(pts_xyz, np.ndarray) else pts_xyz.cpu().numpy()
     colors_arr = colors.copy() if colors is not None and len(colors) > 0 else None
+    vertex_selection = vertex_selection.lower().strip()
+
+    if vertex_selection not in {"median", "lowest", "minimum", "min"}:
+        raise ValueError(
+            f"Unsupported vertex_selection '{vertex_selection}'. Use 'median' or 'lowest'."
+        )
     
     logger.info(f"Creating mesh from {len(points):,} point cloud samples...")
     
@@ -390,17 +407,10 @@ def _create_mesh_from_pointcloud(
     
     logger.info(f"Grid resolution: {num_cells_x} × {num_cells_y} cells (cell size: {cell_size}m)")
     
-    # Create heightmap
-    height_map = np.full((num_cells_x, num_cells_y), np.inf, dtype=np.float64)
-    x_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
-    y_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
-    
-    if colors_arr is not None and len(colors_arr) == len(points):
-        color_map = [np.full((num_cells_x, num_cells_y), -1.0, dtype=np.int32) for _ in range(3)]
-    else:
-        color_map = None
-    
-    # Fill heightmap with minimum z values
+    # Group points by cell so the representative vertex can be selected later.
+    cell_points = {}
+    has_point_colors = colors_arr is not None and len(colors_arr) == len(points)
+
     for i, point in enumerate(points):
         x_idx = int((point[0] - x_min) / scene_width * num_cells_x)
         y_idx = int((point[1] - y_min) / scene_height * num_cells_y)
@@ -408,45 +418,57 @@ def _create_mesh_from_pointcloud(
         x_idx = np.clip(x_idx, 0, num_cells_x - 1)
         y_idx = np.clip(y_idx, 0, num_cells_y - 1)
         
-        z_val = point[2]
-        
-        if z_val < height_map[x_idx, y_idx]:
-            height_map[x_idx, y_idx] = z_val
-            x_coord_map[x_idx, y_idx] = point[0]
-            y_coord_map[x_idx, y_idx] = point[1]
-            
-            if colors_arr is not None:
-                for c in range(3):
-                    color_map[c][x_idx, y_idx] = int(colors_arr[i, c])
-    
-    num_valid_cells = np.sum(~np.isinf(height_map))
+        cell_key = (x_idx, y_idx)
+        cell_points.setdefault(cell_key, []).append(
+            (point, colors_arr[i] if has_point_colors else None)
+        )
+
+    num_valid_cells = len(cell_points)
     logger.info(f"Created {num_valid_cells:,} valid grid cells from point cloud")
     
     if num_valid_cells < 4:
         logger.warning("Insufficient valid cells to create a meaningful mesh")
         return torch.empty(0, 3), torch.empty(0, 3), torch.empty(0, 3)
     
+    def _select_representative_sample(samples):
+        if vertex_selection in {"lowest", "minimum", "min"}:
+            selected_index = min(
+                range(len(samples)),
+                key=lambda idx: float(samples[idx][0][2]),
+            )
+            return samples[selected_index]
+
+        z_values = np.array([sample[0][2] for sample in samples], dtype=np.float64)
+        median_z = float(np.median(z_values))
+        selected_index = min(
+            range(len(samples)),
+            key=lambda idx: (
+                abs(float(samples[idx][0][2]) - median_z),
+                float(samples[idx][0][2]),
+            ),
+        )
+        return samples[selected_index]
+
     # Build vertex and face lists
     height_map_dict = {}
     cell_z_values = []
-    cell_colors_list = [] if color_map is not None else None
-    
+    cell_colors_list = [] if has_point_colors else None
+
     # Identify valid cells
     valid_cells = []
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
-            z_val = height_map[x_idx, y_idx]
-            if not np.isinf(z_val):
+            if (x_idx, y_idx) in cell_points:
                 valid_cells.append((x_idx, y_idx))
-    
+
     # Create vertex mapping
     for i, (x_idx, y_idx) in enumerate(valid_cells):
+        selected_point, selected_color = _select_representative_sample(cell_points[(x_idx, y_idx)])
         height_map_dict[(x_idx, y_idx)] = len(cell_z_values)
-        cell_z_values.append(float(height_map[x_idx, y_idx]))
+        cell_z_values.append(float(selected_point[2]))
         
-        if color_map is not None:
-            mean_color = np.array([color_map[c][x_idx, y_idx] for c in range(3)], dtype=np.float32) / 255.0
-            cell_colors_list.append(mean_color)
+        if cell_colors_list is not None and selected_color is not None:
+            cell_colors_list.append(np.asarray(selected_color, dtype=np.float32))
     
     if len(cell_z_values) == 0:
         logger.warning("No valid cells after filtering")
@@ -486,14 +508,8 @@ def _create_mesh_from_pointcloud(
                 continue
             
             z_height = cell_z_values[height_map_dict[vertex_key]]
-            # Keep world placement faithful to the source LiDAR points.
-            world_x = x_coord_map[x_idx, y_idx]
-            world_y = y_coord_map[x_idx, y_idx]
-            if np.isnan(world_x) or np.isnan(world_y):
-                world_x = x_min + (x_idx / max(num_cells_x - 1, 1)) * scene_width
-                world_y = y_min + (y_idx / max(num_cells_y - 1, 1)) * scene_height
-            
-            final_vertices.append([world_x, world_y, z_height])
+            selected_point = cell_points[vertex_key][0][0]
+            final_vertices.append([float(selected_point[0]), float(selected_point[1]), z_height])
     
     logger.info(f"Created {len(final_vertices):,} mesh vertices in original world space")
     

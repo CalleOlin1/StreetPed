@@ -92,6 +92,19 @@ def parse_args():
         default=None,
         help="Limit how many training images are used for Step 4 ray projection (default: all training images)",
     )
+    parser.add_argument(
+        "--road_vertex_selection",
+        type=str,
+        default="median",
+        choices=["median", "lowest"],
+        help="How to select the representative lidar point per grid cell when building the mesh.",
+    )
+    parser.add_argument(
+        "--road_rays_per_image",
+        type=int,
+        default=400000,
+        help="Maximum number of road-mask rays to cast per image during texture projection.",
+    )
     
     return parser.parse_args()
 
@@ -505,7 +518,8 @@ def create_camera_locations_plot(dataset, output_dir: str = None):
 
 
 def create_mesh_from_pointcloud(pts_xyz: np.ndarray, 
-                                colors: np.ndarray = None):
+                                colors: np.ndarray = None,
+                                vertex_selection: str = "median"):
     """
     Create a 3D mesh from the point cloud using a simpler heightmap-based approach.
     
@@ -513,11 +527,15 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     - Uses x and y ranges of the point cloud to determine scene dimensions
     - Cell size is fixed at 0.2 meters per cell
     - Creates a 2D heightmap array sized (x_range/cell_size) × (y_range/cell_size)
-    - Iterates through points, marking bins with z values while keeping minimum heights
+        - Iterates through points, grouping them by cell and selecting either the median-
+            height or lowest-height representative for each vertex
     
     Args:
         pts_xyz: N x 3 numpy array of point coordinates (x, y, z) in meters
         colors: Optional N x 3 numpy array of RGB colors
+        vertex_selection: Representative point choice per cell. Use "median"
+            to pick the lidar point closest to the median Z value, or "lowest"
+            to preserve the previous minimum-height behavior.
         
     Returns:
         Tuple of (vertices, faces, vertex_colors):
@@ -552,20 +570,17 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     
     logger.info(f"Grid resolution: {num_cells_x} × {num_cells_y} cells (cell size: {cell_size}m)")
     
-    # Create heightmap grid initialized with infinity (user requirement)
-    # Shape is num_cells_x × num_cells_y, storing minimum z values per cell
-    height_map = np.full((num_cells_x, num_cells_y), np.inf, dtype=np.float64)
-    x_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
-    y_coord_map = np.full((num_cells_x, num_cells_y), np.nan, dtype=np.float64)
-    
-    if colors_arr is not None and len(colors_arr) == len(points):
-        color_map = [np.full((num_cells_x, num_cells_y), -1.0, dtype=np.int32) for _ in range(3)]
-    else:
-        color_map = None
-    
-    # Iterate through points to mark bins with z values (user requirement)
-    # Keep lower z values when multiple points fall into same cell
-    logger.info("Iterating through points and marking heightmap cells...")
+    vertex_selection = vertex_selection.lower().strip()
+    if vertex_selection not in {"median", "lowest", "minimum", "min"}:
+        raise ValueError(
+            f"Unsupported vertex_selection '{vertex_selection}'. Use 'median' or 'lowest'."
+        )
+
+    # Collect points per cell so the representative vertex can be selected later.
+    cell_points = {}
+    has_point_colors = colors_arr is not None and len(colors_arr) == len(points)
+
+    logger.info("Iterating through points and grouping heightmap cells...")
     
     for i, point in enumerate(points):
         x_idx = int((point[0] - x_min) / scene_width * num_cells_x)
@@ -575,49 +590,59 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
         x_idx = np.clip(x_idx, 0, num_cells_x - 1)
         y_idx = np.clip(y_idx, 0, num_cells_y - 1)
         
-        z_val = point[2]
-        
-        # Update heightmap if this is a lower (better) z value for this cell
-        if z_val < height_map[x_idx, y_idx]:
-            height_map[x_idx, y_idx] = z_val
-            x_coord_map[x_idx, y_idx] = point[0]
-            y_coord_map[x_idx, y_idx] = point[1]
-            
-            # Store color information if available
-            if colors_arr is not None:
-                for c in range(3):
-                    color_map[c][x_idx, y_idx] = int(colors_arr[i, c])
-    
+        cell_key = (x_idx, y_idx)
+        cell_points.setdefault(cell_key, []).append(
+            (point, colors_arr[i] if has_point_colors else None)
+        )
+
     # Count valid cells (those with actual points)
-    num_valid_cells = np.sum(~np.isinf(height_map))
+    num_valid_cells = len(cell_points)
     logger.info(f"Created {num_valid_cells:,} valid grid cells from point cloud")
     
     if num_valid_cells < 4:
         logger.warning("Insufficient valid cells to create a meaningful mesh")
         return torch.empty(0, 3), torch.empty(0, 3), torch.empty(0, 3)
     
+    def _select_representative_sample(samples):
+        if vertex_selection in {"lowest", "minimum", "min"}:
+            selected_index = min(
+                range(len(samples)),
+                key=lambda idx: float(samples[idx][0][2]),
+            )
+            return samples[selected_index]
+
+        z_values = np.array([sample[0][2] for sample in samples], dtype=np.float64)
+        median_z = float(np.median(z_values))
+        selected_index = min(
+            range(len(samples)),
+            key=lambda idx: (
+                abs(float(samples[idx][0][2]) - median_z),
+                float(samples[idx][0][2]),
+            ),
+        )
+        return samples[selected_index]
+
     # Build lookup table mapping (x_idx, y_idx) -> vertex_index for face building
     height_map_dict = {}
     cell_z_values = []
-    cell_colors_list = [] if color_map is not None else None
+    cell_colors_list = [] if has_point_colors else None
     
     # First pass: identify all valid cells that will become vertices
     # Keep boundary cells too; dropping them removes the outer ring of triangles.
     valid_cells = []
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
-            z_val = height_map[x_idx, y_idx]
-            if not np.isinf(z_val):
+            if (x_idx, y_idx) in cell_points:
                 valid_cells.append((x_idx, y_idx))
     
     # Create mapping from grid position to vertex index
     for i, (x_idx, y_idx) in enumerate(valid_cells):
+        selected_point, selected_color = _select_representative_sample(cell_points[(x_idx, y_idx)])
         height_map_dict[(x_idx, y_idx)] = len(cell_z_values)
-        cell_z_values.append(float(height_map[x_idx, y_idx]))
+        cell_z_values.append(float(selected_point[2]))
         
-        if color_map is not None:
-            mean_color = np.array([color_map[c][x_idx, y_idx] for c in range(3)], dtype=np.float32) / 255.0
-            cell_colors_list.append(mean_color)
+        if cell_colors_list is not None and selected_color is not None:
+            cell_colors_list.append(np.asarray(selected_color, dtype=np.float32))
     
     if len(cell_z_values) == 0:
         logger.warning("No valid cells after boundary filtering")
@@ -655,7 +680,7 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
     
 # Build final vertices with X-Y plane coordinates in original world space (preserving LiDAR coordinate system)
     final_vertices = []
-    row_colors = cell_colors_list if color_map is not None else None
+    row_colors = cell_colors_list if cell_colors_list is not None else None
 
     for x_idx in range(num_cells_x):
         for y_idx in range(num_cells_y):
@@ -666,16 +691,8 @@ def create_mesh_from_pointcloud(pts_xyz: np.ndarray,
                 continue
             
             z_height = cell_z_values[height_map_dict[vertex_key]]
-            
-            # Preserve original world placement by using the stored point coordinates
-            # of the selected minimum-height sample for each occupied grid cell.
-            world_x = x_coord_map[x_idx, y_idx]
-            world_y = y_coord_map[x_idx, y_idx]
-            if np.isnan(world_x) or np.isnan(world_y):
-                world_x = x_min + (x_idx / max(num_cells_x - 1, 1)) * scene_width
-                world_y = y_min + (y_idx / max(num_cells_y - 1, 1)) * scene_height
-            
-            final_vertices.append([world_x, world_y, z_height])
+            selected_point, _ = _select_representative_sample(cell_points[vertex_key])
+            final_vertices.append([float(selected_point[0]), float(selected_point[1]), z_height])
     
     logger.info(f"Created {len(final_vertices):,} mesh vertices in original world space")
     
@@ -779,7 +796,8 @@ def save_pruned_pointcloud_image(pts_xyz: np.ndarray, colors: np.ndarray, output
 
 def create_and_log_mesh(pts_xyz: np.ndarray, 
                         colors: Union[np.ndarray, None] = None,
-                        output_dir: str = ""):
+                        output_dir: str = "",
+                        vertex_selection: str = "median"):
     """
     Create a 3D mesh from the aggregated point cloud and log it.
     
@@ -789,13 +807,18 @@ def create_and_log_mesh(pts_xyz: np.ndarray,
         pts_xyz: N x 3 numpy array of point coordinates (x, y, z) in meters
         colors: Optional N x 3 numpy array of RGB colors (0-1 or 0-255)
         output_dir: Directory to save mesh files and visualizations
+        vertex_selection: Representative point choice per grid cell.
         
     Returns:
         Tuple of (vertices_tensor, faces_tensor, vertex_colors): Mesh components as tensors
     """
     
     # Create the mesh using heightmap-based approach with no Z-axis overlap
-    vertices, faces, vertex_colors = create_mesh_from_pointcloud(pts_xyz, colors)
+    vertices, faces, vertex_colors = create_mesh_from_pointcloud(
+        pts_xyz,
+        colors,
+        vertex_selection=vertex_selection,
+    )
     
     if len(vertices) == 0 or len(faces) == 0:
         logger.warning("Mesh creation failed - insufficient valid points")
@@ -1720,6 +1743,7 @@ def _project_rgb_onto_image_buffer_single_pass(
     device,
     step1_dir=None,
     num_frames=None,
+    rays_per_image=400000,
 ):
     """Project RGB values from road-masked images onto the image buffer using ray casting."""
 
@@ -1887,11 +1911,10 @@ def _project_rgb_onto_image_buffer_single_pass(
                     if len(road_pixel_indices[0]) == 0:
                         continue
                     
-                    rays_per_image = 100000
                     num_road_pixels = len(road_pixel_indices[0])
                     if num_road_pixels > rays_per_image:
                         logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
-                        # Randomly sample up to 100 pixel indices
+                        # Randomly sample up to the configured ray budget.
                         sampled_indices = np.random.choice(num_road_pixels, size=rays_per_image, replace=False)
                         selected_py = road_pixel_indices[0][sampled_indices]
                         selected_px = road_pixel_indices[1][sampled_indices]
@@ -2211,6 +2234,7 @@ def project_rgb_onto_image_buffer(
     device,
     step1_dir=None,
     num_frames=None,
+    rays_per_image=400000,
 ):
     """Run the RGB projection in two passes: low-res preview then full-res refinement."""
     return _run_two_pass_projection(
@@ -2223,6 +2247,7 @@ def project_rgb_onto_image_buffer(
         device,
         step1_dir=step1_dir,
         num_frames=num_frames,
+        rays_per_image=rays_per_image,
     )
 
 
@@ -2235,6 +2260,7 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
     device,
     step1_dir=None,
     num_frames=None,
+    rays_per_image=400000,
     ray_chunk_size=1024,
     triangle_chunk_size=4096,
 ):
@@ -2250,6 +2276,7 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
             device,
             step1_dir=step1_dir,
             num_frames=num_frames,
+            rays_per_image=rays_per_image,
         )
 
     logger.info("\n" + "=" * 60)
@@ -2374,7 +2401,6 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
                         if len(road_pixel_indices[0]) == 0:
                             continue
 
-                        rays_per_image = 100000
                         num_road_pixels = len(road_pixel_indices[0])
                         if num_road_pixels > rays_per_image:
                             logger.info(f"Sampling {rays_per_image} of {num_road_pixels} road pixels (frame {frame_idx}, cam {cam_id})")
@@ -2553,6 +2579,7 @@ def project_rgb_onto_image_buffer_gpu(
     device,
     step1_dir=None,
     num_frames=None,
+    rays_per_image=400000,
     ray_chunk_size=1024,
     triangle_chunk_size=4096,
 ):
@@ -2567,6 +2594,7 @@ def project_rgb_onto_image_buffer_gpu(
         device,
         step1_dir=step1_dir,
         num_frames=num_frames,
+        rays_per_image=rays_per_image,
         ray_chunk_size=ray_chunk_size,
         triangle_chunk_size=triangle_chunk_size,
     )
@@ -3308,7 +3336,8 @@ def main():
         vertices_tensor, faces_tensor, vertex_colors = create_and_log_mesh(
             pts_xyz[:, :3], 
             pts_xyz[:, 3:] if len(pts_xyz) > 0 and pts_xyz.shape[1] >= 6 else None,
-            step1_dir
+            step1_dir,
+            vertex_selection=args.road_vertex_selection,
         )
         
     except Exception as e:
@@ -3444,6 +3473,7 @@ def main():
             device,
             step1_dir,
             num_frames=args.num_projection_frames,
+            rays_per_image=args.road_rays_per_image,
         )
         
         # Log visualization of the projected result

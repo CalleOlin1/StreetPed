@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from omegaconf import OmegaConf
 import os
 import time
@@ -17,6 +17,7 @@ from utils.misc import import_str
 from models.trainers import BasicTrainer
 from models.road_mesh import RoadMesh
 from models.video_utils import render_images, save_videos, render_novel_views, extract_camera_poses_from_dataset, save_camera_poses, analyze_camera_trajectory  
+from utils.geometry import rotation_6d_to_matrix
 
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
@@ -89,6 +90,189 @@ def _load_novel_trajectory_from_file(
     return torch.as_tensor(poses, dtype=torch.float32, device=device)
 
 
+def _log_trajectory_camera_positions(traj_name: str, traj: torch.Tensor) -> None:
+    if traj.ndim == 2 and traj.shape[-1] == 3:
+        positions = traj
+        num_points = positions.shape[0]
+        start_pos = positions[0].detach().cpu().numpy()
+        end_pos = positions[-1].detach().cpu().numpy()
+        message = (
+            f"Trajectory '{traj_name}': {num_points} points | "
+            f"start_xyz=[{start_pos[0]:.6f}, {start_pos[1]:.6f}, {start_pos[2]:.6f}] | "
+            f"end_xyz=[{end_pos[0]:.6f}, {end_pos[1]:.6f}, {end_pos[2]:.6f}]"
+        )
+        logger.info(message)
+        print(message)
+        return
+
+    if traj.ndim != 3 or traj.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"Trajectory '{traj_name}' must have shape [N,4,4] or [N,3], got {tuple(traj.shape)}"
+        )
+    if traj.shape[0] == 0:
+        raise ValueError(f"Trajectory '{traj_name}' is empty")
+
+    start_pos = traj[0, :3, 3].detach().cpu().numpy()
+    end_pos = traj[-1, :3, 3].detach().cpu().numpy()
+    message = (
+        f"Trajectory '{traj_name}': {traj.shape[0]} poses | "
+        f"start_xyz=[{start_pos[0]:.6f}, {start_pos[1]:.6f}, {start_pos[2]:.6f}] | "
+        f"end_xyz=[{end_pos[0]:.6f}, {end_pos[1]:.6f}, {end_pos[2]:.6f}]"
+    )
+    logger.info(message)
+    print(message)
+
+
+def _apply_cam_pose_correction_from_embeds(
+    raw_traj: torch.Tensor,
+    cam_pose_embeds: torch.Tensor,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Apply the checkpoint's per-frame CamPose correction to a raw trajectory."""
+    if raw_traj.ndim != 3 or raw_traj.shape[-2:] != (4, 4):
+        return raw_traj
+    if cam_pose_embeds.ndim != 2 or cam_pose_embeds.shape[-1] != 9:
+        return raw_traj
+
+    device = raw_traj.device if device is None else device
+    raw_traj = raw_traj.to(device=device)
+    cam_pose_embeds = cam_pose_embeds.to(device=device)
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=device, dtype=raw_traj.dtype)
+
+    corrected = raw_traj.clone()
+    with torch.no_grad():
+        for i in range(raw_traj.shape[0]):
+            delta = cam_pose_embeds[i]
+            dx = delta[:3]
+            drot = delta[3:]
+            rot = rotation_6d_to_matrix(drot + identity.expand(1, -1))
+            T = torch.eye(4, device=device, dtype=raw_traj.dtype)
+            T[:3, :3] = rot[0]
+            T[:3, 3] = dx
+            corrected[i] = raw_traj[i] @ T
+    return corrected
+
+
+def _estimate_rigid_alignment_from_reference(
+    source_raw_traj: torch.Tensor,
+    target_dataset_traj: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Estimate a global rigid transform (rotation + translation) from a raw
+    reference trajectory to the dataset-loaded trajectory using normalized-time
+    correspondences.
+    """
+    if source_raw_traj.ndim != 3 or source_raw_traj.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"source_raw_traj must be [N,4,4], got {tuple(source_raw_traj.shape)}"
+        )
+    if target_dataset_traj.ndim != 3 or target_dataset_traj.shape[-2:] != (4, 4):
+        raise ValueError(
+            f"target_dataset_traj must be [N,4,4], got {tuple(target_dataset_traj.shape)}"
+        )
+
+    n_src = source_raw_traj.shape[0]
+    n_dst = target_dataset_traj.shape[0]
+    if n_src <= 0 or n_dst <= 0:
+        raise ValueError("Cannot estimate translation offset from empty trajectories")
+
+    n_pairs = min(max(min(n_src, n_dst), 1), 256)
+    src_idx = (
+        torch.linspace(0, n_src - 1, n_pairs, device=source_raw_traj.device)
+        .round()
+        .long()
+    )
+    dst_idx = (
+        torch.linspace(0, n_dst - 1, n_pairs, device=target_dataset_traj.device)
+        .round()
+        .long()
+    )
+    src_pos = source_raw_traj[src_idx, :3, 3]
+    dst_pos = target_dataset_traj[dst_idx, :3, 3]
+    src_centroid = src_pos.mean(dim=0)
+    dst_centroid = dst_pos.mean(dim=0)
+    src_centered = src_pos - src_centroid
+    dst_centered = dst_pos - dst_centroid
+
+    covariance = src_centered.transpose(0, 1) @ dst_centered
+    u, _, vh = torch.linalg.svd(covariance)
+    rotation = vh.transpose(0, 1) @ u.transpose(0, 1)
+    if torch.det(rotation) < 0:
+        vh[-1, :] *= -1
+        rotation = vh.transpose(0, 1) @ u.transpose(0, 1)
+    translation = dst_centroid - rotation @ src_centroid
+    return rotation, translation
+
+
+def _log_post_transform_alignment_stats(
+    aligned_source_traj: torch.Tensor,
+    target_dataset_traj: torch.Tensor,
+    source_name: str = "source",
+    target_name: str = "target",
+) -> None:
+    if aligned_source_traj.ndim != 3 or aligned_source_traj.shape[-2:] != (4, 4):
+        return
+    if target_dataset_traj.ndim != 3 or target_dataset_traj.shape[-2:] != (4, 4):
+        return
+
+    n_src = aligned_source_traj.shape[0]
+    n_dst = target_dataset_traj.shape[0]
+    n_pairs = min(max(min(n_src, n_dst), 1), 256)
+    src_idx = (
+        torch.linspace(0, n_src - 1, n_pairs, device=aligned_source_traj.device)
+        .round()
+        .long()
+    )
+    dst_idx = (
+        torch.linspace(0, n_dst - 1, n_pairs, device=target_dataset_traj.device)
+        .round()
+        .long()
+    )
+
+    src_pos = aligned_source_traj[src_idx, :3, 3]
+    dst_pos = target_dataset_traj[dst_idx, :3, 3].to(device=src_pos.device, dtype=src_pos.dtype)
+    displacement = dst_pos - src_pos
+    displacement_norm = torch.linalg.norm(displacement, dim=-1)
+
+    src_rot = aligned_source_traj[src_idx, :3, :3]
+    dst_rot = target_dataset_traj[dst_idx, :3, :3].to(device=src_rot.device, dtype=src_rot.dtype)
+    relative_rot = torch.matmul(dst_rot, src_rot.transpose(-1, -2))
+    trace = relative_rot[:, 0, 0] + relative_rot[:, 1, 1] + relative_rot[:, 2, 2]
+    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    rotation_angle_deg = torch.rad2deg(torch.acos(cos_theta))
+
+    stats_msg = (
+        f"Post-transform alignment residuals {source_name} -> {target_name}: "
+        f"mean_displacement={displacement_norm.mean().item():.6f} m, "
+        f"std_displacement={displacement_norm.std(unbiased=False).item():.6f} m, "
+        f"mean_rotational_displacement={rotation_angle_deg.mean().item():.6f} deg, "
+        f"std_rotational_displacement={rotation_angle_deg.std(unbiased=False).item():.6f} deg"
+    )
+    logger.info(stats_msg)
+    print(stats_msg)
+
+
+def _apply_rigid_alignment_to_trajectory(
+    traj: torch.Tensor,
+    rotation: torch.Tensor,
+    translation: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a global rigid transform to all poses in trajectory."""
+    if traj.ndim != 3 or traj.shape[-2:] != (4, 4):
+        raise ValueError(f"traj must be [N,4,4], got {tuple(traj.shape)}")
+    aligned = traj.clone()
+    rotation = rotation.to(device=traj.device, dtype=traj.dtype)
+    translation = translation.to(
+        device=traj.device, dtype=traj.dtype
+    )
+    aligned[:, :3, :3] = torch.matmul(rotation.unsqueeze(0), aligned[:, :3, :3])
+    aligned[:, :3, 3] = (
+        torch.matmul(rotation, aligned[:, :3, 3].transpose(0, 1)).transpose(0, 1)
+        + translation
+    )
+    return aligned
+
+
 def apply_render_frame_limit(dataset: DrivingDataset, max_render_frames: Optional[int]) -> Optional[int]:
     if max_render_frames is None:
         return None
@@ -127,6 +311,7 @@ def do_evaluation(
     extract_camera_poses: bool = True,  # new parameter
     max_render_frames: Optional[int] = None,
     trajectory_file: Optional[str] = None,
+    original_trajectory_raw: Optional[str] = None,
     output_root: Optional[str] = None,
 ):
     print("Save images is", args.save_images)
@@ -313,6 +498,57 @@ def do_evaluation(
             loaded_traj = _load_novel_trajectory_from_file(
                 trajectory_file, device=dataset.pixel_source.device
             )
+            _log_trajectory_camera_positions("file_trajectory_raw", loaded_traj)
+            ref_cam_id = dataset.pixel_source.camera_list[0]
+            reference_traj = dataset.pixel_source.camera_data[ref_cam_id].cam_to_worlds.to(
+                loaded_traj.device
+            )
+
+            if original_trajectory_raw is not None:
+                raw_reference_traj = _load_novel_trajectory_from_file(
+                    original_trajectory_raw, device=dataset.pixel_source.device
+                )
+                rotation_offset, translation_offset = _estimate_rigid_alignment_from_reference(
+                    source_raw_traj=raw_reference_traj,
+                    target_dataset_traj=reference_traj,
+                )
+                offset_msg = (
+                    "Estimated trajectory rigid alignment "
+                    f"[r00={rotation_offset[0, 0].item():.6f}, "
+                    f"r01={rotation_offset[0, 1].item():.6f}, "
+                    f"r02={rotation_offset[0, 2].item():.6f}, "
+                    f"r10={rotation_offset[1, 0].item():.6f}, "
+                    f"r11={rotation_offset[1, 1].item():.6f}, "
+                    f"r12={rotation_offset[1, 2].item():.6f}, "
+                    f"r20={rotation_offset[2, 0].item():.6f}, "
+                    f"r21={rotation_offset[2, 1].item():.6f}, "
+                    f"r22={rotation_offset[2, 2].item():.6f}; "
+                    f"[dx={translation_offset[0].item():.6f}, "
+                    f"dy={translation_offset[1].item():.6f}, "
+                    f"dz={translation_offset[2].item():.6f}]"
+                )
+                logger.info(offset_msg)
+                print(offset_msg)
+                loaded_traj = _apply_rigid_alignment_to_trajectory(
+                    loaded_traj,
+                    rotation_offset,
+                    translation_offset,
+                )
+                _log_post_transform_alignment_stats(
+                    aligned_source_traj=_apply_rigid_alignment_to_trajectory(
+                        raw_reference_traj,
+                        rotation_offset,
+                        translation_offset,
+                    ),
+                    target_dataset_traj=reference_traj,
+                    source_name=os.path.splitext(os.path.basename(original_trajectory_raw))[0],
+                    target_name=f"dataset_cam_{ref_cam_id}",
+                )
+                _log_trajectory_camera_positions("file_trajectory_aligned", loaded_traj)
+            else:
+                logger.info(
+                    "No --original_trajectory_raw provided; using trajectory_file poses without rigid alignment."
+                )
             traj_name = os.path.splitext(os.path.basename(trajectory_file))[0]
             render_traj = {f"file_{traj_name}": loaded_traj}
             logger.info(
@@ -328,8 +564,9 @@ def do_evaluation(
             os.makedirs(video_output_dir)
 
         for traj_type, traj in render_traj.items():
-            # Prepare rendering data
-            render_data = dataset.prepare_novel_view_render_data(traj)
+            _log_trajectory_camera_positions(traj_type, traj)
+            # Prepare rendering data lazily to avoid materializing all frames in memory.
+            render_data = dataset.iter_novel_view_render_data(traj)
 
             # Render and save video
             save_path = os.path.join(video_output_dir, f"{traj_type}.mp4")
@@ -377,6 +614,23 @@ def main(args):
 
     # build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
+    original_train_traj = dataset.pixel_source.front_camera_trajectory
+    _log_trajectory_camera_positions("training_original_trajectory", original_train_traj)
+
+    # Log the corrected trajectory that the checkpoint's CamPose module applies on top.
+    ckpt_state = torch.load(args.resume_from, map_location="cpu")
+    cam_pose = ckpt_state.get("models", {}).get("CamPose", {})
+    cam_pose_embeds = cam_pose.get("embeds.weight", None)
+    if cam_pose_embeds is not None:
+        corrected_train_traj = _apply_cam_pose_correction_from_embeds(
+            raw_traj=original_train_traj,
+            cam_pose_embeds=cam_pose_embeds,
+            device=original_train_traj.device,
+        )
+        _log_trajectory_camera_positions(
+            "training_original_trajectory_corrected_by_CamPose",
+            corrected_train_traj,
+        )
 
     # setup trainer
     trainer = import_str(cfg.trainer.type)(
@@ -446,6 +700,7 @@ def main(args):
         post_fix="_eval"+args.render_video_postfix,
         max_render_frames=max_render_frames,
         trajectory_file=args.trajectory_file,
+        original_trajectory_raw=args.original_trajectory_raw,
         output_root=ckpt_dir,
     )
 
@@ -499,6 +754,15 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="path to a .npy/.npz camera trajectory file used for novel-view rendering",
+    )
+    parser.add_argument(
+        "--original_trajectory_raw",
+        type=str,
+        default=None,
+        help=(
+            "path to the raw training trajectory (.npy/.npz) used as reference to estimate "
+            "a translation offset into the dataset-loaded frame"
+        ),
     )
     parser.add_argument(
         "--lazy_dataset",

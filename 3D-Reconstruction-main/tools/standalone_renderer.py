@@ -7,6 +7,7 @@ from datasets.base.pixel_source import get_rays
 
 import argparse
 import pickle
+import sys
 from omegaconf import OmegaConf
 from PIL import Image
 from utils.misc import import_str
@@ -15,6 +16,19 @@ from models.road_mesh import RoadMesh
 
 
 _ROAD_MASK_WARNING_EMITTED = False
+_ROAD_MESH_MISSING_WARNING_EMITTED = False
+_ROAD_MESH_OUTPUT_WARNING_EMITTED = False
+
+
+def _emit_road_mesh_warning(message: str) -> None:
+    banner = "!" * 28
+    logger.error(message)
+    print(
+        f"\n{banner}\nROAD MESH ERROR\n{message}\n{banner}\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise RuntimeError(message)
 
 
 def _to_binary_mask(opacity_tensor: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
@@ -42,7 +56,10 @@ def _restore_textured_road_mesh(trainer, ckpt_dir: str) -> None:
     """Restore the textured road mesh from the dedicated mesh checkpoint if available."""
     mesh_checkpoint_path = os.path.join(ckpt_dir, "road_mesh.pth")
     if not os.path.exists(mesh_checkpoint_path):
-        logger.warning("No road mesh checkpoint found at %s", mesh_checkpoint_path)
+        _emit_road_mesh_warning(
+            f"No road mesh checkpoint found at {mesh_checkpoint_path}. "
+            "Novel renders cannot continue without textured road mesh."
+        )
         return
 
     try:
@@ -52,8 +69,16 @@ def _restore_textured_road_mesh(trainer, ckpt_dir: str) -> None:
             mesh_checkpoint_path,
             trainer.road_mesh.texture_buffer is not None,
         )
+        if trainer.road_mesh.texture_buffer is None:
+            _emit_road_mesh_warning(
+                "Road mesh checkpoint loaded, but texture_buffer is empty. "
+                "Road mesh may render without expected texture detail."
+            )
     except Exception as exc:
-        logger.warning("Failed to load textured road mesh from %s: %s", mesh_checkpoint_path, exc)
+        _emit_road_mesh_warning(
+            f"Failed to load textured road mesh from {mesh_checkpoint_path}: {exc}. "
+            "Novel renders will continue without road mesh."
+        )
 
 def render_single_offset_novel_view(
     dataset,
@@ -62,6 +87,8 @@ def render_single_offset_novel_view(
     lateral_offset_m: float,
 ):
     global _ROAD_MASK_WARNING_EMITTED
+    global _ROAD_MESH_MISSING_WARNING_EMITTED
+    global _ROAD_MESH_OUTPUT_WARNING_EMITTED
     # This code should shift the camera left by lateral_offset_m meters.
     pixel_source = dataset.pixel_source
     cam0 = pixel_source.camera_data[0]
@@ -97,6 +124,13 @@ def render_single_offset_novel_view(
         bool(getattr(trainer, "road_mesh", None) is not None),
         getattr(trainer, "mesh_blend_alpha", None),
     )
+
+    if getattr(trainer, "road_mesh", None) is None and not _ROAD_MESH_MISSING_WARNING_EMITTED:
+        _emit_road_mesh_warning(
+            "Trainer has no road_mesh attached at render time. "
+            "Synthetic novel renders will exclude road mesh compositing."
+        )
+        _ROAD_MESH_MISSING_WARNING_EMITTED = True
 
     H, W = cam0.HEIGHT, cam0.WIDTH
     x, y = torch.meshgrid(
@@ -150,6 +184,12 @@ def render_single_offset_novel_view(
             )
         elif getattr(trainer, "road_mesh", None) is not None:
             logger.warning("Trainer has a road_mesh, but the forward pass did not return road_mesh_rgb.")
+            if not _ROAD_MESH_OUTPUT_WARNING_EMITTED:
+                _emit_road_mesh_warning(
+                    "road_mesh is attached, but forward pass did not emit road_mesh_rgb. "
+                    "Check mesh initialization/compositing path."
+                )
+                _ROAD_MESH_OUTPUT_WARNING_EMITTED = True
         if "road_mesh_opacity" in novel_outputs and isinstance(novel_outputs["road_mesh_opacity"], torch.Tensor):
             road_mesh_opacity_tensor = novel_outputs["road_mesh_opacity"].detach()
             logger.info(
@@ -163,6 +203,12 @@ def render_single_offset_novel_view(
             logger.warning(
                 "Trainer has a road_mesh, but the forward pass did not return road_mesh_opacity/road_mesh_rgb."
             )
+            if not _ROAD_MESH_OUTPUT_WARNING_EMITTED:
+                _emit_road_mesh_warning(
+                    "road_mesh is attached, but forward pass did not emit road_mesh_opacity/road_mesh_rgb. "
+                    "Rendered output may silently miss mesh contribution."
+                )
+                _ROAD_MESH_OUTPUT_WARNING_EMITTED = True
         rendered_rgb = novel_outputs["rgb"].detach().cpu()
         background_rgb = novel_outputs.get("Background_rgb", None)
         sky_rgb = novel_outputs.get("rgb_sky", None)
@@ -253,6 +299,11 @@ def cli_render_novel_sample():
     )
     minimal_trainer.resume_from_checkpoint(ckpt_path=ckpt_path, load_only_model=True)
     _restore_textured_road_mesh(minimal_trainer, ckpt_dir)
+    if getattr(minimal_trainer, "road_mesh", None) is None:
+        _emit_road_mesh_warning(
+            "Checkpoint resumed without an attached road_mesh after restore step. "
+            "This render run will proceed without road mesh."
+        )
     logger.info(
         "Checkpoint loaded: has_road_mesh=%s mesh_blend_alpha_before_set=%s",
         bool(getattr(minimal_trainer, "road_mesh", None) is not None),
@@ -313,6 +364,11 @@ def cli_render_novel_sample_list():
     )
     minimal_trainer.resume_from_checkpoint(ckpt_path=ckpt_path, load_only_model=True)
     _restore_textured_road_mesh(minimal_trainer, ckpt_dir)
+    if getattr(minimal_trainer, "road_mesh", None) is None:
+        _emit_road_mesh_warning(
+            "Checkpoint resumed without an attached road_mesh after restore step. "
+            "Batch novel renders will proceed without road mesh."
+        )
     logger.info(
         "Checkpoint loaded for list render: has_road_mesh=%s mesh_blend_alpha_before_set=%s",
         bool(getattr(minimal_trainer, "road_mesh", None) is not None),
