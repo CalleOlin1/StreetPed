@@ -1,4 +1,12 @@
+from pathlib import Path
 from typing import List, Optional, Tuple
+import sys
+
+# Make repository-local packages importable when invoked as ``python tools/eval.py``.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from omegaconf import OmegaConf
 import os
 import time
@@ -37,6 +45,37 @@ def _restore_textured_road_mesh(trainer: BasicTrainer, checkpoint_dir: str):
             logger.warning(f"Failed to load textured road mesh from {road_mesh_path}: {e}")
     else:
         logger.debug(f"Road mesh texture file not found: {road_mesh_path}")
+
+
+@torch.no_grad()
+def hold_last_dynamic_node_states(trainer: BasicTrainer) -> None:
+    """Keep each instance's last valid state for later evaluation timestamps.
+
+    This only changes the loaded model in memory. Earlier visibility gaps and
+    checkpoints on disk are left as they are.
+    """
+    for class_name in ("RigidNodes", "DeformableNodes", "SMPLNodes"):
+        if class_name not in trainer.models:
+            continue
+        model = trainer.models[class_name]
+        frame_valid = model.instances_fv
+        pose_names = ["instances_trans", "instances_quats"]
+        if class_name == "SMPLNodes":
+            pose_names.append("smpl_qauts")
+        held_instances = 0
+        for instance_id in range(frame_valid.shape[1]):
+            valid_frames = torch.nonzero(frame_valid[:, instance_id], as_tuple=True)[0]
+            if valid_frames.numel() == 0:
+                continue
+            last_frame = int(valid_frames[-1])
+            if last_frame == frame_valid.shape[0] - 1:
+                continue
+            for pose_name in pose_names:
+                pose = getattr(model, pose_name)
+                pose[last_frame + 1:, instance_id] = pose[last_frame, instance_id].clone()
+            frame_valid[last_frame + 1:, instance_id] = True
+            held_instances += 1
+        logger.info("Held final state for %d %s instances", held_instances, class_name)
 
 
 
@@ -88,6 +127,103 @@ def _load_novel_trajectory_from_file(
         )
 
     return torch.as_tensor(poses, dtype=torch.float32, device=device)
+
+
+def load_custom_ego_trajectory(
+    dataset: DrivingDataset,
+    ego_pose_dir: str,
+    camera_id: int = 0,
+    extrinsics_path: Optional[str] = None,
+    ego_lateral_position: Optional[float] = None,
+) -> torch.Tensor:
+    """Convert an on-disk ego trajectory to the model's camera coordinates.
+
+    CARLA novel-view exports keep the vehicle trajectory in ``ego_pose`` and
+    encode the camera offset (for example, ``right_4m``) in
+    ``extrinsics/0.txt``. Training poses are relative to the first ego pose,
+    so apply the same normalization and camera extrinsic as the data loader.
+    """
+    pose_dir = Path(ego_pose_dir).expanduser().resolve()
+    if not pose_dir.is_dir():
+        raise FileNotFoundError(f"Custom ego-pose directory does not exist: {pose_dir}")
+
+    pose_paths = sorted(
+        pose_dir.glob("*.txt"),
+        key=lambda path: (
+            0 if path.stem.isdigit() else 1,
+            int(path.stem) if path.stem.isdigit() else path.stem,
+        ),
+    )
+    if not pose_paths:
+        raise ValueError(f"No .txt pose files found in {pose_dir}")
+
+    if extrinsics_path is None:
+        exported_extrinsics = pose_dir.parent / "extrinsics" / f"{camera_id}.txt"
+        scene_extrinsics = Path(dataset.data_path) / "extrinsics" / f"{camera_id}.txt"
+        extrinsics_file = (
+            exported_extrinsics if exported_extrinsics.is_file() else scene_extrinsics
+        )
+    else:
+        extrinsics_file = Path(extrinsics_path).expanduser().resolve()
+    if not extrinsics_file.is_file():
+        raise FileNotFoundError(f"Camera extrinsics do not exist: {extrinsics_file}")
+
+    origin_path = (
+        Path(dataset.data_path) / "ego_pose" / f"{dataset.start_timestep:03d}.txt"
+    )
+    if not origin_path.is_file():
+        raise FileNotFoundError(f"Training trajectory origin does not exist: {origin_path}")
+    origin_from_world = np.linalg.inv(np.loadtxt(origin_path))
+    camera_to_ego = np.loadtxt(extrinsics_file)
+    if camera_to_ego.shape != (4, 4):
+        raise ValueError(
+            f"Expected 4x4 camera extrinsics in {extrinsics_file}, "
+            f"got {camera_to_ego.shape}"
+        )
+    if ego_lateral_position is not None:
+        camera_to_ego = camera_to_ego.copy()
+        camera_to_ego[1, 3] = ego_lateral_position
+        logger.info(
+            "Overriding camera ego-Y position with %.3f m (positive is left)",
+            ego_lateral_position,
+        )
+
+    trajectory = []
+    for pose_path in pose_paths:
+        ego_to_world = np.loadtxt(pose_path)
+        if ego_to_world.shape != (4, 4):
+            raise ValueError(
+                f"Expected a 4x4 pose matrix in {pose_path}, got {ego_to_world.shape}"
+            )
+        trajectory.append(origin_from_world @ ego_to_world @ camera_to_ego)
+
+    logger.info(
+        "Loaded %d custom poses from %s with extrinsics %s",
+        len(trajectory),
+        pose_dir,
+        extrinsics_file,
+    )
+    return torch.from_numpy(np.stack(trajectory)).float()
+
+
+def resolve_custom_trajectory(
+    args: argparse.Namespace, dataset: DrivingDataset
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve an explicit ego-pose directory or a named per-scene export."""
+    if args.custom_ego_pose_dir:
+        pose_dir = Path(args.custom_ego_pose_dir)
+        default_name = pose_dir.parent.name
+    elif args.custom_trajectory_name:
+        pose_dir = (
+            Path(dataset.data_path)
+            / "novel_views"
+            / args.custom_trajectory_name
+            / "ego_pose"
+        )
+        default_name = args.custom_trajectory_name
+    else:
+        return None, None
+    return str(pose_dir), args.custom_trajectory_label or default_name
 
 
 def _log_trajectory_camera_positions(traj_name: str, traj: torch.Tensor) -> None:
@@ -159,8 +295,9 @@ def _estimate_rigid_alignment_from_reference(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Estimate a global rigid transform (rotation + translation) from a raw
-    reference trajectory to the dataset-loaded trajectory using normalized-time
-    correspondences.
+    reference trajectory to the dataset-loaded trajectory using corresponding
+    camera poses. Camera orientations determine the rotation even when the
+    camera positions follow a nearly straight path.
     """
     if source_raw_traj.ndim != 3 or source_raw_traj.shape[-2:] != (4, 4):
         raise ValueError(
@@ -174,7 +311,7 @@ def _estimate_rigid_alignment_from_reference(
     n_src = source_raw_traj.shape[0]
     n_dst = target_dataset_traj.shape[0]
     if n_src <= 0 or n_dst <= 0:
-        raise ValueError("Cannot estimate translation offset from empty trajectories")
+        raise ValueError("Cannot align empty trajectories")
 
     n_pairs = min(max(min(n_src, n_dst), 1), 256)
     src_idx = (
@@ -189,18 +326,18 @@ def _estimate_rigid_alignment_from_reference(
     )
     src_pos = source_raw_traj[src_idx, :3, 3]
     dst_pos = target_dataset_traj[dst_idx, :3, 3]
-    src_centroid = src_pos.mean(dim=0)
-    dst_centroid = dst_pos.mean(dim=0)
-    src_centered = src_pos - src_centroid
-    dst_centered = dst_pos - dst_centroid
+    src_rot = source_raw_traj[src_idx, :3, :3]
+    dst_rot = target_dataset_traj[dst_idx, :3, :3]
 
-    covariance = src_centered.transpose(0, 1) @ dst_centered
-    u, _, vh = torch.linalg.svd(covariance)
-    rotation = vh.transpose(0, 1) @ u.transpose(0, 1)
-    if torch.det(rotation) < 0:
-        vh[-1, :] *= -1
-        rotation = vh.transpose(0, 1) @ u.transpose(0, 1)
-    translation = dst_centroid - rotation @ src_centroid
+    # Each matching pose implies dst_rot = rotation @ src_rot. Average those
+    # relative rotations and project the result onto SO(3). Position-only SVD
+    # leaves roll around a straight trajectory unconstrained.
+    relative_rotations = dst_rot @ src_rot.transpose(-1, -2)
+    u, _, vh = torch.linalg.svd(relative_rotations.mean(dim=0))
+    correction = torch.eye(3, device=u.device, dtype=u.dtype)
+    correction[-1, -1] = torch.det(u @ vh).sign()
+    rotation = u @ correction @ vh
+    translation = dst_pos.mean(dim=0) - rotation @ src_pos.mean(dim=0)
     return rotation, translation
 
 
@@ -587,6 +724,40 @@ def do_evaluation(
                 f"Saved novel view video for trajectory type: {traj_type} to {save_path}"
             )
 
+    custom_pose_dir, custom_traj_name = resolve_custom_trajectory(args, dataset)
+    if custom_pose_dir is not None:
+        logger.info("Rendering custom trajectory %s...", custom_traj_name)
+        custom_traj = load_custom_ego_trajectory(
+            dataset=dataset,
+            ego_pose_dir=custom_pose_dir,
+            camera_id=args.custom_camera_id,
+            extrinsics_path=args.custom_extrinsics,
+            ego_lateral_position=args.custom_ego_lateral_position,
+        ).to(dataset.pixel_source.device)
+        _log_trajectory_camera_positions(custom_traj_name, custom_traj)
+        if len(custom_traj) != dataset.frame_num:
+            logger.warning(
+                "Custom trajectory has %d poses but the scene has %d frames; "
+                "timestamps will be linearly mapped across the trained sequence.",
+                len(custom_traj),
+                dataset.frame_num,
+            )
+
+        render_data = dataset.iter_novel_view_render_data(custom_traj)
+        video_output_dir = f"{output_root}/videos{post_fix}/novel_{step}"
+        os.makedirs(video_output_dir, exist_ok=True)
+        save_path = os.path.join(video_output_dir, f"{custom_traj_name}.mp4")
+        render_novel_views(
+            trainer,
+            render_data,
+            save_path,
+            fps=args.custom_trajectory_fps or cfg.render.fps,
+            traj_type=custom_traj_name,
+            save_raw=args.custom_save_raw_frames,
+            save_images=args.custom_save_images,
+        )
+        logger.info("Saved custom trajectory video to %s", save_path)
+
 
 def main(args):
     ckpt_dir = os.path.dirname(args.resume_from)
@@ -598,8 +769,22 @@ def main(args):
         os.makedirs(os.path.join(ckpt_dir, folder), exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    has_custom_trajectory = bool(
+        args.custom_ego_pose_dir or args.custom_trajectory_name
+    )
+    if has_custom_trajectory:
+        render_downscale = float(args.custom_render_downscale)
+        if render_downscale <= 0:
+            raise ValueError("--custom_render_downscale must be greater than zero")
+        camera_count = len(cfg.data.pixel_source.cameras)
+        cfg.data.pixel_source.downscale_when_loading = [render_downscale] * camera_count
+        logger.info(
+            "Custom trajectory render: using source image resolution with downscale %.3g.",
+            render_downscale,
+        )
     lazy_dataset_mode = args.lazy_dataset or (
-        args.skip_original_render and args.trajectory_file is not None
+        args.skip_original_render
+        and (args.trajectory_file is not None or has_custom_trajectory)
     )
     if lazy_dataset_mode:
         logger.info("Using lazy dataset mode for eval.")
@@ -607,10 +792,16 @@ def main(args):
         cfg.data.pixel_source.load_rgb_images = False
         cfg.data.pixel_source.load_dynamic_mask = False
         cfg.data.pixel_source.load_sky_mask = False
+        if "load_road_mask" in cfg.data.pixel_source:
+            cfg.data.pixel_source.load_road_mask = False
         if cfg.render.render_test:
             logger.info("Disabling test-set rendering in lazy dataset mode.")
             cfg.render.render_test = False
         cfg.render.render_full = False
+    if args.skip_lidar:
+        logger.info("Skipping LiDAR loading; using camera-derived scene bounds for eval.")
+        cfg.data.lidar_source.load_lidar = False
+        cfg.data.project_lidar_on_images = False
 
     # build dataset
     dataset = DrivingDataset(data_cfg=cfg.data)
@@ -649,6 +840,8 @@ def main(args):
     logger.info(
         f"Resuming training from {args.resume_from}, starting at step {trainer.step}"
     )
+    if args.hold_dynamic_nodes:
+        hold_last_dynamic_node_states(trainer)
     
     # Restore textured road mesh if available
     _restore_textured_road_mesh(trainer, ckpt_dir)
@@ -702,6 +895,7 @@ def main(args):
         trajectory_file=args.trajectory_file,
         original_trajectory_raw=args.original_trajectory_raw,
         output_root=ckpt_dir,
+        extract_camera_poses=not args.skip_original_render,
     )
 
     if args.enable_viewer:
@@ -744,6 +938,11 @@ if __name__ == "__main__":
         help="Skips running some metrics as well as rendering the original viewpoint.",
     )
     parser.add_argument(
+        "--hold_dynamic_nodes",
+        action="store_true",
+        help="Hold each rigid, deformable, and SMPL instance at its last valid state through later render frames.",
+    )
+    parser.add_argument(
         "--max_render_frames",
         type=int,
         default=None,
@@ -761,13 +960,88 @@ if __name__ == "__main__":
         default=None,
         help=(
             "path to the raw training trajectory (.npy/.npz) used as reference to estimate "
-            "a translation offset into the dataset-loaded frame"
+            "a rigid transform into the dataset-loaded frame"
         ),
+    )
+    custom_trajectory_group = parser.add_mutually_exclusive_group()
+    custom_trajectory_group.add_argument(
+        "--custom_trajectory_name",
+        type=str,
+        default=None,
+        help=(
+            "Per-scene trajectory name resolved as "
+            "<scene>/novel_views/<name>/ego_pose (for example: right_4m)."
+        ),
+    )
+    custom_trajectory_group.add_argument(
+        "--custom_ego_pose_dir",
+        type=str,
+        default=None,
+        help="Explicit directory containing numbered 4x4 ego-pose .txt files.",
+    )
+    parser.add_argument(
+        "--custom_extrinsics",
+        type=str,
+        default=None,
+        help=(
+            "Camera-to-ego extrinsics for the custom trajectory. Defaults to "
+            "the calibration beside ego_pose, then the scene calibration."
+        ),
+    )
+    parser.add_argument(
+        "--custom_camera_id",
+        type=int,
+        default=0,
+        help="Camera calibration ID used for the custom trajectory (default: 0).",
+    )
+    parser.add_argument(
+        "--custom_ego_lateral_position",
+        type=float,
+        default=None,
+        metavar="METERS",
+        help="Override camera translation along ego Y (positive is left).",
+    )
+    parser.add_argument(
+        "--custom_trajectory_label",
+        type=str,
+        default=None,
+        help="Optional output filename stem for the custom trajectory.",
+    )
+    parser.add_argument(
+        "--custom_trajectory_fps",
+        type=int,
+        default=None,
+        help="Override FPS for the custom trajectory video.",
+    )
+    parser.add_argument(
+        "--custom_render_downscale",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help=(
+            "Custom-trajectory output downscale relative to source images "
+            "(default: 1, full source resolution)."
+        ),
+    )
+    parser.add_argument(
+        "--custom_save_raw_frames",
+        action="store_true",
+        help="Also save raw per-frame outputs for the custom trajectory.",
+    )
+    parser.add_argument(
+        "--custom_save_images",
+        action="store_true",
+        help="Save every custom-trajectory RGB frame as a PNG image.",
     )
     parser.add_argument(
         "--lazy_dataset",
         action="store_true",
         help="skip loading RGB images/masks and image-based lidar projection; best for trajectory-only novel rendering",
+    )
+    parser.add_argument(
+        "--skip-lidar",
+        action="store_true",
+        help="Skip LiDAR loading and use camera-derived scene bounds (for renders that do not need LiDAR).",
     )
 
     # viewer

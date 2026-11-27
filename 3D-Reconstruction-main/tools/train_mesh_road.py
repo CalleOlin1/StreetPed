@@ -33,6 +33,7 @@ import logging
 from typing import Union, Tuple
 
 import numpy as np
+import cv2
 from tqdm import tqdm
 import torch
 from omegaconf import OmegaConf
@@ -1366,20 +1367,44 @@ def save_texture_buffer_as_png(buffer: np.ndarray, output_path: str) -> None:
         logger.error(f"Failed to save texture image: {e}")
 
 
-def _resize_texture_buffer(buffer: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Resize a texture buffer while preserving normalized RGB values."""
-    if buffer.shape[:2] == (height, width):
-        return np.asarray(buffer, dtype=np.float32).copy()
+def _resize_texture_buffer(
+    buffer: np.ndarray,
+    width: int,
+    height: int,
+    destination: np.ndarray = None,
+) -> np.ndarray:
+    """Resize a float texture without full-size format-conversion copies.
 
-    from PIL import Image
+    When ``destination`` is supplied, OpenCV writes directly into that array.
+    This lets the two-pass projection reuse its original target allocation when
+    upscaling the preview instead of retaining a backup plus a new target.
+    """
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    source = np.asarray(buffer, dtype=np.float32)
 
-    buffer_uint8 = np.clip(buffer * 255.0, 0, 255).astype(np.uint8)
-    resampling = getattr(Image, "Resampling", Image)
-    resized = Image.fromarray(buffer_uint8, mode="RGB").resize(
-        (max(int(width), 1), max(int(height), 1)),
-        resample=resampling.BILINEAR,
+    if destination is not None:
+        if destination.shape != (height, width, source.shape[2]):
+            raise ValueError(
+                f"Resize destination has shape {destination.shape}; expected "
+                f"{(height, width, source.shape[2])}"
+            )
+        if destination.dtype != np.float32:
+            raise ValueError("Resize destination must have dtype float32")
+
+    if source.shape[:2] == (height, width):
+        if destination is None or destination is source:
+            return source
+        np.copyto(destination, source)
+        return destination
+
+    interpolation = cv2.INTER_AREA if height < source.shape[0] or width < source.shape[1] else cv2.INTER_LINEAR
+    return cv2.resize(
+        source,
+        (width, height),
+        dst=destination,
+        interpolation=interpolation,
     )
-    return np.asarray(resized, dtype=np.float32) / 255.0
 
 
 def _downscale_buffer_metadata(buffer_metadata: dict, downscale_factor: int = 10) -> dict:
@@ -1414,12 +1439,20 @@ def _run_two_pass_projection(
         lowres_metadata["height"],
     )
 
+    lowres_projection_kwargs = dict(projection_kwargs)
+    highres_rays = int(projection_kwargs.get("rays_per_image", 400000))
+    lowres_rays = min(highres_rays, 100000)
+    lowres_projection_kwargs["rays_per_image"] = lowres_rays
+
     logger.info(
-        "Two-pass texture projection: pass 1 at %dx%d, pass 2 at %dx%d",
+        "Two-pass texture projection: pass 1 at %dx%d with %d rays/image, "
+        "pass 2 at %dx%d with %d rays/image",
         lowres_metadata["width"],
         lowres_metadata["height"],
+        lowres_rays,
         buffer_metadata.get("width", image_buffer.shape[1]),
         buffer_metadata.get("height", image_buffer.shape[0]),
+        highres_rays,
     )
 
     lowres_buffer, lowres_stats = projection_fn(
@@ -1431,13 +1464,14 @@ def _run_two_pass_projection(
         device,
         step1_dir=step1_dir,
         num_frames=num_frames,
-        **projection_kwargs,
+        **lowres_projection_kwargs,
     )
 
     upscaled_buffer = _resize_texture_buffer(
         lowres_buffer,
         int(buffer_metadata.get("width", image_buffer.shape[1])),
         int(buffer_metadata.get("height", image_buffer.shape[0])),
+        destination=image_buffer,
     )
 
     highres_buffer, highres_stats = projection_fn(
@@ -1762,15 +1796,15 @@ def _project_rgb_onto_image_buffer_single_pass(
     x_max_buffer = x_min + scene_width_meters
     y_max_buffer = y_min + scene_height_meters
     
-    # Initialize updated buffer as copy of input (preserves initial texture)
-    updated_buffer = image_buffer.copy()
+    # Projection owns this working buffer and updates it in place. Keeping a
+    # full-resolution backup can consume many gigabytes for large road maps.
+    updated_buffer = image_buffer
     
     # Statistics tracking with ray projection details
     projection_stats = {
         'total_frames': 0,
         'total_cameras_processed': 0,
         'road_pixels_projected': 0,
-        'buffer_pixels_updated': set(),  # Will convert to count later
         'cameras_with_data': [],
         'rays_cast_total': 0,           # Total rays cast from cameras
         'rays_hit_mesh': 0,             # Rays that intersected mesh triangles
@@ -1780,7 +1814,7 @@ def _project_rgb_onto_image_buffer_single_pass(
     if len(vertices_tensor) == 0 or faces_tensor.numel() == 0:
         logger.warning("Cannot project RGB - mesh not available")
         return updated_buffer, projection_stats
-    
+
     # Convert mesh to numpy for ray intersection testing
     verts_np = vertices_tensor.cpu().numpy() if isinstance(vertices_tensor, torch.Tensor) else np.array(vertices_tensor)
 
@@ -2067,7 +2101,6 @@ def _project_rgb_onto_image_buffer_single_pass(
                         buf_y_idx = np.clip(buf_y_idx, 0, height_pixels - 1)
                         
                         updated_buffer[buf_y_idx, buf_x_idx] = rgb_color
-                        projection_stats['buffer_pixels_updated'].add((buf_y_idx, buf_x_idx))
                         print(f"Updated buffer pixel at ({buf_y_idx}, {buf_x_idx}) with color {rgb_color}")
                     
                     # Save the image buffer after processing each frame/camera combination
@@ -2096,10 +2129,10 @@ def _project_rgb_onto_image_buffer_single_pass(
                 import traceback
                 traceback.print_exc()
     
-        # Convert set to count for stats
-    projection_stats['road_pixels_projected'] = len(projection_stats['buffer_pixels_updated'])
-    num_unique_buffer_pixels = len(projection_stats['buffer_pixels_updated'])
-    del projection_stats['buffer_pixels_updated']  # Remove raw set from final output
+    # Every successful ray writes one texture pixel. Repeated writes are
+    # intentionally included so no full-resolution coverage map is required.
+    texture_pixel_writes = int(projection_stats['rays_hit_mesh'])
+    projection_stats['road_pixels_projected'] = texture_pixel_writes
     
     hit_rate = (projection_stats['rays_hit_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_cast_total' in projection_stats else 0.0
     miss_rate = (projection_stats['rays_missed_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_missed_mesh' in projection_stats and projection_stats['rays_cast_total'] > 0 else 0.0
@@ -2112,7 +2145,7 @@ def _project_rgb_onto_image_buffer_single_pass(
     logger.info(f"Rays cast from camera: {projection_stats.get('rays_cast_total', 0):,}")
     logger.info(f"Rays that HIT mesh triangles: {projection_stats.get('rays_hit_mesh', 0):,} ({hit_rate:.1f}%)")
     logger.info(f"Rays MISSED all triangles: {projection_stats.get('rays_missed_mesh', 0):,} ({miss_rate:.1f}%)")
-    logger.info(f"Unique buffer pixels updated with RGB colors: {num_unique_buffer_pixels:,}")
+    logger.info(f"Texture pixel writes (including repeated pixels): {texture_pixel_writes:,}")
     if projection_stats['total_cameras_processed'] > 0:
         avg_rays_per_camera = projection_stats.get('rays_cast_total', 0) / max(projection_stats['total_cameras_processed'], 1)
         logger.info(f"Average rays per camera: {avg_rays_per_camera:.1f}")
@@ -2131,7 +2164,7 @@ def _project_rgb_onto_image_buffer_single_pass(
         logger.info("  3. Ensure mesh coordinate system matches world space from dataset")
 
     logger.info(f"Projected {projection_stats['total_cameras_processed']} camera views")
-    logger.info(f"Updated {num_unique_buffer_pixels:,} unique buffer pixels with RGB colors")
+    logger.info(f"Applied {texture_pixel_writes:,} texture pixel writes")
     
     return updated_buffer, projection_stats
 
@@ -2289,12 +2322,13 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
     scene_width_meters = buffer_metadata['scene_width_meters']
     scene_height_meters = buffer_metadata['scene_height_meters']
 
-    updated_buffer = image_buffer.copy()
+    # Update the caller-owned working buffer in place; no full-size backup is
+    # needed because failed batch scenes are regenerated from their dataset.
+    updated_buffer = image_buffer
     projection_stats = {
         'total_frames': 0,
         'total_cameras_processed': 0,
         'road_pixels_projected': 0,
-        'buffer_pixels_updated': set(),
         'cameras_with_data': [],
         'rays_cast_total': 0,
         'rays_hit_mesh': 0,
@@ -2509,7 +2543,6 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
                         )
 
                         updated_buffer[buf_y_idx, buf_x_idx] = hit_colors_np
-                        projection_stats['buffer_pixels_updated'].update(zip(buf_y_idx.tolist(), buf_x_idx.tolist()))
                         print(f"Updated buffer pixels with {num_hits} GPU ray hits for frame {frame_idx}, cam {cam_id}")
 
                         save_path = os.path.join(step1_dir, f"frame_{frame_idx}_cam{cam_id}_buffer.png") if step1_dir else None
@@ -2533,9 +2566,10 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
                     import traceback
                     traceback.print_exc()
 
-    projection_stats['road_pixels_projected'] = len(projection_stats['buffer_pixels_updated'])
-    num_unique_buffer_pixels = len(projection_stats['buffer_pixels_updated'])
-    del projection_stats['buffer_pixels_updated']
+    # Every successful ray writes one texture pixel. Repeated writes are
+    # intentionally included so no full-resolution coverage map is required.
+    texture_pixel_writes = int(projection_stats['rays_hit_mesh'])
+    projection_stats['road_pixels_projected'] = texture_pixel_writes
 
     hit_rate = (projection_stats['rays_hit_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_cast_total' in projection_stats else 0.0
     miss_rate = (projection_stats['rays_missed_mesh'] / max(projection_stats['rays_cast_total'], 1)) * 100 if 'rays_missed_mesh' in projection_stats and projection_stats['rays_cast_total'] > 0 else 0.0
@@ -2548,7 +2582,7 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
     logger.info(f"Rays cast from camera: {projection_stats.get('rays_cast_total', 0):,}")
     logger.info(f"Rays that HIT mesh triangles: {projection_stats.get('rays_hit_mesh', 0):,} ({hit_rate:.1f}%)")
     logger.info(f"Rays MISSED all triangles: {projection_stats.get('rays_missed_mesh', 0):,} ({miss_rate:.1f}%)")
-    logger.info(f"Unique buffer pixels updated with RGB colors: {num_unique_buffer_pixels:,}")
+    logger.info(f"Texture pixel writes (including repeated pixels): {texture_pixel_writes:,}")
     if projection_stats['total_cameras_processed'] > 0:
         avg_rays_per_camera = projection_stats.get('rays_cast_total', 0) / max(projection_stats['total_cameras_processed'], 1)
         logger.info(f"Average rays per camera: {avg_rays_per_camera:.1f}")
@@ -2565,7 +2599,7 @@ def _project_rgb_onto_image_buffer_gpu_single_pass(
         logger.info("  3. Ensure mesh coordinate system matches world space from dataset")
 
     logger.info(f"Projected {projection_stats['total_cameras_processed']} camera views")
-    logger.info(f"Updated {num_unique_buffer_pixels:,} unique buffer pixels with RGB colors")
+    logger.info(f"Applied {texture_pixel_writes:,} texture pixel writes")
 
     return updated_buffer, projection_stats
 
@@ -3568,7 +3602,7 @@ def main():
             
             logger.info(f"\nRGB Projection Statistics:")
             logger.info(f"  - Total cameras processed: {total_cameras}")
-            logger.info(f"  - Unique buffer pixels updated: {pixels_updated:,}")
+            logger.info(f"  - Texture pixel writes (including repeats): {pixels_updated:,}")
             logger.info(f"  - Output file: road_textured_mesh.png")
         
         # Update image_buffer variable for final summary (now contains RGB projections)

@@ -680,7 +680,7 @@ def render_novel_views(
         print(f"Created folder for all images at {image_output_dir}")
     
     with torch.no_grad():
-        for frame_data in render_data:
+        for output_frame_idx, frame_data in enumerate(render_data):
             # Move data to GPU
             for key, value in frame_data["cam_infos"].items():
                 frame_data["cam_infos"][key] = value.cuda(non_blocking=True)
@@ -704,12 +704,11 @@ def render_novel_views(
             del outputs
 
             # Generate unique filename
-            frame_idx = frame_data["image_infos"]["frame_idx"][0,0].item()
             if save_raw and raw_output_dir is not None:
                 rgb_raw = outputs_cpu["rgb"].numpy()  # Keep original data [H, W, 3]
                 raw_rgb_path = os.path.join(
                     raw_output_dir,
-                    f"new_frame{frame_idx:04d}.npy"
+                    f"new_frame{output_frame_idx:04d}.npy"
                 )
                 np.save(raw_rgb_path, rgb_raw)
                 logger.debug(f"Saved raw RGB to {raw_rgb_path}")
@@ -725,7 +724,7 @@ def render_novel_views(
 
             # Save image
             if save_images:
-                img_path = os.path.join(image_output_dir, f"frame{frame_idx:04d}.png")
+                img_path = os.path.join(image_output_dir, f"frame{output_frame_idx:04d}.png")
                 img = Image.fromarray(rgb_uint8)
                 img.save(img_path)
 

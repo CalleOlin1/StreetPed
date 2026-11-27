@@ -88,6 +88,11 @@ if __name__ == "__main__":
         action='store_true',
         help="Whether to process road masks",
     )
+    parser.add_argument(
+        '--road_only',
+        action='store_true',
+        help="Generate road masks without generating sky masks",
+    )
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--ignore_existing', action='store_true')
     parser.add_argument('--no_compress', action='store_true')
@@ -107,6 +112,8 @@ if __name__ == "__main__":
     parser.add_argument('--progress_leave', action='store_true', help=SUPPRESS)
     
     args = parser.parse_args()
+    if args.road_only:
+        args.process_road_mask = True
     if args.config is None:
         args.config = os.path.join(
             args.segformer_path,
@@ -162,14 +169,14 @@ if __name__ == "__main__":
             scene_id = scene_id.zfill(3)
         img_dir = os.path.join(args.data_root, scene_id, args.rgb_dirname)
 
-        # create mask dir
-        sky_mask_dir = os.path.join(args.data_root, scene_id, "sky_masks")
-        if not os.path.exists(sky_mask_dir):
-            os.makedirs(sky_mask_dir)
+        scene_context = {}
 
-        scene_context = {
-            "sky_mask_dir": sky_mask_dir,
-        }
+        # create sky mask dir unless road-only output was requested
+        if not args.road_only:
+            sky_mask_dir = os.path.join(args.data_root, scene_id, "sky_masks")
+            if not os.path.exists(sky_mask_dir):
+                os.makedirs(sky_mask_dir)
+            scene_context["sky_mask_dir"] = sky_mask_dir
 
         # create dynamic mask dir
         if args.process_dynamic_mask:
@@ -227,8 +234,9 @@ if __name__ == "__main__":
             result = inference_segmentor(model, fpath)
             mask = result[0].astype(np.uint8)   # NOTE: in the settings of "cityscapes", there are 19 classes at most.
 
-            sky_mask = np.isin(mask, [10])
-            imageio.imwrite(os.path.join(scene_context["sky_mask_dir"], f"{fbase}.png"), sky_mask.astype(np.uint8) * 255)
+            if not args.road_only:
+                sky_mask = np.isin(mask, [10])
+                imageio.imwrite(os.path.join(scene_context["sky_mask_dir"], f"{fbase}.png"), sky_mask.astype(np.uint8) * 255)
 
             if args.process_road_mask:
                 road_mask = np.isin(mask, [0])
@@ -263,8 +271,9 @@ if __name__ == "__main__":
                 result = inference_segmentor(model, fpath)
                 mask = result[0].astype(np.uint8)   # NOTE: in the settings of "cityscapes", there are 19 classes at most.
 
-                sky_mask = np.isin(mask, [10])
-                imageio.imwrite(os.path.join(scene_context["sky_mask_dir"], f"{fbase}.png"), sky_mask.astype(np.uint8) * 255)
+                if not args.road_only:
+                    sky_mask = np.isin(mask, [10])
+                    imageio.imwrite(os.path.join(scene_context["sky_mask_dir"], f"{fbase}.png"), sky_mask.astype(np.uint8) * 255)
 
                 if args.process_road_mask:
                     road_mask = np.isin(mask, [0])

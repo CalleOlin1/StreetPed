@@ -225,7 +225,7 @@ class RoadMesh(nn.Module):
                     dataset=dataset,
                     vertices_tensor=self.vertices,
                     faces_tensor=self.faces,
-                    image_buffer=self.texture_buffer.copy(),
+                    image_buffer=self.texture_buffer,
                     buffer_metadata=self.texture_metadata,
                     device=self.device,
                     num_frames=num_frames,
@@ -239,7 +239,7 @@ class RoadMesh(nn.Module):
                     dataset=dataset,
                     vertices_tensor=self.vertices,
                     faces_tensor=self.faces,
-                    image_buffer=self.texture_buffer.copy(),
+                    image_buffer=self.texture_buffer,
                     buffer_metadata=self.texture_metadata,
                     device=self.device,
                     num_frames=num_frames,
@@ -250,7 +250,7 @@ class RoadMesh(nn.Module):
             
             logger.info(
                 f"Texture projection complete: {stats.get('road_pixels_projected', 0)} "
-                f"pixels updated from {stats.get('total_cameras_processed', 0)} cameras"
+                f"pixel writes from {stats.get('total_cameras_processed', 0)} cameras"
             )
             
             return stats

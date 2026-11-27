@@ -34,9 +34,18 @@ def get_layout(dataset_type: str):
         layout = layout_kitti
     elif dataset_type == "nuplan":
         layout = layout_nuplan
+    elif dataset_type == "paralane":
+        layout = layout_paralane
     else:
         raise ValueError(f"dataset_type {dataset_type} not supported")
     return layout
+
+
+def layout_paralane(imgs: List[np.array], cam_names: List[str]) -> np.array:
+    """Display the single ParaLane front camera without padding or cropping."""
+    if len(imgs) != 1 or len(cam_names) != 1:
+        raise ValueError("ParaLane layout expects exactly one camera image")
+    return imgs[0]
 
 def layout_nuplan(
     imgs: List[np.array], cam_names: List[str]

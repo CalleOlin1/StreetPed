@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,8 +40,8 @@ DEFAULT_DATASET_OPTS = [
     "data.pixel_source.type=datasets.kitti.kitti_sourceloader.KITTIPixelSource",
     "data.lidar_source.type=datasets.kitti.kitti_sourceloader.KITTILiDARSource",
     "data.pixel_source.cameras=[0]",
-    "data.pixel_source.downscale_when_loading=[2]",
-    "data.pixel_source.downscale=2",
+    "data.pixel_source.downscale_when_loading=[1]",
+    "data.pixel_source.downscale=1",
 ]
 
 
@@ -93,6 +94,7 @@ def build_eval_command(
     repo_root: Path,
     extra_opts: Sequence[str],
     trajectory_name: str = "clip_1",
+    skip_lidar: bool = False,
 ) -> List[str]:
     trajectories_dir = scene_dir / "trajectories"
     clip_0 = trajectories_dir / "clip_0.npz"
@@ -121,6 +123,8 @@ def build_eval_command(
         "--trajectory_file",
         str(trajectory_file),
     ]
+    if skip_lidar:
+        cmd.append("--skip-lidar")
     cmd.extend(DEFAULT_DATASET_OPTS)
     cmd.extend(extra_opts)
     return cmd
@@ -381,6 +385,55 @@ def has_metrics_csv_for_trajectory(checkpoint: Path, trajectory_name: str) -> bo
     return False
 
 
+def rendered_image_dirs(checkpoint: Path, trajectory_name: str) -> List[Path]:
+    target_dir_name = f"images_file_{trajectory_name}"
+    return sorted(p for p in checkpoint.parent.rglob(target_dir_name) if p.is_dir())
+
+
+def video_frame_count(video_path: Path) -> Optional[int]:
+    if not video_path.is_file():
+        return None
+    if shutil.which("ffprobe") is None:
+        raise RuntimeError("ffprobe is required to verify rendered video frame counts.")
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames", "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
+        raise RuntimeError(f"Could not count video frames in {video_path}: {result.stderr.strip()}")
+    return int(result.stdout.strip())
+
+
+def has_rendered_images_for_trajectory(
+    checkpoint: Path, trajectory_name: str, expected_frames: int
+) -> bool:
+    for images_dir in rendered_image_dirs(checkpoint, trajectory_name):
+        video_path = images_dir.parent / f"file_{trajectory_name}.mp4"
+        video_frames = video_frame_count(video_path)
+        if video_frames != expected_frames:
+            continue
+        png_paths = list(images_dir.glob("*.png"))
+        frame_numbers = sorted(
+            int(match.group(1))
+            for path in png_paths
+            if (match := re.fullmatch(r"frame(\d+)\.png", path.name)) is not None
+        )
+        if len(png_paths) == video_frames and frame_numbers == list(range(video_frames)):
+            return True
+    return False
+
+
+def remove_incomplete_images(checkpoint: Path, trajectory_name: str) -> None:
+    """Remove incomplete exports so stale filenames cannot survive a re-render."""
+    for images_dir in rendered_image_dirs(checkpoint, trajectory_name):
+        shutil.rmtree(images_dir)
+        print(f"Removed incomplete images at {images_dir}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -400,7 +453,17 @@ def main() -> int:
         "--raw-root",
         type=Path,
         default=None,
-        help="Root folder containing raw ground-truth data (default: data/paralane/raw).",
+        help="Root folder containing raw ground-truth data for --compute-metrics (default: data/paralane/raw).",
+    )
+    parser.add_argument(
+        "--compute-metrics",
+        action="store_true",
+        help="Compute PSNR, SSIM, and LPIPS against raw ground-truth images after rendering.",
+    )
+    parser.add_argument(
+        "--skip-lidar",
+        action="store_true",
+        help="Skip LiDAR loading during eval and use camera-derived scene bounds.",
     )
     parser.add_argument(
         "--checkpoint-pattern",
@@ -441,12 +504,13 @@ def main() -> int:
         )
         return 1
 
-    if not raw_root.exists():
+    if args.compute_metrics and not raw_root.exists():
         print(f"Could not find raw GT images under {raw_root}")
         return 1
 
     print(f"Using processed4sep root: {data_root}")
-    print(f"Using raw GT root: {raw_root}")
+    if args.compute_metrics:
+        print(f"Using raw GT root: {raw_root}")
     print(f"Found {len(checkpoints)} checkpoint(s) to evaluate.")
 
     for checkpoint in checkpoints:
@@ -462,15 +526,33 @@ def main() -> int:
             continue
 
         for trajectory_name in ("clip_1", "clip_0"):
-            if has_metrics_csv_for_trajectory(checkpoint, trajectory_name):
+            trajectory_path = scene_dir / "trajectories" / f"{trajectory_name}.npz"
+            if not trajectory_path.is_file():
+                print(f"Skipping {checkpoint}: missing {trajectory_path}")
+                continue
+            if np is None:
+                raise RuntimeError("NumPy is required to verify trajectory frame counts.")
+            with np.load(trajectory_path) as trajectory:
+                expected_frames = len(trajectory["camera_poses"])
+
+            if has_rendered_images_for_trajectory(checkpoint, trajectory_name, expected_frames):
                 print(
                     f"Skipping render for scene {scene_id} ({trajectory_name}): "
-                    "metrics.csv already exists."
+                    f"video and all {expected_frames} sequential PNGs already exist."
                 )
+                if args.compute_metrics and not has_metrics_csv_for_trajectory(checkpoint, trajectory_name):
+                    compute_image_metrics_for_run(checkpoint, scene_id, raw_root)
                 continue
+            print(
+                f"Incomplete export for scene {scene_id} ({trajectory_name}): expected "
+                f"{expected_frames} video frames and sequential PNGs; re-rendering."
+            )
 
             try:
-                cmd = build_eval_command(checkpoint, scene_dir, repo_root, args.extra_opts, trajectory_name)
+                cmd = build_eval_command(
+                    checkpoint, scene_dir, repo_root, args.extra_opts, trajectory_name,
+                    skip_lidar=args.skip_lidar,
+                )
             except FileNotFoundError as exc:
                 print(f"Skipping {checkpoint} for {trajectory_name}: {exc}")
                 continue
@@ -481,13 +563,21 @@ def main() -> int:
             if args.dry_run:
                 continue
 
+            remove_incomplete_images(checkpoint, trajectory_name)
             proc = subprocess.Popen(cmd, cwd=str(repo_root))
             rc = proc.wait()
             if rc != 0:
                 print(f"Render for {checkpoint} ({trajectory_name}) exited with code {rc}")
                 return rc
+            if not has_rendered_images_for_trajectory(checkpoint, trajectory_name, expected_frames):
+                print(
+                    f"Render for {checkpoint} ({trajectory_name}) did not save {expected_frames} "
+                    "sequential PNGs matching the video."
+                )
+                return 1
 
-            compute_image_metrics_for_run(checkpoint, scene_id, raw_root)
+            if args.compute_metrics:
+                compute_image_metrics_for_run(checkpoint, scene_id, raw_root)
 
     return 0
 

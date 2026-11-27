@@ -78,10 +78,10 @@ class DrivingDataset(SceneDataset):
 
         # ---- create data source ---- #
         self.pixel_source, self.lidar_source = self.build_data_source()
-        assert (
-            self.pixel_source is not None and self.lidar_source is not None
-        ), "Must have both pixel source and lidar source"
+        assert self.pixel_source is not None, "Must have a pixel source"
         if self.data_cfg.get("project_lidar_on_images", True):
+            if self.lidar_source is None:
+                raise ValueError("LiDAR projection requires a LiDAR source")
             self.project_lidar_pts_on_images(delete_out_of_view_points=True)
         else:
             logger.info("Skipping lidar projection on images by configuration.")

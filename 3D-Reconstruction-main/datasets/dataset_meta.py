@@ -156,6 +156,14 @@ DATASETS_CONFIG = {
         },
     },
 
+    "paralane": {
+        0: {
+            "camera_name": "CAM_FRONT",
+            "original_size": (1075, 1910),
+            "egocar_visible": True,
+        },
+    },
+
     "nuplan": {
         0: {
             "camera_name": "CAM_F0",

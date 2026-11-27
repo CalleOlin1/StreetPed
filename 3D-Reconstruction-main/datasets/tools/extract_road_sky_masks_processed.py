@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Extract road and sky masks for all scenes inside a processed dataset folder.
+Extract road masks, optionally alongside sky masks, for all scenes inside a
+processed dataset folder.
 
 This is a thin wrapper around datasets/tools/extract_masks.py:
 - discovers scene directories under --data_root
 - filters to scenes that contain an image folder
 - invokes extract_masks.py per scene with --process_road_mask
 
-Sky masks are always produced by extract_masks.py; road masks are enabled here.
+Road-only mode can be selected with --road_only.
 """
 
 from __future__ import annotations
@@ -82,6 +83,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Forwarded to extract_masks.py; skips when output already exists.",
     )
+    parser.add_argument(
+        "--road_only",
+        action="store_true",
+        help="Generate road masks without generating sky masks.",
+    )
     return parser
 
 
@@ -153,7 +159,8 @@ def main() -> int:
             f"No scenes found in {data_root} with image folder '{args.rgb_dirname}'."
         )
 
-    print(f"Found {len(scene_ids)} scene(s). Running road+sky mask extraction...")
+    output_description = "road" if args.road_only else "road+sky"
+    print(f"Found {len(scene_ids)} scene(s). Running {output_description} mask extraction...")
     for index, scene_id in enumerate(scene_ids, start=1):
         print(f"[{index}/{len(scene_ids)}] {scene_id}")
         cmd = [
@@ -163,7 +170,7 @@ def main() -> int:
             str(data_root),
             "--scene_ids",
             scene_id,
-            "--process_road_mask",
+            "--road_only" if args.road_only else "--process_road_mask",
             "--rgb_dirname",
             args.rgb_dirname,
             "--device",
